@@ -77,7 +77,7 @@ export function Generator() {
         }
         setResult(generateResult)
         setShowModal(true)
-        await saveToHistory(formData, data.data)
+        await saveToHistory(formData, data.data.count)
       } else {
         showToast('error', data.message || '生成失败')
       }
@@ -89,14 +89,13 @@ export function Generator() {
     }
   }
 
-  const saveToHistory = async (formData: GenerateFormData, resultData: { keys: string[]; count: number }) => {
+  const saveToHistory = async (formData: GenerateFormData, count: number) => {
     try {
       const historyItem: HistoryItem = {
         id: Date.now().toString(),
         timestamp: new Date().toISOString(),
         name: formData.name,
-        count: resultData.count,
-        keys: resultData.keys,
+        count,
         quota_mode: formData.quota_mode,
         expire_mode: formData.expire_mode,
       }

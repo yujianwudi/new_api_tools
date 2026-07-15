@@ -266,8 +266,9 @@ func backgroundSyncAbuseBroadcast(stop <-chan struct{}) {
 			return idleInterval, false
 		}
 		seconds := settings.PullIntervalSeconds
-		if seconds <= 0 {
-			seconds = 300
+		if seconds < service.MinAbuseBroadcastPullIntervalSeconds ||
+			seconds > service.MaxAbuseBroadcastPullIntervalSeconds {
+			seconds = service.DefaultAbuseBroadcastPullIntervalSeconds
 		}
 		return time.Duration(seconds) * time.Second, true
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -137,6 +138,50 @@ func TestAbuseBroadcastSyncOnceStoresHubReports(t *testing.T) {
 	}
 	if unread.Unread != 0 {
 		t.Fatalf("expected unread count to be cleared, got %d", unread.Unread)
+	}
+}
+
+func TestAbuseBroadcastPullIntervalBounds(t *testing.T) {
+	tests := []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{name: "default for zero", value: 0, want: DefaultAbuseBroadcastPullIntervalSeconds},
+		{name: "default for negative", value: -1, want: DefaultAbuseBroadcastPullIntervalSeconds},
+		{name: "clamp legacy value below minimum", value: 1, want: MinAbuseBroadcastPullIntervalSeconds},
+		{name: "minimum", value: MinAbuseBroadcastPullIntervalSeconds, want: MinAbuseBroadcastPullIntervalSeconds},
+		{name: "maximum", value: MaxAbuseBroadcastPullIntervalSeconds, want: MaxAbuseBroadcastPullIntervalSeconds},
+		{name: "clamp legacy value above maximum", value: MaxAbuseBroadcastPullIntervalSeconds + 1, want: MaxAbuseBroadcastPullIntervalSeconds},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeAbuseBroadcastPullInterval(tt.value); got != tt.want {
+				t.Fatalf("normalize interval %d = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAbuseBroadcastUpdateSettingsRejectsUnsafePullIntervals(t *testing.T) {
+	t.Setenv("SQL_DSN", "not-used")
+	t.Setenv("DATA_DIR", t.TempDir())
+	config.Load()
+	svc := NewAbuseBroadcastService()
+
+	for _, value := range []int{
+		MinAbuseBroadcastPullIntervalSeconds - 1,
+		MaxAbuseBroadcastPullIntervalSeconds + 1,
+		int(^uint(0) >> 1),
+	} {
+		value := value
+		t.Run(fmt.Sprintf("%d", value), func(t *testing.T) {
+			if _, err := svc.UpdateSettings(context.Background(), AbuseBroadcastSettingsInput{
+				PullIntervalSeconds: &value,
+			}); err == nil {
+				t.Fatalf("expected interval %d to be rejected", value)
+			}
+		})
 	}
 }
 

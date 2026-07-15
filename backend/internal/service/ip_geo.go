@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/new-api-tools/backend/internal/security"
 	"github.com/oschwald/geoip2-golang"
 )
 
@@ -151,7 +152,7 @@ func (s *IPGeoService) httpClient() *http.Client {
 	if s.downloadClient != nil {
 		return s.downloadClient
 	}
-	return &http.Client{Timeout: 120 * time.Second}
+	return security.NewHTTPSClient(120 * time.Second)
 }
 
 func (s *IPGeoService) openDatabase(path string) (geoIPCityReader, error) {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/util"
@@ -79,6 +80,29 @@ type PaginatedTopUps struct {
 }
 
 const defaultPendingAnomalyHours = 2
+
+// spreadsheetSafeCSVCell prevents user-controlled text from being interpreted
+// as a formula when an exported CSV is opened in Excel or LibreOffice. CSV
+// quoting only protects the file structure; spreadsheet applications may still
+// execute cells whose first non-whitespace character is =, +, -, or @.
+func spreadsheetSafeCSVCell(value string) string {
+	trimmed := strings.TrimLeftFunc(value, unicode.IsSpace)
+	if trimmed == "" {
+		return value
+	}
+
+	leadingWhitespace := value[:len(value)-len(trimmed)]
+	if strings.ContainsAny(leadingWhitespace, "\t\r\n") {
+		return "'" + value
+	}
+
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	default:
+		return value
+	}
+}
 
 func topUpStatusBucketSQL(column string) string {
 	trimmed := fmt.Sprintf("TRIM(COALESCE(%s, ''))", column)
@@ -386,7 +410,6 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 	}
 
 	csvW := csv.NewWriter(w)
-	defer csvW.Flush()
 
 	header := []string{
 		"ID", "用户ID", "用户名", "额度(USD)", "金额(CNY)",
@@ -434,16 +457,16 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 		if err := csvW.Write([]string{
 			strconv.FormatInt(rec.ID, 10),
 			strconv.FormatInt(rec.UserID, 10),
-			username,
+			spreadsheetSafeCSVCell(username),
 			strconv.FormatInt(rec.Amount, 10),
 			strconv.FormatFloat(rec.Money, 'f', 2, 64),
-			rec.TradeNo,
-			rec.PaymentMethod,
-			rec.PaymentProvider,
-			rec.Status,
-			rec.StatusBucket,
+			spreadsheetSafeCSVCell(rec.TradeNo),
+			spreadsheetSafeCSVCell(rec.PaymentMethod),
+			spreadsheetSafeCSVCell(rec.PaymentProvider),
+			spreadsheetSafeCSVCell(rec.Status),
+			spreadsheetSafeCSVCell(rec.StatusBucket),
 			strconv.FormatInt(rec.CompletionSeconds, 10),
-			strings.Join(rec.AnomalyReasons, "; "),
+			spreadsheetSafeCSVCell(strings.Join(rec.AnomalyReasons, "; ")),
 			createTimeStr,
 			completeTimeStr,
 		}); err != nil {
@@ -465,7 +488,11 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 		}
 	}
 
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	csvW.Flush()
+	return csvW.Error()
 }
 
 // GetTopUpStatistics returns aggregate top-up statistics

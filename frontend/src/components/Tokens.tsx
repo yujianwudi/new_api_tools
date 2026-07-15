@@ -55,6 +55,7 @@ interface PaginatedResponse {
 
 type StatusFilter = '' | 'active' | 'disabled' | 'expired' | 'exhausted'
 type EffectiveTokenStatus = Exclude<StatusFilter, ''> | 'unknown'
+type FetchOutcome = 'succeeded' | 'failed' | 'superseded'
 
 function getEffectiveTokenStatus(record: TokenRecord): EffectiveTokenStatus {
   if (record.status === 2) return 'disabled'
@@ -108,28 +109,34 @@ export function Tokens() {
     'Authorization': `Bearer ${token}`,
   }), [token])
 
-  const fetchStatistics = useCallback(async () => {
+  const fetchStatistics = useCallback(async (): Promise<FetchOutcome> => {
     setStatsLoading(true)
     try {
       const response = await fetch(`${apiUrl}/api/tokens/statistics`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) setStatistics(data.data)
+      if (!data.success) return 'failed'
+      setStatistics(data.data)
+      return 'succeeded'
     } catch (error) {
       console.error('Failed to fetch token statistics:', error)
+      return 'failed'
     } finally { setStatsLoading(false) }
   }, [apiUrl, getAuthHeaders])
 
-  const fetchGroups = useCallback(async () => {
+  const fetchGroups = useCallback(async (): Promise<FetchOutcome> => {
     try {
       const response = await fetch(`${apiUrl}/api/tokens/groups`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) setAvailableGroups(data.data || [])
+      if (!data.success) return 'failed'
+      setAvailableGroups(data.data || [])
+      return 'succeeded'
     } catch (error) {
       console.error('Failed to fetch token groups:', error)
+      return 'failed'
     }
   }, [apiUrl, getAuthHeaders])
 
-  const fetchTokens = useCallback(async () => {
+  const fetchTokens = useCallback(async (): Promise<FetchOutcome> => {
     const requestSequence = ++tokenRequestSequenceRef.current
     tokenRequestAbortRef.current?.abort()
     const controller = new AbortController()
@@ -162,7 +169,9 @@ export function Tokens() {
           signal: controller.signal,
         })
       const data = await response.json()
-      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) return
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) {
+        return 'superseded'
+      }
       if (data.success) {
         const result: PaginatedResponse = data.data
         setTokens(result.items || [])
@@ -170,11 +179,16 @@ export function Tokens() {
         setTotalPages(result.total_pages)
       } else {
         showToast('error', data.message || '获取令牌列表失败')
+        return 'failed'
       }
+      return 'succeeded'
     } catch (error) {
-      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) return
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) {
+        return 'superseded'
+      }
       showToast('error', '网络错误，请重试')
       console.error('Failed to fetch tokens:', error)
+      return 'failed'
     } finally {
       if (tokenRequestSequenceRef.current === requestSequence) {
         if (tokenRequestAbortRef.current === controller) tokenRequestAbortRef.current = null
@@ -195,9 +209,16 @@ export function Tokens() {
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchTokens(), fetchStatistics(), fetchGroups()])
-    setRefreshing(false)
-    showToast('success', '数据已刷新')
+    try {
+      const results = await Promise.all([fetchTokens(), fetchStatistics(), fetchGroups()])
+      if (results.includes('failed')) {
+        showToast('error', '部分数据刷新失败，请重试')
+      } else if (results.every((result) => result === 'succeeded')) {
+        showToast('success', '数据已刷新')
+      }
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   const formatTimestamp = (ts: number) => {

@@ -19,6 +19,11 @@ type localEntry struct {
 	expiresAt time.Time // zero means no expiry
 }
 
+const (
+	localCacheCleanupInterval = 60 * time.Second
+	maxLocalCacheEntries      = 4096
+)
+
 // isExpired returns true if the entry has expired
 func (e *localEntry) isExpired() bool {
 	if e.expiresAt.IsZero() {
@@ -30,9 +35,12 @@ func (e *localEntry) isExpired() bool {
 // Manager provides a two-level cache: local sync.Map + Redis
 // Matches Python's cache_manager.py functionality
 type Manager struct {
-	rdb        *redis.Client
-	localCache sync.Map // level-1 local cache (stores *localEntry)
-	ctx        context.Context
+	rdb           *redis.Client
+	localCache    sync.Map // level-1 local cache (stores *localEntry)
+	localCount    int64
+	localEviction sync.Mutex
+	cleanupOnce   sync.Once
+	ctx           context.Context
 
 	// Stats — use atomic for lock-free incrementing
 	hits   int64
@@ -71,25 +79,83 @@ func Init(connString string) (*Manager, error) {
 		ctx: ctx,
 	}
 
-	// Start local cache cleanup goroutine
-	go mgr.cleanupExpiredEntries()
+	// Start local cache cleanup goroutine.
+	mgr.startCleanup()
 
 	logger.L.System("Redis 连接成功")
 	return mgr, nil
 }
 
+func (m *Manager) startCleanup() {
+	m.cleanupOnce.Do(func() {
+		go m.cleanupExpiredEntries()
+	})
+}
+
 // cleanupExpiredEntries periodically removes expired local cache entries
 func (m *Manager) cleanupExpiredEntries() {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(localCacheCleanupInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		m.localCache.Range(func(key, value interface{}) bool {
-			if entry, ok := value.(*localEntry); ok && entry.isExpired() {
-				m.localCache.Delete(key)
-			}
-			return true
-		})
+		m.removeExpiredLocalEntries()
 	}
+}
+
+func (m *Manager) removeExpiredLocalEntries() {
+	m.localCache.Range(func(key, value interface{}) bool {
+		if entry, ok := value.(*localEntry); ok && entry.isExpired() {
+			m.deleteLocal(key)
+		}
+		return true
+	})
+}
+
+func (m *Manager) storeLocal(key string, entry *localEntry) {
+	if _, loaded := m.localCache.Swap(key, entry); !loaded {
+		atomic.AddInt64(&m.localCount, 1)
+	}
+	m.enforceLocalCacheLimit()
+}
+
+func (m *Manager) deleteLocal(key interface{}) {
+	if _, loaded := m.localCache.LoadAndDelete(key); loaded {
+		atomic.AddInt64(&m.localCount, -1)
+	}
+}
+
+func (m *Manager) enforceLocalCacheLimit() {
+	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+		return
+	}
+
+	m.localEviction.Lock()
+	defer m.localEviction.Unlock()
+
+	m.removeExpiredLocalEntries()
+	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+		return
+	}
+
+	// Prefer evicting TTL-backed query results so permanent in-memory settings
+	// survive Redis outages. sync.Map does not expose recency ordering, so the
+	// selection within each class is intentionally arbitrary.
+	m.localCache.Range(func(key, value interface{}) bool {
+		entry, ok := value.(*localEntry)
+		if ok && !entry.expiresAt.IsZero() {
+			m.deleteLocal(key)
+		}
+		return atomic.LoadInt64(&m.localCount) > maxLocalCacheEntries
+	})
+	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+		return
+	}
+
+	// If permanent entries alone exceed the ceiling, bounded memory still takes
+	// priority over cache retention.
+	m.localCache.Range(func(key, _ interface{}) bool {
+		m.deleteLocal(key)
+		return atomic.LoadInt64(&m.localCount) > maxLocalCacheEntries
+	})
 }
 
 // Available returns true if the cache manager has been initialized
@@ -100,6 +166,7 @@ func Available() bool {
 // Get returns the global cache manager, or a no-op manager if not initialized
 func Get() *Manager {
 	if mgr == nil {
+		noop.startCleanup()
 		return &noop
 	}
 	return mgr
@@ -137,7 +204,7 @@ func (m *Manager) Set(key string, value interface{}, ttl time.Duration) error {
 	if ttl > 0 {
 		entry.expiresAt = time.Now().Add(ttl)
 	}
-	m.localCache.Store(key, entry)
+	m.storeLocal(key, entry)
 
 	// Store in Redis (skip if not connected)
 	if m.rdb == nil {
@@ -156,7 +223,7 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 				return true, json.Unmarshal(entry.data, dest)
 			}
 			// Expired — remove from local cache
-			m.localCache.Delete(key)
+			m.deleteLocal(key)
 		}
 	}
 
@@ -181,7 +248,7 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 		data:      data,
 		expiresAt: time.Now().Add(30 * time.Second),
 	}
-	m.localCache.Store(key, entry)
+	m.storeLocal(key, entry)
 
 	atomic.AddInt64(&m.hits, 1)
 
@@ -205,7 +272,7 @@ func (m *Manager) GetString(key string) (string, bool, error) {
 
 // Delete removes a key from both caches
 func (m *Manager) Delete(key string) error {
-	m.localCache.Delete(key)
+	m.deleteLocal(key)
 	if m.rdb == nil {
 		return nil
 	}
@@ -217,7 +284,7 @@ func (m *Manager) DeleteByPrefix(prefix string) (int64, error) {
 	// Clear local cache entries with this prefix
 	m.localCache.Range(func(key, value interface{}) bool {
 		if k, ok := key.(string); ok && strings.HasPrefix(k, prefix) {
-			m.localCache.Delete(k)
+			m.deleteLocal(k)
 		}
 		return true
 	})
@@ -270,7 +337,10 @@ func (m *Manager) Exists(key string) (bool, error) {
 
 // ClearLocal clears the entire local cache
 func (m *Manager) ClearLocal() {
-	m.localCache = sync.Map{}
+	m.localCache.Range(func(key, _ interface{}) bool {
+		m.deleteLocal(key)
+		return true
+	})
 }
 
 // ClearAll clears both local and all application Redis keys
@@ -292,19 +362,12 @@ func (m *Manager) Stats() map[string]interface{} {
 		hitRate = float64(hits) / float64(total) * 100
 	}
 
-	// Count local cache entries
-	localCount := 0
-	m.localCache.Range(func(_, _ interface{}) bool {
-		localCount++
-		return true
-	})
-
 	// Get Redis info
 	info := map[string]interface{}{
 		"hits":        hits,
 		"misses":      misses,
 		"hit_rate":    fmt.Sprintf("%.1f%%", hitRate),
-		"local_count": localCount,
+		"local_count": atomic.LoadInt64(&m.localCount),
 	}
 
 	// Try to get Redis memory info (skip if not connected)
@@ -430,7 +493,7 @@ func (m *Manager) HashDelete(key, field string) (bool, error) {
 func (m *Manager) DeleteLocal(prefix string) {
 	m.localCache.Range(func(key, value interface{}) bool {
 		if k, ok := key.(string); ok && strings.HasPrefix(k, prefix) {
-			m.localCache.Delete(k)
+			m.deleteLocal(k)
 		}
 		return true
 	})

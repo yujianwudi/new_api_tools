@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jmoiron/sqlx"
+	"github.com/new-api-tools/backend/internal/database"
+	_ "modernc.org/sqlite"
 )
 
 func TestParseTopUpFiltersIncludesUserAndInviterIDs(t *testing.T) {
@@ -85,6 +90,63 @@ func TestTopUpHandlersReturnBadRequestForMalformedIDs(t *testing.T) {
 			tt.handler(ctx)
 			if recorder.Code != 400 {
 				t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestTopUpQueryHandlersHideDatabaseErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := sqlx.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite test database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`
+		ATTACH DATABASE ':memory:' AS information_schema;
+		CREATE TABLE information_schema.columns (table_name TEXT, column_name TEXT);
+		INSERT INTO information_schema.columns (table_name, column_name)
+		VALUES ('top_ups', 'payment_provider');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatalf("install information_schema fixture: %v", err)
+	}
+	database.SetForTesting(&database.Manager{DB: db, IsPG: true})
+	t.Cleanup(func() {
+		database.SetForTesting(nil)
+		_ = db.Close()
+	})
+
+	tests := []struct {
+		name    string
+		target  string
+		handler gin.HandlerFunc
+	}{
+		{name: "list", target: "/api/top-ups", handler: ListTopUps},
+		{name: "statistics", target: "/api/top-ups/statistics", handler: GetTopUpStatistics},
+		{name: "payment methods", target: "/api/top-ups/payment-methods", handler: GetPaymentMethods},
+		{name: "payment providers", target: "/api/top-ups/payment-providers", handler: GetPaymentProviders},
+		{name: "export", target: "/api/top-ups/export", handler: ExportTopUps},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, tt.target, nil)
+			ctx.Request.RemoteAddr = "192.0.2.30:12345"
+
+			tt.handler(ctx)
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "Top-up data is temporarily unavailable") {
+				t.Fatalf("generic top-up error missing: %s", body)
+			}
+			for _, sensitive := range []string{"no such table", "SQL logic error", "top_ups", "topups"} {
+				if strings.Contains(body, sensitive) {
+					t.Fatalf("response leaked database detail %q: %s", sensitive, body)
+				}
 			}
 		})
 	}

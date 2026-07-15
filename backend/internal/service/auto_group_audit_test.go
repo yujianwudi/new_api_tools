@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/new-api-tools/backend/internal/config"
@@ -18,17 +20,21 @@ import (
 type fakeAutoGroupAuditStore struct {
 	mu sync.Mutex
 
-	nextID     int64
-	logs       []string
-	allIDs     []int64
-	pending    map[int64]string
-	pingErr    error
-	reserveErr error
-	appendErr  error
-	commitErr  error
-	markerErr  error
-	readErr    error
-	committed  map[int64]struct{}
+	nextID       int64
+	logs         []string
+	allIDs       []int64
+	pending      map[int64]string
+	pendingAt    map[int64]time.Time
+	pendingState map[int64]string
+	pingErr      error
+	reserveErr   error
+	appendErr    error
+	commitErr    error
+	markerErr    error
+	readErr      error
+	pendingErr   error
+	resolveErr   error
+	committed    map[int64]struct{}
 }
 
 func (s *fakeAutoGroupAuditStore) Ping(context.Context) error {
@@ -58,9 +64,19 @@ func (s *fakeAutoGroupAuditStore) StageLogs(_ context.Context, logs []string) er
 	if s.appendErr != nil {
 		return s.appendErr
 	}
+	if int64(len(s.pending)+len(logs)) > autoGroupMaxPendingLogs {
+		return errors.New("pending auto-group audit capacity exceeded")
+	}
 	if s.pending == nil {
 		s.pending = make(map[int64]string, len(logs))
 	}
+	if s.pendingAt == nil {
+		s.pendingAt = make(map[int64]time.Time, len(logs))
+	}
+	if s.pendingState == nil {
+		s.pendingState = make(map[int64]string, len(logs))
+	}
+	stagedAt := time.Now()
 	for _, raw := range logs {
 		var entry map[string]interface{}
 		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
@@ -70,7 +86,12 @@ func (s *fakeAutoGroupAuditStore) StageLogs(_ context.Context, logs []string) er
 		if !ok {
 			return errors.New("invalid staged audit ID")
 		}
+		if _, exists := s.pending[id]; exists {
+			return fmt.Errorf("duplicate pending audit log %d", id)
+		}
 		s.pending[id] = raw
+		s.pendingAt[id] = stagedAt
+		s.pendingState[id] = autoGroupPendingStateUnknown
 	}
 	return nil
 }
@@ -99,11 +120,129 @@ func (s *fakeAutoGroupAuditStore) CommitLogs(_ context.Context, ids []int64) err
 		newHead[len(staged)-1-i] = staged[i]
 		s.committed[id] = struct{}{}
 		delete(s.pending, id)
+		delete(s.pendingAt, id)
+		delete(s.pendingState, id)
 		s.allIDs = append(s.allIDs, id)
 	}
 	s.logs = append(newHead, s.logs...)
 	if len(s.logs) > int(autoGroupMaxLogs) {
 		s.logs = s.logs[:autoGroupMaxLogs]
+	}
+	return nil
+}
+
+func (s *fakeAutoGroupAuditStore) SetPendingState(_ context.Context, ids []int64, state string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if state != autoGroupPendingStateAmbiguous && state != autoGroupPendingStateSQLCommitted {
+		return errors.New("invalid pending audit state")
+	}
+	for _, id := range ids {
+		if _, ok := s.pending[id]; !ok {
+			return fmt.Errorf("missing pending audit log %d", id)
+		}
+	}
+	if s.pendingState == nil {
+		s.pendingState = make(map[int64]string, len(ids))
+	}
+	for _, id := range ids {
+		s.pendingState[id] = state
+	}
+	return nil
+}
+
+func (s *fakeAutoGroupAuditStore) ReadPending(_ context.Context, limit int64) ([]autoGroupPendingAuditRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingErr != nil {
+		return nil, s.pendingErr
+	}
+	if int64(len(s.pending)) > limit {
+		return nil, fmt.Errorf("pending audit log count %d exceeds limit %d", len(s.pending), limit)
+	}
+	records := make([]autoGroupPendingAuditRecord, 0, len(s.pending))
+	for id, raw := range s.pending {
+		state := s.pendingState[id]
+		if state == "" {
+			state = autoGroupPendingStateUnknown
+		}
+		records = append(records, autoGroupPendingAuditRecord{
+			ID:       id,
+			Raw:      raw,
+			State:    state,
+			StagedAt: s.pendingAt[id],
+		})
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
+	return records, nil
+}
+
+func (s *fakeAutoGroupAuditStore) ResolvePending(
+	_ context.Context,
+	operationID string,
+	ids []int64,
+	resolution, actor string,
+	resolvedAt time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.resolveErr != nil {
+		return s.resolveErr
+	}
+	entries := make([]map[string]interface{}, len(ids))
+	for i, id := range ids {
+		raw, ok := s.pending[id]
+		if !ok {
+			return fmt.Errorf("missing pending audit log %d", id)
+		}
+		state := s.pendingState[id]
+		if state == "" {
+			state = autoGroupPendingStateUnknown
+		}
+		if state == autoGroupPendingStateUnknown {
+			return errors.New("commit-unknown pending auto-group audit operations cannot be resolved online")
+		}
+		if resolution == autoGroupPendingResolutionDiscard && state == autoGroupPendingStateSQLCommitted {
+			return errors.New("sql-committed pending auto-group audit operations must be finalized")
+		}
+		var entry map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+			return err
+		}
+		if toString(entry["operation_id"]) != operationID || toInt64(entry["operation_size"]) != int64(len(ids)) {
+			return errors.New("pending audit operation mismatch")
+		}
+		entries[i] = entry
+	}
+	if resolution == autoGroupPendingResolutionFinalize {
+		if s.committed == nil {
+			s.committed = make(map[int64]struct{}, len(ids))
+		}
+		newHead := make([]string, len(ids))
+		for i, id := range ids {
+			entries[i]["revertible"] = false
+			entries[i]["recovery_state"] = "manually_finalized_ambiguous"
+			entries[i]["resolved_by"] = actor
+			entries[i]["resolved_at"] = resolvedAt.Unix()
+			raw, err := json.Marshal(entries[i])
+			if err != nil {
+				return err
+			}
+			newHead[len(ids)-1-i] = string(raw)
+			s.committed[id] = struct{}{}
+			s.allIDs = append(s.allIDs, id)
+		}
+		s.logs = append(newHead, s.logs...)
+		if len(s.logs) > int(autoGroupMaxLogs) {
+			s.logs = s.logs[:autoGroupMaxLogs]
+		}
+	} else if resolution != autoGroupPendingResolutionDiscard {
+		return errors.New("invalid pending audit resolution")
+	}
+	for _, id := range ids {
+		delete(s.pending, id)
+		delete(s.pendingAt, id)
+		delete(s.pendingState, id)
 	}
 	return nil
 }
@@ -139,6 +278,16 @@ func (s *fakeAutoGroupAuditStore) pendingSnapshot() map[int64]string {
 	result := make(map[int64]string, len(s.pending))
 	for id, raw := range s.pending {
 		result[id] = raw
+	}
+	return result
+}
+
+func (s *fakeAutoGroupAuditStore) pendingStateSnapshot() map[int64]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make(map[int64]string, len(s.pendingState))
+	for id, state := range s.pendingState {
+		result[id] = state
 	}
 	return result
 }
@@ -243,7 +392,7 @@ func TestAutoGroupFinalizeFailureKeepsCommittedMutationPendingAndNonActionable(t
 	if success, _ := result["success"].(bool); success {
 		t.Fatalf("assignment unexpectedly reported full success: %#v", result)
 	}
-	if message := toString(result["message"]); !strings.Contains(message, "pending") || !strings.Contains(message, "人工核对") {
+	if message := toString(result["message"]); !strings.Contains(message, "pending") || !strings.Contains(message, "人工") {
 		t.Fatalf("expected explicit pending recovery error, got %q", message)
 	}
 	if got := autoGroupForUser(t, db, 1); got != "vip" {
@@ -256,6 +405,11 @@ func TestAutoGroupFinalizeFailureKeepsCommittedMutationPendingAndNonActionable(t
 	pending := store.pendingSnapshot()
 	if len(pending) != 1 {
 		t.Fatalf("finalize failure did not retain one pending record: %d", len(pending))
+	}
+	for id, state := range store.pendingStateSnapshot() {
+		if state != autoGroupPendingStateSQLCommitted {
+			t.Fatalf("pending audit %d state=%q, want %q", id, state, autoGroupPendingStateSQLCommitted)
+		}
 	}
 	for id := range pending {
 		revert := svc.RevertUser(int(id))
@@ -314,6 +468,11 @@ func TestAutoGroupCommitFailureLeavesOnlyPendingNonActionableAudit(t *testing.T)
 	if len(pending) != 1 {
 		t.Fatalf("expected one pending recovery audit, got %d", len(pending))
 	}
+	for id, state := range store.pendingStateSnapshot() {
+		if state != autoGroupPendingStateAmbiguous {
+			t.Fatalf("pending audit %d state=%q, want %q", id, state, autoGroupPendingStateAmbiguous)
+		}
+	}
 	var ghostID int64
 	for id := range pending {
 		ghostID = id
@@ -347,6 +506,210 @@ func TestAutoGroupCommitFailureLeavesOnlyPendingNonActionableAudit(t *testing.T)
 	}
 	if got := autoGroupForUser(t, db, 1); got != "vip" {
 		t.Fatalf("ghost audit reverted the later legitimate assignment to %q", got)
+	}
+}
+
+func TestPendingAuditManualFinalizePreservesEvidenceButDisablesRevert(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{commitErr: errors.New("simulated Redis finalize failure")}
+	db, svc := newAutoGroupAuditTestService(t, store)
+	insertAutoGroupUser(t, db, 1, "alice", "default")
+
+	result := svc.assignUser(1, "vip", "admin")
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("assignment unexpectedly reported full success: %#v", result)
+	}
+	pending, err := svc.GetPendingAudits()
+	if err != nil {
+		t.Fatalf("list pending audits: %v", err)
+	}
+	items, ok := pending["items"].([]map[string]interface{})
+	if !ok || len(items) != 1 {
+		t.Fatalf("unexpected pending operation list: %#v", pending)
+	}
+	operationID := toString(items[0]["operation_id"])
+	if operationID == "" || toString(items[0]["state"]) != autoGroupPendingStateSQLCommitted {
+		t.Fatalf("unexpected pending operation metadata: %#v", items[0])
+	}
+	if _, err := svc.ResolvePendingAudit(operationID, autoGroupPendingResolutionFinalize, "FINALIZE wrong", "admin"); err == nil {
+		t.Fatal("manual finalize accepted an incorrect confirmation")
+	}
+	resolved, err := svc.ResolvePendingAudit(
+		operationID,
+		autoGroupPendingResolutionFinalize,
+		"FINALIZE "+operationID,
+		"security-admin",
+	)
+	if err != nil {
+		t.Fatalf("manual finalize: %v", err)
+	}
+	if revertible, _ := resolved["revertible"].(bool); revertible {
+		t.Fatalf("ambiguous manual finalize unexpectedly became revertible: %#v", resolved)
+	}
+	if got := len(store.pendingSnapshot()); got != 0 {
+		t.Fatalf("manual finalize retained %d pending records", got)
+	}
+	logs, ids := store.snapshot()
+	if len(logs) != 1 || len(ids) != 1 {
+		t.Fatalf("manual finalize did not preserve one committed audit record: logs=%d ids=%d", len(logs), len(ids))
+	}
+	var archived map[string]interface{}
+	if err := json.Unmarshal([]byte(logs[0]), &archived); err != nil {
+		t.Fatalf("decode manually finalized record: %v", err)
+	}
+	if archived["revertible"] != false || toString(archived["recovery_state"]) != "manually_finalized_ambiguous" {
+		t.Fatalf("manual finalize did not mark the record non-revertible: %#v", archived)
+	}
+	reverted := svc.RevertUser(int(ids[0]))
+	if success, _ := reverted["success"].(bool); success {
+		t.Fatalf("manually finalized ambiguous audit unexpectedly reverted the user: %#v", reverted)
+	}
+	if message := toString(reverted["message"]); !strings.Contains(message, "不允许自动恢复") {
+		t.Fatalf("unexpected non-revertible error: %q", message)
+	}
+}
+
+func TestPendingAuditSQLCommittedCannotBeDiscarded(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{commitErr: errors.New("simulated Redis finalize failure")}
+	db, svc := newAutoGroupAuditTestService(t, store)
+	insertAutoGroupUser(t, db, 1, "alice", "default")
+
+	result := svc.assignUser(1, "vip", "admin")
+	if success, _ := result["success"].(bool); success {
+		t.Fatalf("assignment unexpectedly reported full success: %#v", result)
+	}
+	pending, err := svc.GetPendingAudits()
+	if err != nil {
+		t.Fatalf("list pending audits: %v", err)
+	}
+	items, ok := pending["items"].([]map[string]interface{})
+	if !ok || len(items) != 1 {
+		t.Fatalf("unexpected pending operation list: %#v", pending)
+	}
+	operationID := toString(items[0]["operation_id"])
+	if toString(items[0]["state"]) != autoGroupPendingStateSQLCommitted {
+		t.Fatalf("unexpected pending operation state: %#v", items[0])
+	}
+
+	if _, err := svc.ResolvePendingAudit(
+		operationID,
+		autoGroupPendingResolutionDiscard,
+		"DISCARD "+operationID,
+		"security-admin",
+	); err == nil || !strings.Contains(err.Error(), "must be finalized") {
+		t.Fatalf("SQL-committed pending audit was not protected from discard: %v", err)
+	}
+	if got := len(store.pendingSnapshot()); got != 1 {
+		t.Fatalf("rejected discard removed pending audit evidence: got %d records", got)
+	}
+	if got := autoGroupForUser(t, db, 1); got != "vip" {
+		t.Fatalf("SQL-committed mutation unexpectedly changed after rejected discard: %q", got)
+	}
+}
+
+func TestPendingAuditCommitUnknownCannotBeResolvedOnline(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{}
+	_, svc := newAutoGroupAuditTestService(t, store)
+	ctx := context.Background()
+	logs, err := prepareAutoGroupAuditLogs(ctx, store, "assign", []autoGroupLogUser{{
+		ID: 1, Username: "alice", Source: "password",
+	}}, "default", "vip", "admin")
+	if err != nil {
+		t.Fatalf("prepare pending audit: %v", err)
+	}
+	if err := store.StageLogs(ctx, logs); err != nil {
+		t.Fatalf("stage pending audit: %v", err)
+	}
+	var entry autoGroupAuditEntry
+	if err := json.Unmarshal([]byte(logs[0]), &entry); err != nil {
+		t.Fatalf("decode pending audit: %v", err)
+	}
+
+	for _, resolution := range []string{autoGroupPendingResolutionFinalize, autoGroupPendingResolutionDiscard} {
+		confirmation := strings.ToUpper(resolution) + " " + entry.OperationID
+		if _, err := svc.ResolvePendingAudit(entry.OperationID, resolution, confirmation, "admin"); err == nil || !strings.Contains(err.Error(), "cannot be resolved online") {
+			t.Fatalf("commit-unknown operation accepted %s: %v", resolution, err)
+		}
+	}
+	if got := len(store.pendingSnapshot()); got != 1 {
+		t.Fatalf("rejected online recovery removed pending evidence: got %d records", got)
+	}
+}
+
+func TestPendingAuditManualDiscardRequiresExactOperationConfirmation(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{}
+	_, svc := newAutoGroupAuditTestService(t, store)
+	ctx := context.Background()
+	logs, err := prepareAutoGroupAuditLogs(ctx, store, "assign", []autoGroupLogUser{{
+		ID: 1, Username: "alice", Source: "password",
+	}}, "default", "vip", "admin")
+	if err != nil {
+		t.Fatalf("prepare pending audit: %v", err)
+	}
+	if err := store.StageLogs(ctx, logs); err != nil {
+		t.Fatalf("stage pending audit: %v", err)
+	}
+	ids, err := autoGroupAuditLogIDs(logs)
+	if err != nil {
+		t.Fatalf("decode staged audit IDs: %v", err)
+	}
+	if err := store.SetPendingState(ctx, ids, autoGroupPendingStateAmbiguous); err != nil {
+		t.Fatalf("mark pending audit ambiguous: %v", err)
+	}
+	var entry autoGroupAuditEntry
+	if err := json.Unmarshal([]byte(logs[0]), &entry); err != nil {
+		t.Fatalf("decode pending audit: %v", err)
+	}
+	if _, err := svc.ResolvePendingAudit(entry.OperationID, autoGroupPendingResolutionDiscard, "DISCARD", "admin"); err == nil {
+		t.Fatal("manual discard accepted an incomplete confirmation")
+	}
+	if _, err := svc.ResolvePendingAudit(
+		entry.OperationID,
+		autoGroupPendingResolutionDiscard,
+		"DISCARD "+entry.OperationID,
+		"admin",
+	); err != nil {
+		t.Fatalf("manual discard: %v", err)
+	}
+	if got := len(store.pendingSnapshot()); got != 0 {
+		t.Fatalf("manual discard retained %d pending records", got)
+	}
+	if committed, _ := store.snapshot(); len(committed) != 0 {
+		t.Fatalf("manual discard unexpectedly committed %d records", len(committed))
+	}
+}
+
+func TestPendingAuditCapacityFailsClosedWithoutEvictingEvidence(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{
+		pending:      make(map[int64]string, autoGroupMaxPendingLogs),
+		pendingAt:    make(map[int64]time.Time, autoGroupMaxPendingLogs),
+		pendingState: make(map[int64]string, autoGroupMaxPendingLogs),
+	}
+	for id := int64(1); id <= autoGroupMaxPendingLogs; id++ {
+		store.pending[id] = "preserved"
+		store.pendingAt[id] = time.Now()
+		store.pendingState[id] = autoGroupPendingStateAmbiguous
+	}
+	ctx := context.Background()
+	logs, err := prepareAutoGroupAuditLogs(ctx, store, "assign", []autoGroupLogUser{{
+		ID: 9999, Username: "blocked", Source: "password",
+	}}, "default", "vip", "admin")
+	if err != nil {
+		t.Fatalf("prepare audit at capacity: %v", err)
+	}
+	if err := store.StageLogs(ctx, logs); err == nil || !strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("expected pending capacity rejection, got %v", err)
+	}
+	if got := len(store.pendingSnapshot()); got != int(autoGroupMaxPendingLogs) {
+		t.Fatalf("capacity rejection evicted pending evidence: got %d records", got)
+	}
+}
+
+func TestAutoGroupRejectsFutureAuditVersion(t *testing.T) {
+	entry := map[string]interface{}{
+		"audit_version": float64(autoGroupAuditVersion + 1),
+	}
+	if requiresMarker, err := autoGroupLogRequiresCommitMarker(entry); err == nil || requiresMarker {
+		t.Fatalf("future audit version was accepted: marker=%t err=%v", requiresMarker, err)
 	}
 }
 

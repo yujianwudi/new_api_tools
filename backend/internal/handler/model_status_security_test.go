@@ -116,7 +116,7 @@ func TestPublicModelRateLimitAmortizesCapacitySweeps(t *testing.T) {
 	}
 }
 
-func TestPublicBatchLimitsDoNotConstrainAuthenticatedRoutes(t *testing.T) {
+func TestAuthenticatedBatchUsesHigherButFiniteLimits(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	configurePublicModelStatusTest(t)
 	installEmptyHandlerDatabase(t)
@@ -150,6 +150,44 @@ func TestPublicBatchLimitsDoNotConstrainAuthenticatedRoutes(t *testing.T) {
 	authenticatedRouter.ServeHTTP(authenticatedRecorder, authenticatedRequest)
 	if authenticatedRecorder.Code == http.StatusBadRequest {
 		t.Fatalf("authenticated batch was incorrectly constrained by public limits: %s", authenticatedRecorder.Body.String())
+	}
+
+	tooManyNames := make([]string, authenticatedModelStatusMaxBatch+1)
+	for i := range tooManyNames {
+		tooManyNames[i] = fmt.Sprintf("model-%d", i)
+	}
+	tooManyPayload, err := json.Marshal(tooManyNames)
+	if err != nil {
+		t.Fatalf("marshal oversized authenticated batch: %v", err)
+	}
+	authenticatedRecorder = httptest.NewRecorder()
+	authenticatedRequest = httptest.NewRequest(
+		http.MethodPost,
+		"/api/model-status/status/multiple",
+		strings.NewReader(string(tooManyPayload)),
+	)
+	authenticatedRequest.Header.Set("Content-Type", "application/json")
+	authenticatedRouter.ServeHTTP(authenticatedRecorder, authenticatedRequest)
+	if authenticatedRecorder.Code != http.StatusBadRequest ||
+		!strings.Contains(authenticatedRecorder.Body.String(), "At most 200") {
+		t.Fatalf("authenticated batch limit was not enforced: status=%d body=%s", authenticatedRecorder.Code, authenticatedRecorder.Body.String())
+	}
+
+	oversizedPayload := `["` + strings.Repeat("x", int(authenticatedModelStatusMaxBodyBytes)) + `"]`
+	authenticatedRecorder = httptest.NewRecorder()
+	authenticatedRequest = httptest.NewRequest(
+		http.MethodPost,
+		"/api/model-status/status/multiple",
+		strings.NewReader(oversizedPayload),
+	)
+	authenticatedRequest.Header.Set("Content-Type", "application/json")
+	authenticatedRouter.ServeHTTP(authenticatedRecorder, authenticatedRequest)
+	if authenticatedRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("authenticated body limit was not enforced: status=%d body=%s", authenticatedRecorder.Code, authenticatedRecorder.Body.String())
+	}
+	if strings.Contains(authenticatedRecorder.Body.String(), "request body too large") ||
+		strings.Contains(authenticatedRecorder.Body.String(), "details") {
+		t.Fatalf("authenticated body limit leaked parser diagnostics: %s", authenticatedRecorder.Body.String())
 	}
 }
 
@@ -232,12 +270,13 @@ func TestPublicMultipleModelStatusHidesJSONParserDetails(t *testing.T) {
 	if authenticatedRecorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected authenticated status 400, got %d: %s", authenticatedRecorder.Code, authenticatedRecorder.Body.String())
 	}
-	if !strings.Contains(authenticatedRecorder.Body.String(), "details") {
-		t.Fatalf("authenticated route lost parser diagnostics: %s", authenticatedRecorder.Body.String())
+	if strings.Contains(authenticatedRecorder.Body.String(), "details") ||
+		strings.Contains(authenticatedRecorder.Body.String(), "unexpected EOF") {
+		t.Fatalf("authenticated parser error leaked implementation details: %s", authenticatedRecorder.Body.String())
 	}
 }
 
-func TestAuthenticatedModelStatusRetainsDatabaseDiagnostics(t *testing.T) {
+func TestAuthenticatedModelStatusHidesDatabaseDiagnostics(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	configurePublicModelStatusTest(t)
 	installEmptyHandlerDatabase(t)
@@ -252,8 +291,13 @@ func TestAuthenticatedModelStatusRetainsDatabaseDiagnostics(t *testing.T) {
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("expected status 500, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "no such table") ||
-		!strings.Contains(recorder.Body.String(), "logs") {
-		t.Fatalf("authenticated route lost database diagnostics: %s", recorder.Body.String())
+	body := recorder.Body.String()
+	if !strings.Contains(body, "Model status data is temporarily unavailable") {
+		t.Fatalf("stable generic error message missing: %s", body)
+	}
+	for _, sensitive := range []string{"no such table", "SQL logic error", "logs", "abilities"} {
+		if strings.Contains(body, sensitive) {
+			t.Fatalf("authenticated response leaked database detail %q: %s", sensitive, body)
+		}
 	}
 }

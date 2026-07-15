@@ -347,6 +347,14 @@ func buildDashboardSystemInfo(metrics DashboardScaleMetrics) DashboardSystemInfo
 
 func buildDashboardRefreshEstimate(info DashboardSystemInfo, period string) DashboardRefreshEstimate {
 	estimatedLogs := estimateDashboardLogs(info.Metrics.Logs24H, period)
+	// A quiet latest 24-hour window can substantially understate a multi-day
+	// refresh after an earlier traffic spike. TotalLogs is already a
+	// conservative estimate (MAX(id) or engine metadata), so use it as the
+	// workload floor for 3d-14d refreshes. This deliberately favors showing the
+	// confirmation over letting a large historical scan bypass it.
+	if period != "24h" && info.Metrics.TotalLogs > estimatedLogs {
+		estimatedLogs = info.Metrics.TotalLogs
+	}
 	estimate := DashboardRefreshEstimate{
 		ShowEstimate:           false,
 		Scale:                  info.Scale,

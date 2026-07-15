@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -40,7 +39,7 @@ func ListAffiliateStats(c *gin.Context) {
 	params := parseAffiliateParams(c)
 	result, err := service.ListAffiliateStats(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "affiliate statistics list query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -54,7 +53,7 @@ func GetAffiliateStatsSummary(c *gin.Context) {
 	params := parseAffiliateParams(c)
 	summary, err := service.GetAffiliateStatsSummary(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "affiliate statistics summary query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

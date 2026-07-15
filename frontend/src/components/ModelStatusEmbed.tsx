@@ -854,7 +854,9 @@ function formatCountdown(seconds: number): string {
 }
 
 function getStatusColor(status: ModelHealthStatus, styles: typeof themeStyles.obsidian) {
-  if (status === 'unknown') return styles.statusEmpty
+  if (status === 'unknown') {
+    return cn(styles.statusEmpty, 'border border-dashed border-current/60 bg-transparent')
+  }
   return status === 'green' ? styles.statusGreen :
          status === 'yellow' ? styles.statusYellow : styles.statusRed
 }
@@ -1324,6 +1326,13 @@ export function ModelStatusEmbed({
               </span>
             </div>
           ))}
+          {/* Unknown status indicator */}
+          <div className="flex items-center gap-2">
+            <span className={cn(styles.legendDot, getStatusColor('unknown', styles))} />
+            <span className={styles.legendText}>
+              {theme === 'minimal' ? 'Unknown' : '状态未知'}
+            </span>
+          </div>
           {/* No requests indicator */}
           <div className="flex items-center gap-2">
             <span className={cn(styles.legendDot, styles.statusEmpty)} />
@@ -1368,9 +1377,11 @@ export function ModelStatusEmbed({
                       ? 'text-amber-400'
                       : 'text-rose-400'
               )}>
-                {hoveredSlot.total_requests === 0 || hoveredSlot.status === 'unknown'
-                  ? '暂无数据'
-                  : `${hoveredSlot.success_rate}%`}
+                {hoveredSlot.total_requests === 0
+                  ? '无请求'
+                  : hoveredSlot.status === 'unknown'
+                    ? '状态未知'
+                    : `${hoveredSlot.success_rate}%`}
               </span>
             </div>
           </div>

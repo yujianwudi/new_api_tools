@@ -224,3 +224,24 @@ func TestIPGeoDownloadRejectsChunkedBodyOverMaximumSize(t *testing.T) {
 		}
 	}
 }
+
+func TestIPGeoDefaultDownloadClientRejectsPlainHTTP(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := (&IPGeoService{}).httpClient()
+	resp, err := client.Get(server.URL)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("default GeoIP download client accepted plain HTTP")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("unsafe request reached the HTTP server: requests=%d", got)
+	}
+}

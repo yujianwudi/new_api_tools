@@ -77,7 +77,7 @@ func GetIndexStatus(c *gin.Context) {
 
 		exists, err := db.IndexExists(idx.Name, idx.Table)
 		if err != nil {
-			logger.L.Warn("检查索引状态失败 "+idx.Name+": "+err.Error(), logger.CatDatabase)
+			logger.L.Error("Index status check failed for "+idx.Name+": "+err.Error(), logger.CatDatabase)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"success": false,
 				"message": "检查索引状态失败",

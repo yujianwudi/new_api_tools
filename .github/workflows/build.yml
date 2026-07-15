@@ -10,6 +10,7 @@ on:
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'index.html'
       - 'Dockerfile'
       - '.dockerignore'
       - 'docker-compose*.yml'
@@ -27,6 +28,7 @@ on:
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'index.html'
       - 'Dockerfile'
       - '.dockerignore'
       - 'docker-compose*.yml'
@@ -40,7 +42,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -56,6 +58,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Validate deployment configuration
         run: |
@@ -70,7 +74,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          cache: false
 
       - name: Run Go tests
         working-directory: backend
@@ -90,8 +94,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+
+      - name: Test static redemption generator
+        run: node tests/index_expiry_validation_test.mjs
+
+      - name: Test browser secret storage guards
+        run: node tests/frontend_secret_storage_test.mjs
 
       - name: Install frontend dependencies
         working-directory: frontend

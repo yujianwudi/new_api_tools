@@ -237,6 +237,8 @@ func isBlockedIP(ip net.IP) bool {
 }
 
 var blockedNetworks = mustParseCIDRs([]string{
+	"64:ff9b::/96",
+	"64:ff9b:1::/48",
 	"0.0.0.0/8",
 	"100.64.0.0/10",
 	"192.0.0.0/24",

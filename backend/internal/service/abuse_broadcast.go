@@ -187,15 +187,31 @@ type abuseSettings struct {
 	UpdatedAt           int64
 }
 
+const (
+	DefaultAbuseBroadcastPullIntervalSeconds = 300
+	MinAbuseBroadcastPullIntervalSeconds     = 30
+	MaxAbuseBroadcastPullIntervalSeconds     = 86400
+)
+
+func normalizeAbuseBroadcastPullInterval(seconds int) int {
+	if seconds <= 0 {
+		return DefaultAbuseBroadcastPullIntervalSeconds
+	}
+	if seconds < MinAbuseBroadcastPullIntervalSeconds {
+		return MinAbuseBroadcastPullIntervalSeconds
+	}
+	if seconds > MaxAbuseBroadcastPullIntervalSeconds {
+		return MaxAbuseBroadcastPullIntervalSeconds
+	}
+	return seconds
+}
+
 func (s abuseSettings) configured() bool {
 	return s.HubURL != "" && s.NodeID != "" && s.Secret != ""
 }
 
 func (s abuseSettings) interval() int {
-	if s.PullIntervalSeconds <= 0 {
-		return 300
-	}
-	return s.PullIntervalSeconds
+	return normalizeAbuseBroadcastPullInterval(s.PullIntervalSeconds)
 }
 
 type hubEnvelope struct {
@@ -351,7 +367,13 @@ func (s *AbuseBroadcastService) UpdateSettings(ctx context.Context, input AbuseB
 	if input.PullIntervalSeconds != nil {
 		val := *input.PullIntervalSeconds
 		if val <= 0 {
-			val = 300
+			val = DefaultAbuseBroadcastPullIntervalSeconds
+		} else if val < MinAbuseBroadcastPullIntervalSeconds || val > MaxAbuseBroadcastPullIntervalSeconds {
+			return AbuseBroadcastSettings{}, fmt.Errorf(
+				"拉取间隔必须在 %d 到 %d 秒之间",
+				MinAbuseBroadcastPullIntervalSeconds,
+				MaxAbuseBroadcastPullIntervalSeconds,
+			)
 		}
 		settings.PullIntervalSeconds = val
 	}
@@ -1653,16 +1675,14 @@ func loadAbuseSettings(ctx context.Context, db *sql.DB) (abuseSettings, error) {
 		&settings.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
-		return abuseSettings{PullIntervalSeconds: 300}, nil
+		return abuseSettings{PullIntervalSeconds: DefaultAbuseBroadcastPullIntervalSeconds}, nil
 	}
 	if err != nil {
 		return abuseSettings{}, err
 	}
 	settings.Enabled = enabled == 1
 	settings.HubURL = strings.TrimRight(settings.HubURL, "/")
-	if settings.PullIntervalSeconds <= 0 {
-		settings.PullIntervalSeconds = 300
-	}
+	settings.PullIntervalSeconds = normalizeAbuseBroadcastPullInterval(settings.PullIntervalSeconds)
 	return settings, nil
 }
 

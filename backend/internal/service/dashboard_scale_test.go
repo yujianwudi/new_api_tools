@@ -47,10 +47,10 @@ func TestBuildDashboardRefreshEstimate(t *testing.T) {
 	if !estimate.ShowEstimate || estimate.Scale != DashboardScaleLarge {
 		t.Fatalf("large system estimate was not enabled: %+v", estimate)
 	}
-	if estimate.EstimatedLogs != 14_000_000 || estimate.EstimatedLogsFormatted != "14.0M" {
+	if estimate.EstimatedLogs != 25_000_000 || estimate.EstimatedLogsFormatted != "25.0M" {
 		t.Fatalf("unexpected estimated logs: %+v", estimate)
 	}
-	if estimate.EstimatedSeconds != 70 || estimate.EstimatedTimeFormatted != "70~105 秒" {
+	if estimate.EstimatedSeconds != 125 || estimate.EstimatedTimeFormatted != "125~187 秒" {
 		t.Fatalf("unexpected estimated duration: %+v", estimate)
 	}
 	if estimate.Warning == "" || estimate.TotalLogs != 25_000_000 || estimate.Logs24H != 2_000_000 {
@@ -67,6 +67,24 @@ func TestBuildDashboardRefreshEstimate(t *testing.T) {
 	mediumEstimate := buildDashboardRefreshEstimate(medium, "14d")
 	if medium.IsLargeSystem || !mediumEstimate.ShowEstimate || mediumEstimate.EstimatedLogs != 12_600_000 {
 		t.Fatalf("long-period medium refresh was underestimated: info=%+v estimate=%+v", medium, mediumEstimate)
+	}
+
+	quietHistory := buildDashboardSystemInfo(DashboardScaleMetrics{
+		TotalUsers: 100,
+		Logs24H:    500,
+		TotalLogs:  2_000_000,
+	})
+	quietHistoryEstimate := buildDashboardRefreshEstimate(quietHistory, "3d")
+	if quietHistory.IsLargeSystem || !quietHistoryEstimate.ShowEstimate {
+		t.Fatalf("large historical refresh bypassed confirmation: info=%+v estimate=%+v", quietHistory, quietHistoryEstimate)
+	}
+	if quietHistoryEstimate.EstimatedLogs != 2_000_000 || quietHistoryEstimate.EstimatedSeconds != 8 {
+		t.Fatalf("historical workload was not used conservatively: %+v", quietHistoryEstimate)
+	}
+
+	quiet24H := buildDashboardRefreshEstimate(quietHistory, "24h")
+	if quiet24H.ShowEstimate || quiet24H.EstimatedLogs != 500 {
+		t.Fatalf("24h refresh should use the bounded daily workload: %+v", quiet24H)
 	}
 }
 

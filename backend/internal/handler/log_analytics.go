@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -42,7 +41,7 @@ func ProcessLogs(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	result, err := svc.ProcessLogs()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("PROCESS_ERROR", err.Error(), ""))
+		respondInternalError(c, "PROCESS_ERROR", "Unable to process analytics logs", "analytics log processing", err)
 		return
 	}
 	c.JSON(http.StatusOK, result)
@@ -55,7 +54,7 @@ func BatchProcessLogs(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	result, err := svc.BatchProcess(maxIter)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("PROCESS_ERROR", err.Error(), ""))
+		respondInternalError(c, "PROCESS_ERROR", "Unable to process analytics logs", "analytics batch log processing", err)
 		return
 	}
 	c.JSON(http.StatusOK, result)
@@ -67,7 +66,7 @@ func GetUserRequestRanking(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.GetUserRequestRanking(limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "analytics request ranking query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -79,7 +78,7 @@ func GetUserQuotaRanking(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.GetUserQuotaRanking(limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "analytics quota ranking query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -91,7 +90,7 @@ func GetModelStatistics(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.GetModelStatistics(limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "analytics model statistics query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -102,7 +101,7 @@ func GetAnalyticsSummary(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.GetSummary()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "analytics summary query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -112,7 +111,7 @@ func GetAnalyticsSummary(c *gin.Context) {
 func ResetAnalytics(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	if err := svc.ResetAnalytics(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("RESET_ERROR", err.Error(), ""))
+		respondInternalError(c, "RESET_ERROR", "Unable to reset analytics data", "analytics reset", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -126,7 +125,7 @@ func GetSyncStatus(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.GetSyncStatus()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "analytics sync status query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -138,7 +137,7 @@ func CheckDataConsistency(c *gin.Context) {
 	svc := service.NewLogAnalyticsService()
 	data, err := svc.CheckDataConsistency(autoReset)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("CHECK_ERROR", err.Error(), ""))
+		respondInternalError(c, "CHECK_ERROR", "Unable to check analytics data consistency", "analytics consistency check", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

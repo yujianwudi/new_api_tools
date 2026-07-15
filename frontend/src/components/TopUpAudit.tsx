@@ -144,19 +144,37 @@ export function TopUpAudit({ active }: Props) {
       fetchAnomalies(),
     ])
 
-    if (generation !== requestGenerationRef.current) return false
+    if (generation !== requestGenerationRef.current) {
+      return { isCurrent: false, complete: false }
+    }
 
-    if (nextProviderHealth) setProviderHealth(nextProviderHealth)
-    if (nextAnomalies) setAnomalies(nextAnomalies)
+    const complete = nextProviderHealth !== null && nextAnomalies !== null
+    if (nextProviderHealth !== null) setProviderHealth(nextProviderHealth)
+    if (nextAnomalies !== null) setAnomalies(nextAnomalies)
+    if (complete) initialLoadedRef.current = true
     setRefreshing(false)
-    if (showDoneToast) showToast('success', '审计数据已刷新')
-    return true
+    if (complete) {
+      if (showDoneToast) {
+        showToast('success', '审计数据已刷新')
+      }
+    } else if (nextProviderHealth === null && nextAnomalies === null) {
+      showToast('error', '审计数据刷新失败，请稍后重试')
+    } else {
+      showToast('info', '审计数据仅部分刷新成功，失败部分已保留原数据')
+    }
+    return { isCurrent: true, complete }
   }, [fetchProviderHealth, fetchAnomalies, showToast])
 
   const lastFetchedRef = useRef<typeof fetchAll | null>(null)
 
   useEffect(() => {
-    if (!active || lastFetchedRef.current === fetchAll) return
+    if (!active) {
+      lastFetchedRef.current = null
+      requestGenerationRef.current += 1
+      setRefreshing(false)
+      return
+    }
+    if (lastFetchedRef.current === fetchAll) return
     lastFetchedRef.current = fetchAll
 
     const isInitialLoad = !initialLoadedRef.current
@@ -164,9 +182,8 @@ export function TopUpAudit({ active }: Props) {
       setLoading(true)
     }
 
-    fetchAll().then(isCurrent => {
+    fetchAll().then(({ isCurrent }) => {
       if (isInitialLoad && isCurrent) {
-        initialLoadedRef.current = true
         setLoading(false)
       }
     })

@@ -300,20 +300,20 @@ export function Dashboard() {
   }, [fetchOverview, fetchUsage, fetchModels, fetchTrends, fetchAnalyticsSummary])
 
   // 获取系统规模信息（仅首次加载）
-  const fetchSystemInfo = useCallback(async () => {
+  const fetchSystemInfo = useCallback(async (signal?: AbortSignal) => {
     try {
       const response = await fetch(
         `${apiUrl}/api/dashboard/system-info`,
-        { headers: getAuthHeaders() },
+        { headers: getAuthHeaders(), signal },
       )
       const data = await response.json()
       if (!response.ok || !data.success || typeof data.data?.is_large_system !== 'boolean') {
         console.error('Failed to fetch system info:', response.status)
         return
       }
-      if (mountedRef.current) setSystemInfo(data.data)
+      if (mountedRef.current && !signal?.aborted) setSystemInfo(data.data)
     } catch (error) {
-      console.error('Failed to fetch system info:', error)
+      if (!signal?.aborted) console.error('Failed to fetch system info:', error)
     }
   }, [apiUrl, getAuthHeaders])
 
@@ -358,10 +358,17 @@ export function Dashboard() {
     }
   }, [apiUrl, getAuthHeaders, requestTimeoutMs])
 
-  // 首次加载时获取系统信息
+  // 首次加载及周期切换时获取系统信息；清理函数会取消旧请求。
   useEffect(() => {
-    fetchSystemInfo()
-  }, [fetchSystemInfo])
+    const controller = new AbortController()
+    const timeoutId = window.setTimeout(() => controller.abort('timeout'), requestTimeoutMs)
+    void fetchSystemInfo(controller.signal)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+      controller.abort('system-info-effect-cleanup')
+    }
+  }, [fetchSystemInfo, period, requestTimeoutMs])
 
   useEffect(() => {
     const controller = new AbortController()

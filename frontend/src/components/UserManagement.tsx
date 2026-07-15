@@ -310,6 +310,11 @@ export function UserManagement() {
           showToast('info', '没有需要清理的软删除用户')
           return
         }
+        if (!snapshotId) {
+          setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+          showToast('error', '预览未返回安全快照，请重试')
+          return
+        }
         setConfirmDialog(prev => ({
           ...prev,
           message: `确定要永久清理 ${count} 个已软删除的用户吗？\n\n⚠️ 这是默认禁用的兼容写库路径，只会清理本工具已覆盖的用户和令牌数据，可能遗留 2FA、Passkey、OAuth 绑定等认证记录。请优先在 NewAPI 后台完成永久删除。`,

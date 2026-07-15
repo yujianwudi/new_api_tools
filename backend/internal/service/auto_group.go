@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,14 +20,25 @@ import (
 )
 
 const (
-	autoGroupLogsKey            = "auto_group:logs"
-	autoGroupLogSequenceKey     = "auto_group:log_sequence"
-	autoGroupPendingLogsKey     = "auto_group:pending_logs"
-	autoGroupCommittedLogIDsKey = "auto_group:committed_log_ids"
-	autoGroupCommitSequenceKey  = "auto_group:commit_sequence"
-	autoGroupAuditVersion       = int64(2)
-	autoGroupMaxLogs            = int64(1000)
-	maxJSONSafeInteger          = int64(1<<53 - 1)
+	autoGroupLogsKey              = "auto_group:logs"
+	autoGroupLogSequenceKey       = "auto_group:log_sequence"
+	autoGroupPendingLogsKey       = "auto_group:pending_logs"
+	autoGroupPendingLogTimesKey   = "auto_group:pending_log_times"
+	autoGroupPendingStatesKey     = "auto_group:pending_states"
+	autoGroupCommittedLogIDsKey   = "auto_group:committed_log_ids"
+	autoGroupCommitSequenceKey    = "auto_group:commit_sequence"
+	autoGroupAuditVersion         = int64(2)
+	autoGroupMaxLogs              = int64(1000)
+	autoGroupMaxPendingLogs       = int64(2000)
+	maxJSONSafeInteger            = int64(1<<53 - 1)
+	autoGroupMutationTimeout      = 2 * time.Minute
+	autoGroupAuditFinalizeTimeout = 15 * time.Second
+
+	autoGroupPendingStateUnknown       = "commit_unknown"
+	autoGroupPendingStateAmbiguous     = "commit_ambiguous"
+	autoGroupPendingStateSQLCommitted  = "sql_committed"
+	autoGroupPendingResolutionFinalize = "finalize"
+	autoGroupPendingResolutionDiscard  = "discard"
 )
 
 var reserveAutoGroupLogIDsScript = redis.NewScript(`
@@ -68,6 +80,70 @@ redis.call('SET', KEYS[1], current)
 return redis.call('INCRBY', KEYS[1], count)
 `)
 
+var stageAutoGroupAuditLogsScript = redis.NewScript(`
+local max_pending = tonumber(ARGV[1])
+local redis_time = redis.call('TIME')
+local staged_at = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
+if not max_pending or max_pending <= 0 or not staged_at or staged_at <= 0 then
+  return redis.error_reply('invalid pending auto-group audit limits')
+end
+if ((#ARGV - 1) % 2) ~= 0 then
+  return redis.error_reply('invalid pending auto-group audit payload')
+end
+
+local pending_type = redis.call('TYPE', KEYS[1]).ok
+if pending_type ~= 'none' and pending_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit log key type')
+end
+local times_type = redis.call('TYPE', KEYS[2]).ok
+if times_type ~= 'none' and times_type ~= 'zset' then
+  return redis.error_reply('invalid pending auto-group audit time key type')
+end
+local states_type = redis.call('TYPE', KEYS[3]).ok
+if states_type ~= 'none' and states_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit state key type')
+end
+
+local incoming = (#ARGV - 1) / 2
+local current = redis.call('HLEN', KEYS[1])
+if current + incoming > max_pending then
+  return redis.error_reply('pending auto-group audit capacity exceeded')
+end
+
+for i = 2, #ARGV, 2 do
+  local id = ARGV[i]
+  if redis.call('HEXISTS', KEYS[1], id) == 1 then
+    return redis.error_reply('duplicate pending auto-group audit log ' .. id)
+  end
+end
+
+for i = 2, #ARGV, 2 do
+  local id = ARGV[i]
+  local raw = ARGV[i + 1]
+  redis.call('HSET', KEYS[1], id, raw)
+  redis.call('ZADD', KEYS[2], staged_at, id)
+  redis.call('HSET', KEYS[3], id, 'commit_unknown')
+end
+return incoming
+`)
+
+var setAutoGroupPendingStateScript = redis.NewScript(`
+local state = ARGV[1]
+if state ~= 'commit_ambiguous' and state ~= 'sql_committed' then
+  return redis.error_reply('invalid pending auto-group audit state')
+end
+for i = 2, #ARGV do
+  local id = ARGV[i]
+  if redis.call('HEXISTS', KEYS[1], id) ~= 1 then
+    return redis.error_reply('missing pending auto-group audit log ' .. id)
+  end
+end
+for i = 2, #ARGV do
+  redis.call('HSET', KEYS[2], ARGV[i], state)
+end
+return #ARGV - 1
+`)
+
 var commitAutoGroupAuditLogsScript = redis.NewScript(`
 local max_logs = tonumber(ARGV[1])
 local pending = {}
@@ -87,6 +163,14 @@ end
 local sequence_type = redis.call('TYPE', KEYS[4]).ok
 if sequence_type ~= 'none' and sequence_type ~= 'string' then
   return redis.error_reply('invalid auto-group audit commit sequence key type')
+end
+local times_type = redis.call('TYPE', KEYS[5]).ok
+if times_type ~= 'none' and times_type ~= 'zset' then
+  return redis.error_reply('invalid pending auto-group audit time key type')
+end
+local states_type = redis.call('TYPE', KEYS[6]).ok
+if states_type ~= 'none' and states_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit state key type')
 end
 
 local commit_sequence_raw = redis.call('GET', KEYS[4])
@@ -121,6 +205,135 @@ for _, item in ipairs(pending) do
   redis.call('LPUSH', KEYS[1], item.raw)
   redis.call('ZADD', KEYS[3], commit_sequence, item.id)
   redis.call('HDEL', KEYS[2], item.id)
+  redis.call('ZREM', KEYS[5], item.id)
+  redis.call('HDEL', KEYS[6], item.id)
+end
+
+redis.call('LTRIM', KEYS[1], 0, max_logs - 1)
+local marker_count = redis.call('ZCARD', KEYS[3])
+if marker_count > max_logs then
+  redis.call('ZREMRANGEBYRANK', KEYS[3], 0, marker_count - max_logs - 1)
+end
+return #pending
+`)
+
+var resolveAutoGroupPendingAuditScript = redis.NewScript(`
+local max_logs = tonumber(ARGV[1])
+local operation_id = ARGV[2]
+local resolution = ARGV[3]
+local actor = ARGV[4]
+local resolved_at = tonumber(ARGV[5])
+if resolution ~= 'finalize' and resolution ~= 'discard' then
+  return redis.error_reply('invalid pending auto-group audit resolution')
+end
+if operation_id == '' or actor == '' or not resolved_at or resolved_at <= 0 then
+  return redis.error_reply('invalid pending auto-group audit resolution metadata')
+end
+
+local pending_type = redis.call('TYPE', KEYS[2]).ok
+if pending_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit log key type')
+end
+local times_type = redis.call('TYPE', KEYS[5]).ok
+if times_type ~= 'none' and times_type ~= 'zset' then
+  return redis.error_reply('invalid pending auto-group audit time key type')
+end
+local states_type = redis.call('TYPE', KEYS[6]).ok
+if states_type ~= 'none' and states_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit state key type')
+end
+
+local expected_size = #ARGV - 5
+if expected_size <= 0 then
+  return redis.error_reply('pending auto-group audit operation is empty')
+end
+local pending = {}
+local indexes = {}
+local operation_state = nil
+for i = 6, #ARGV do
+  local id = ARGV[i]
+  local raw = redis.call('HGET', KEYS[2], id)
+  if not raw then
+    return redis.error_reply('missing pending auto-group audit log ' .. id)
+  end
+	local ok, entry = pcall(cjson.decode, raw)
+	if not ok or tostring(entry['operation_id']) ~= operation_id then
+	  return redis.error_reply('pending auto-group audit operation mismatch')
+	end
+	local pending_state = redis.call('HGET', KEYS[6], id) or 'commit_unknown'
+	if pending_state ~= 'commit_unknown' and pending_state ~= 'commit_ambiguous' and pending_state ~= 'sql_committed' then
+	  return redis.error_reply('invalid pending auto-group audit state')
+	end
+	if operation_state and pending_state ~= operation_state then
+	  return redis.error_reply('pending auto-group audit operation has mixed states')
+	end
+	operation_state = pending_state
+	if pending_state == 'commit_unknown' then
+	  return redis.error_reply('commit-unknown pending auto-group audit operations cannot be resolved online')
+	end
+	if resolution == 'discard' and pending_state == 'sql_committed' then
+	  return redis.error_reply('sql-committed pending auto-group audit operations must be finalized')
+	end
+	if tonumber(entry['audit_version']) ~= 2 or tonumber(entry['id']) ~= tonumber(id) then
+	  return redis.error_reply('invalid pending auto-group audit record')
+	end
+  if tonumber(entry['operation_size']) ~= expected_size then
+    return redis.error_reply('incomplete pending auto-group audit operation')
+  end
+  local operation_index = tonumber(entry['operation_index'])
+  if not operation_index or operation_index < 0 or operation_index >= expected_size or indexes[operation_index] then
+    return redis.error_reply('invalid pending auto-group audit operation index')
+  end
+  indexes[operation_index] = true
+  pending[#pending + 1] = {id = id, entry = entry}
+end
+
+if resolution == 'discard' then
+  for _, item in ipairs(pending) do
+    redis.call('HDEL', KEYS[2], item.id)
+    redis.call('ZREM', KEYS[5], item.id)
+    redis.call('HDEL', KEYS[6], item.id)
+  end
+  return #pending
+end
+
+local logs_type = redis.call('TYPE', KEYS[1]).ok
+if logs_type ~= 'none' and logs_type ~= 'list' then
+  return redis.error_reply('invalid committed auto-group audit log key type')
+end
+local markers_type = redis.call('TYPE', KEYS[3]).ok
+if markers_type ~= 'none' and markers_type ~= 'zset' then
+  return redis.error_reply('invalid auto-group audit marker key type')
+end
+local sequence_type = redis.call('TYPE', KEYS[4]).ok
+if sequence_type ~= 'none' and sequence_type ~= 'string' then
+  return redis.error_reply('invalid auto-group audit commit sequence key type')
+end
+
+local commit_sequence_raw = redis.call('GET', KEYS[4])
+if commit_sequence_raw and not tonumber(commit_sequence_raw) then
+  return redis.error_reply('invalid auto-group audit commit sequence')
+end
+local commit_sequence_seed = 0
+if not commit_sequence_raw then
+  local latest_marker = redis.call('ZREVRANGE', KEYS[3], 0, 0, 'WITHSCORES')
+  if latest_marker[2] then
+    commit_sequence_seed = tonumber(latest_marker[2]) or 0
+  end
+  redis.call('SET', KEYS[4], commit_sequence_seed)
+end
+
+for _, item in ipairs(pending) do
+  item.entry['revertible'] = false
+  item.entry['recovery_state'] = 'manually_finalized_ambiguous'
+  item.entry['resolved_by'] = actor
+  item.entry['resolved_at'] = resolved_at
+  local commit_sequence = redis.call('INCR', KEYS[4])
+  redis.call('LPUSH', KEYS[1], cjson.encode(item.entry))
+  redis.call('ZADD', KEYS[3], commit_sequence, item.id)
+  redis.call('HDEL', KEYS[2], item.id)
+  redis.call('ZREM', KEYS[5], item.id)
+  redis.call('HDEL', KEYS[6], item.id)
 end
 
 redis.call('LTRIM', KEYS[1], 0, max_logs - 1)
@@ -135,14 +348,25 @@ return #pending
 // SQL transaction commits. A SQL failure can leave a pending recovery record,
 // but it cannot evict committed history or leave an unaudited group mutation.
 // After SQL commit, Redis atomically moves the staged records into the capped
-// list and writes commit markers. Only those finalized records are revertible.
+// list and writes commit markers. Normal finalization is revertible; a manual
+// finalization of an ambiguous outcome is permanently marked non-revertible.
 type autoGroupAuditStore interface {
 	Ping(context.Context) error
 	ReserveIDs(context.Context, int) ([]int64, error)
 	StageLogs(context.Context, []string) error
 	CommitLogs(context.Context, []int64) error
+	SetPendingState(context.Context, []int64, string) error
+	ReadPending(context.Context, int64) ([]autoGroupPendingAuditRecord, error)
+	ResolvePending(context.Context, string, []int64, string, string, time.Time) error
 	IsCommitted(context.Context, int64) (bool, error)
 	ReadLogs(context.Context) ([]string, error)
+}
+
+type autoGroupPendingAuditRecord struct {
+	ID       int64
+	Raw      string
+	State    string
+	StagedAt time.Time
 }
 
 type redisAutoGroupAuditStore struct {
@@ -201,12 +425,22 @@ func (s *redisAutoGroupAuditStore) StageLogs(ctx context.Context, logs []string)
 	if err != nil {
 		return err
 	}
-	values := make([]interface{}, 0, len(logs)*2)
+	values := make([]interface{}, 0, len(logs)*2+1)
+	values = append(values, autoGroupMaxPendingLogs)
 	for i, id := range ids {
 		values = append(values, strconv.FormatInt(id, 10), logs[i])
 	}
-	if err := s.client.HSet(ctx, autoGroupPendingLogsKey, values...).Err(); err != nil {
+	staged, err := stageAutoGroupAuditLogsScript.Run(
+		ctx,
+		s.client,
+		[]string{autoGroupPendingLogsKey, autoGroupPendingLogTimesKey, autoGroupPendingStatesKey},
+		values...,
+	).Int64()
+	if err != nil {
 		return fmt.Errorf("stage audit logs: %w", err)
+	}
+	if staged != int64(len(logs)) {
+		return fmt.Errorf("staged %d audit logs, want %d", staged, len(logs))
 	}
 	return nil
 }
@@ -231,7 +465,14 @@ func (s *redisAutoGroupAuditStore) CommitLogs(ctx context.Context, ids []int64) 
 	committed, err := commitAutoGroupAuditLogsScript.Run(
 		ctx,
 		s.client,
-		[]string{autoGroupLogsKey, autoGroupPendingLogsKey, autoGroupCommittedLogIDsKey, autoGroupCommitSequenceKey},
+		[]string{
+			autoGroupLogsKey,
+			autoGroupPendingLogsKey,
+			autoGroupCommittedLogIDsKey,
+			autoGroupCommitSequenceKey,
+			autoGroupPendingLogTimesKey,
+			autoGroupPendingStatesKey,
+		},
 		args...,
 	).Int64()
 	if err != nil {
@@ -254,6 +495,156 @@ func (s *redisAutoGroupAuditStore) CommitLogs(ctx context.Context, ids []int64) 
 	}
 	if committed != int64(len(ids)) {
 		return fmt.Errorf("committed %d staged audit logs, want %d", committed, len(ids))
+	}
+	return nil
+}
+
+func (s *redisAutoGroupAuditStore) SetPendingState(ctx context.Context, ids []int64, state string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if s == nil || s.client == nil {
+		return errors.New("Redis client is not initialized")
+	}
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, state)
+	for _, id := range ids {
+		if id <= 0 || id > maxJSONSafeInteger {
+			return fmt.Errorf("invalid pending audit log ID %d", id)
+		}
+		args = append(args, strconv.FormatInt(id, 10))
+	}
+	updated, err := setAutoGroupPendingStateScript.Run(
+		ctx,
+		s.client,
+		[]string{autoGroupPendingLogsKey, autoGroupPendingStatesKey},
+		args...,
+	).Int64()
+	if err != nil {
+		return fmt.Errorf("set pending audit state: %w", err)
+	}
+	if updated != int64(len(ids)) {
+		return fmt.Errorf("updated %d pending audit states, want %d", updated, len(ids))
+	}
+	return nil
+}
+
+func (s *redisAutoGroupAuditStore) ReadPending(ctx context.Context, limit int64) ([]autoGroupPendingAuditRecord, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.New("Redis client is not initialized")
+	}
+	if limit <= 0 || limit > autoGroupMaxPendingLogs {
+		return nil, fmt.Errorf("invalid pending audit read limit %d", limit)
+	}
+	count, err := s.client.HLen(ctx, autoGroupPendingLogsKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("count pending audit logs: %w", err)
+	}
+	if count > limit {
+		return nil, fmt.Errorf("pending audit log count %d exceeds the safe enumeration limit %d", count, limit)
+	}
+	if count == 0 {
+		return []autoGroupPendingAuditRecord{}, nil
+	}
+
+	logs, err := s.client.HGetAll(ctx, autoGroupPendingLogsKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read pending audit logs: %w", err)
+	}
+	times, err := s.client.ZRangeWithScores(ctx, autoGroupPendingLogTimesKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read pending audit timestamps: %w", err)
+	}
+	timeByID := make(map[string]time.Time, len(times))
+	for _, item := range times {
+		id := fmt.Sprint(item.Member)
+		if item.Score > 0 {
+			timeByID[id] = time.UnixMilli(int64(item.Score))
+		}
+	}
+	states, err := s.client.HGetAll(ctx, autoGroupPendingStatesKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read pending audit states: %w", err)
+	}
+
+	records := make([]autoGroupPendingAuditRecord, 0, len(logs))
+	for rawID, raw := range logs {
+		id, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil || id <= 0 || id > maxJSONSafeInteger {
+			return nil, fmt.Errorf("invalid pending audit log ID %q", rawID)
+		}
+		stagedAt := timeByID[rawID]
+		if stagedAt.IsZero() {
+			var entry autoGroupAuditEntry
+			if json.Unmarshal([]byte(raw), &entry) == nil && entry.CreatedAt > 0 {
+				stagedAt = time.Unix(entry.CreatedAt, 0)
+			}
+		}
+		state := states[rawID]
+		if state == "" {
+			state = autoGroupPendingStateUnknown
+		}
+		records = append(records, autoGroupPendingAuditRecord{
+			ID:       id,
+			Raw:      raw,
+			State:    state,
+			StagedAt: stagedAt,
+		})
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].StagedAt.Equal(records[j].StagedAt) {
+			return records[i].ID < records[j].ID
+		}
+		if records[i].StagedAt.IsZero() {
+			return true
+		}
+		if records[j].StagedAt.IsZero() {
+			return false
+		}
+		return records[i].StagedAt.Before(records[j].StagedAt)
+	})
+	return records, nil
+}
+
+func (s *redisAutoGroupAuditStore) ResolvePending(
+	ctx context.Context,
+	operationID string,
+	ids []int64,
+	resolution, actor string,
+	resolvedAt time.Time,
+) error {
+	if len(ids) == 0 {
+		return errors.New("pending audit operation is empty")
+	}
+	if s == nil || s.client == nil {
+		return errors.New("Redis client is not initialized")
+	}
+	args := make([]interface{}, 0, len(ids)+5)
+	args = append(args, autoGroupMaxLogs, operationID, resolution, actor, resolvedAt.Unix())
+	for _, id := range ids {
+		if id <= 0 || id > maxJSONSafeInteger {
+			return fmt.Errorf("invalid pending audit log ID %d", id)
+		}
+		args = append(args, strconv.FormatInt(id, 10))
+	}
+	resolved, err := resolveAutoGroupPendingAuditScript.Run(
+		ctx,
+		s.client,
+		[]string{
+			autoGroupLogsKey,
+			autoGroupPendingLogsKey,
+			autoGroupCommittedLogIDsKey,
+			autoGroupCommitSequenceKey,
+			autoGroupPendingLogTimesKey,
+			autoGroupPendingStatesKey,
+		},
+		args...,
+	).Int64()
+	if err != nil {
+		return fmt.Errorf("resolve pending audit operation: %w", err)
+	}
+	if resolved != int64(len(ids)) {
+		return fmt.Errorf("resolved %d pending audit logs, want %d", resolved, len(ids))
 	}
 	return nil
 }
@@ -289,17 +680,20 @@ type autoGroupLogUser struct {
 }
 
 type autoGroupAuditEntry struct {
-	AuditVersion int64  `json:"audit_version,omitempty"`
-	ID           int64  `json:"id"`
-	Action       string `json:"action"`
-	UserID       int64  `json:"user_id"`
-	Username     string `json:"username"`
-	OldGroup     string `json:"old_group"`
-	NewGroup     string `json:"new_group"`
-	Source       string `json:"source"`
-	Operator     string `json:"operator"`
-	Affected     int64  `json:"affected"`
-	CreatedAt    int64  `json:"created_at"`
+	AuditVersion   int64  `json:"audit_version,omitempty"`
+	OperationID    string `json:"operation_id"`
+	OperationSize  int    `json:"operation_size"`
+	OperationIndex int    `json:"operation_index"`
+	ID             int64  `json:"id"`
+	Action         string `json:"action"`
+	UserID         int64  `json:"user_id"`
+	Username       string `json:"username"`
+	OldGroup       string `json:"old_group"`
+	NewGroup       string `json:"new_group"`
+	Source         string `json:"source"`
+	Operator       string `json:"operator"`
+	Affected       int64  `json:"affected"`
+	CreatedAt      int64  `json:"created_at"`
 }
 
 type autoGroupSQLExecutor interface {
@@ -411,6 +805,7 @@ func prepareAutoGroupAuditLogs(
 
 	seen := make(map[int64]struct{}, len(ids))
 	createdAt := time.Now().Unix()
+	operationID := strconv.FormatInt(ids[0], 10)
 	logs := make([]string, len(users))
 	for i, user := range users {
 		id := ids[i]
@@ -423,17 +818,20 @@ func prepareAutoGroupAuditLogs(
 		seen[id] = struct{}{}
 
 		entry := autoGroupAuditEntry{
-			AuditVersion: autoGroupAuditVersion,
-			ID:           id,
-			Action:       action,
-			UserID:       user.ID,
-			Username:     user.Username,
-			OldGroup:     oldGroup,
-			NewGroup:     newGroup,
-			Source:       user.Source,
-			Operator:     operator,
-			Affected:     1,
-			CreatedAt:    createdAt,
+			AuditVersion:   autoGroupAuditVersion,
+			OperationID:    operationID,
+			OperationSize:  len(users),
+			OperationIndex: i,
+			ID:             id,
+			Action:         action,
+			UserID:         user.ID,
+			Username:       user.Username,
+			OldGroup:       oldGroup,
+			NewGroup:       newGroup,
+			Source:         user.Source,
+			Operator:       operator,
+			Affected:       1,
+			CreatedAt:      createdAt,
 		}
 		data, err := json.Marshal(entry)
 		if err != nil {
@@ -447,14 +845,28 @@ func prepareAutoGroupAuditLogs(
 func autoGroupAuditLogIDs(logs []string) ([]int64, error) {
 	ids := make([]int64, len(logs))
 	seen := make(map[int64]struct{}, len(logs))
+	seenIndexes := make(map[int]struct{}, len(logs))
+	operationID := ""
 	for i, raw := range logs {
 		var entry autoGroupAuditEntry
 		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
 			return nil, fmt.Errorf("decode prepared audit log: %w", err)
 		}
-		if entry.AuditVersion < autoGroupAuditVersion {
-			return nil, fmt.Errorf("prepared audit log %d is missing the current audit version", entry.ID)
+		if entry.AuditVersion != autoGroupAuditVersion {
+			return nil, fmt.Errorf("prepared audit log %d uses unsupported audit version %d", entry.ID, entry.AuditVersion)
 		}
+		if entry.OperationID == "" || entry.OperationSize != len(logs) || entry.OperationIndex < 0 || entry.OperationIndex >= len(logs) {
+			return nil, fmt.Errorf("prepared audit log %d has invalid operation metadata", entry.ID)
+		}
+		if operationID == "" {
+			operationID = entry.OperationID
+		} else if entry.OperationID != operationID {
+			return nil, errors.New("prepared audit logs span multiple operations")
+		}
+		if _, duplicate := seenIndexes[entry.OperationIndex]; duplicate {
+			return nil, fmt.Errorf("prepared audit logs contain duplicate operation index %d", entry.OperationIndex)
+		}
+		seenIndexes[entry.OperationIndex] = struct{}{}
 		if entry.ID <= 0 || entry.ID > maxJSONSafeInteger {
 			return nil, fmt.Errorf("prepared audit log contains invalid ID %d", entry.ID)
 		}
@@ -478,6 +890,277 @@ func commitAutoGroupAuditLogs(ctx context.Context, store autoGroupAuditStore, lo
 	return nil
 }
 
+func setAutoGroupPendingState(ctx context.Context, store autoGroupAuditStore, logs []string, state string) error {
+	ids, err := autoGroupAuditLogIDs(logs)
+	if err != nil {
+		return err
+	}
+	if err := store.SetPendingState(ctx, ids, state); err != nil {
+		return fmt.Errorf("record pending audit outcome: %w", err)
+	}
+	return nil
+}
+
+type autoGroupPendingOperation struct {
+	OperationID     string
+	State           string
+	StagedAt        time.Time
+	Records         []autoGroupPendingAuditRecord
+	Entries         []autoGroupAuditEntry
+	Complete        bool
+	ValidationError string
+}
+
+func collectAutoGroupPendingOperations(records []autoGroupPendingAuditRecord) []autoGroupPendingOperation {
+	type pendingItem struct {
+		record autoGroupPendingAuditRecord
+		entry  autoGroupAuditEntry
+		err    error
+	}
+	grouped := make(map[string][]pendingItem)
+	order := make([]string, 0)
+	for _, record := range records {
+		var entry autoGroupAuditEntry
+		err := json.Unmarshal([]byte(record.Raw), &entry)
+		key := entry.OperationID
+		if err != nil || key == "" {
+			key = fmt.Sprintf("invalid:%d", record.ID)
+		}
+		if _, exists := grouped[key]; !exists {
+			order = append(order, key)
+		}
+		grouped[key] = append(grouped[key], pendingItem{record: record, entry: entry, err: err})
+	}
+
+	operations := make([]autoGroupPendingOperation, 0, len(grouped))
+	for _, key := range order {
+		items := grouped[key]
+		op := autoGroupPendingOperation{
+			OperationID: key,
+			State:       items[0].record.State,
+			StagedAt:    items[0].record.StagedAt,
+			Records:     make([]autoGroupPendingAuditRecord, 0, len(items)),
+			Entries:     make([]autoGroupAuditEntry, 0, len(items)),
+			Complete:    true,
+		}
+		expectedSize := 0
+		seenIndexes := make(map[int]struct{}, len(items))
+		for _, item := range items {
+			op.Records = append(op.Records, item.record)
+			op.Entries = append(op.Entries, item.entry)
+			if item.record.StagedAt.Before(op.StagedAt) || op.StagedAt.IsZero() {
+				op.StagedAt = item.record.StagedAt
+			}
+			if item.record.State != op.State {
+				op.State = "mixed"
+			}
+			if item.err != nil {
+				op.Complete = false
+				op.ValidationError = "pending audit record is not valid JSON"
+				continue
+			}
+			entry := item.entry
+			if entry.AuditVersion != autoGroupAuditVersion || entry.ID != item.record.ID || entry.OperationID != key || entry.OperationSize <= 0 || entry.OperationIndex < 0 || entry.OperationIndex >= entry.OperationSize {
+				op.Complete = false
+				op.ValidationError = "pending audit record has invalid operation metadata"
+				continue
+			}
+			if expectedSize == 0 {
+				expectedSize = entry.OperationSize
+			} else if entry.OperationSize != expectedSize {
+				op.Complete = false
+				op.ValidationError = "pending audit operation has inconsistent sizes"
+			}
+			if _, duplicate := seenIndexes[entry.OperationIndex]; duplicate {
+				op.Complete = false
+				op.ValidationError = "pending audit operation has duplicate indexes"
+			}
+			seenIndexes[entry.OperationIndex] = struct{}{}
+		}
+		if expectedSize == 0 || len(items) != expectedSize || len(seenIndexes) != expectedSize {
+			op.Complete = false
+			if op.ValidationError == "" {
+				op.ValidationError = "pending audit operation is incomplete"
+			}
+		}
+		sort.SliceStable(op.Entries, func(i, j int) bool {
+			return op.Entries[i].OperationIndex < op.Entries[j].OperationIndex
+		})
+		sort.SliceStable(op.Records, func(i, j int) bool {
+			var left, right autoGroupAuditEntry
+			_ = json.Unmarshal([]byte(op.Records[i].Raw), &left)
+			_ = json.Unmarshal([]byte(op.Records[j].Raw), &right)
+			return left.OperationIndex < right.OperationIndex
+		})
+		operations = append(operations, op)
+	}
+	sort.SliceStable(operations, func(i, j int) bool {
+		if operations[i].StagedAt.Equal(operations[j].StagedAt) {
+			return operations[i].OperationID < operations[j].OperationID
+		}
+		if operations[i].StagedAt.IsZero() {
+			return true
+		}
+		if operations[j].StagedAt.IsZero() {
+			return false
+		}
+		return operations[i].StagedAt.Before(operations[j].StagedAt)
+	})
+	return operations
+}
+
+// GetPendingAudits returns every bounded pending operation. Pending records are
+// never expired automatically: an unknown SQL commit outcome is durable audit
+// evidence and must remain until an administrator explicitly resolves it.
+func (s *AutoGroupService) GetPendingAudits() (map[string]interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), autoGroupMutationTimeout)
+	defer cancel()
+	store, err := s.requireAuditStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	records, err := store.ReadPending(ctx, autoGroupMaxPendingLogs)
+	if err != nil {
+		return nil, fmt.Errorf("read pending audit operations: %w", err)
+	}
+	operations := collectAutoGroupPendingOperations(records)
+	items := make([]map[string]interface{}, 0, len(operations))
+	for _, operation := range operations {
+		logs := make([]map[string]interface{}, 0, len(operation.Records))
+		for _, record := range operation.Records {
+			entry := make(map[string]interface{})
+			if err := json.Unmarshal([]byte(record.Raw), &entry); err != nil {
+				entry = map[string]interface{}{"id": record.ID, "raw": record.Raw}
+			}
+			stagedAt := int64(0)
+			if !record.StagedAt.IsZero() {
+				stagedAt = record.StagedAt.Unix()
+			}
+			entry["pending_state"] = record.State
+			entry["staged_at"] = stagedAt
+			logs = append(logs, entry)
+		}
+		stagedAt := int64(0)
+		if !operation.StagedAt.IsZero() {
+			stagedAt = operation.StagedAt.Unix()
+		}
+		item := map[string]interface{}{
+			"operation_id":        operation.OperationID,
+			"state":               operation.State,
+			"staged_at":           stagedAt,
+			"record_count":        len(operation.Records),
+			"complete":            operation.Complete,
+			"resolvable":          false,
+			"allowed_resolutions": []string{},
+			"logs":                logs,
+		}
+		if operation.ValidationError != "" {
+			item["validation_error"] = operation.ValidationError
+		}
+		if operation.Complete {
+			switch operation.State {
+			case autoGroupPendingStateAmbiguous:
+				item["resolvable"] = true
+				item["allowed_resolutions"] = []string{autoGroupPendingResolutionFinalize, autoGroupPendingResolutionDiscard}
+				item["finalize_confirmation"] = "FINALIZE " + operation.OperationID
+				item["discard_confirmation"] = "DISCARD " + operation.OperationID
+			case autoGroupPendingStateSQLCommitted:
+				item["resolvable"] = true
+				item["allowed_resolutions"] = []string{autoGroupPendingResolutionFinalize}
+				item["finalize_confirmation"] = "FINALIZE " + operation.OperationID
+			case autoGroupPendingStateUnknown:
+				item["recovery_note"] = "writer outcome is unrecorded; stop all tool instances and investigate offline"
+			}
+		}
+		items = append(items, item)
+	}
+	return map[string]interface{}{
+		"items":            items,
+		"operation_count":  len(items),
+		"record_count":     len(records),
+		"capacity":         autoGroupMaxPendingLogs,
+		"capacity_reached": int64(len(records)) >= autoGroupMaxPendingLogs,
+	}, nil
+}
+
+// ResolvePendingAudit is intentionally manual. Finalizing preserves the audit
+// record but marks it non-revertible because an ambiguous commit can never be
+// made safe for automatic rollback by inspecting the user's current group.
+func (s *AutoGroupService) ResolvePendingAudit(operationID, resolution, confirmation, actor string) (map[string]interface{}, error) {
+	operationID = strings.TrimSpace(operationID)
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	actor = strings.TrimSpace(actor)
+	if operationID == "" {
+		return nil, errors.New("pending audit operation_id is required")
+	}
+	parsedOperationID, validOperationID := parseAutoGroupLogID(operationID)
+	if !validOperationID || strconv.FormatInt(parsedOperationID, 10) != operationID {
+		return nil, errors.New("pending audit operation_id is invalid")
+	}
+	if resolution != autoGroupPendingResolutionFinalize && resolution != autoGroupPendingResolutionDiscard {
+		return nil, errors.New("pending audit resolution must be finalize or discard")
+	}
+	expectedConfirmation := strings.ToUpper(resolution) + " " + operationID
+	if strings.TrimSpace(confirmation) != expectedConfirmation {
+		return nil, fmt.Errorf("confirmation must exactly match %q", expectedConfirmation)
+	}
+	if actor == "" {
+		actor = "admin"
+	}
+	if len(actor) > 128 {
+		actor = actor[:128]
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), autoGroupMutationTimeout)
+	defer cancel()
+	store, err := s.requireAuditStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	records, err := store.ReadPending(ctx, autoGroupMaxPendingLogs)
+	if err != nil {
+		return nil, fmt.Errorf("read pending audit operations: %w", err)
+	}
+	var target *autoGroupPendingOperation
+	for _, operation := range collectAutoGroupPendingOperations(records) {
+		if operation.OperationID == operationID {
+			copy := operation
+			target = &copy
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("pending audit operation %s not found", operationID)
+	}
+	if !target.Complete {
+		return nil, fmt.Errorf("pending audit operation %s cannot be resolved safely: %s", operationID, target.ValidationError)
+	}
+	if target.State != autoGroupPendingStateUnknown && target.State != autoGroupPendingStateAmbiguous && target.State != autoGroupPendingStateSQLCommitted {
+		return nil, fmt.Errorf("pending audit operation %s has an invalid or mixed state", operationID)
+	}
+	if target.State == autoGroupPendingStateUnknown {
+		return nil, fmt.Errorf("pending audit operation %s has an unrecorded writer outcome and cannot be resolved online", operationID)
+	}
+	if resolution == autoGroupPendingResolutionDiscard && target.State == autoGroupPendingStateSQLCommitted {
+		return nil, fmt.Errorf("pending audit operation %s is known to be SQL-committed and must be finalized", operationID)
+	}
+	ids := make([]int64, len(target.Entries))
+	for i, entry := range target.Entries {
+		ids[i] = entry.ID
+	}
+	if err := store.ResolvePending(ctx, operationID, ids, resolution, actor, time.Now()); err != nil {
+		return nil, err
+	}
+	logger.L.Security(fmt.Sprintf("auto-group pending audit manually resolved: operation_id=%s resolution=%s records=%d actor=%s",
+		operationID, resolution, len(ids), actor))
+	return map[string]interface{}{
+		"operation_id": operationID,
+		"resolution":   resolution,
+		"record_count": len(ids),
+		"revertible":   false,
+	}, nil
+}
+
 func autoGroupLogRequiresCommitMarker(entry map[string]interface{}) (bool, error) {
 	rawVersion, exists := entry["audit_version"]
 	if !exists {
@@ -488,7 +1171,7 @@ func autoGroupLogRequiresCommitMarker(entry map[string]interface{}) (bool, error
 	if !valid {
 		return false, errors.New("日志记录的审计版本无效")
 	}
-	if version < autoGroupAuditVersion {
+	if version != autoGroupAuditVersion {
 		return false, fmt.Errorf("不支持的审计版本 %d", version)
 	}
 	return true, nil
@@ -1140,7 +1823,8 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), autoGroupMutationTimeout)
+	defer cancel()
 	store, err := s.requireAuditStore(ctx)
 	if err != nil {
 		return map[string]interface{}{
@@ -1160,7 +1844,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 
-	tx, err := s.db.DB.Beginx()
+	tx, err := s.db.DB.BeginTxx(ctx, nil)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1213,16 +1897,30 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 			"message": fmt.Sprintf("audit log staging failed; user group was rolled back: %v", err),
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	commitErr := tx.Commit()
+	auditCtx, auditCancel := context.WithTimeout(context.Background(), autoGroupAuditFinalizeTimeout)
+	defer auditCancel()
+	if commitErr != nil {
+		_ = tx.Rollback()
+		stateErr := setAutoGroupPendingState(auditCtx, store, logs, autoGroupPendingStateAmbiguous)
+		message := fmt.Sprintf("提交用户分组事务失败，提交结果不明确；pending 审计将永久保留，必须人工 finalize/discard: %v", commitErr)
+		if stateErr != nil {
+			message += fmt.Sprintf("; pending 状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+		}
 		return map[string]interface{}{
 			"success": false,
-			"message": fmt.Sprintf("提交用户分组事务失败: %v", err),
+			"message": message,
 		}
 	}
-	if err := commitAutoGroupAuditLogs(ctx, store, logs); err != nil {
+	stateErr := setAutoGroupPendingState(auditCtx, store, logs, autoGroupPendingStateSQLCommitted)
+	if err := commitAutoGroupAuditLogs(auditCtx, store, logs); err != nil {
+		message := fmt.Sprintf("用户分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s，需人工处置: %v", autoGroupPendingLogsKey, err)
+		if stateErr != nil {
+			message += fmt.Sprintf("; SQL 已提交状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+		}
 		return map[string]interface{}{
 			"success": false,
-			"message": fmt.Sprintf("用户分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+			"message": message,
 		}
 	}
 
@@ -1335,17 +2033,9 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 			})
 		}
 
-		ctx := context.Background()
-		preparedLogs, err := prepareAutoGroupAuditLogs(ctx, scanAuditStore, "assign", userInfos, "default", targetGroup, "system")
-		if err != nil {
-			return map[string]interface{}{
-				"success": false,
-				"dry_run": false,
-				"message": fmt.Sprintf("prepare scan audit logs failed: %v", err),
-			}
-		}
-
-		tx, err := s.db.DB.Beginx()
+		ctx, cancel := context.WithTimeout(context.Background(), autoGroupMutationTimeout)
+		defer cancel()
+		tx, err := s.db.DB.BeginTxx(ctx, nil)
 		if err != nil {
 			return map[string]interface{}{
 				"success": false,
@@ -1355,9 +2045,8 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 		}
 		defer func() { _ = tx.Rollback() }()
 
-		logsToAppend := make([]string, 0, len(preparedLogs))
 		assignedUsers := make([]autoGroupLogUser, 0, len(userInfos))
-		for i, user := range userInfos {
+		for _, user := range userInfos {
 			affected, updateErr := s.updateUserGroupIfCurrentWith(tx, user.ID, targetGroup, "default")
 			if updateErr != nil {
 				_ = tx.Rollback()
@@ -1375,8 +2064,16 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 				})
 				continue
 			}
-			logsToAppend = append(logsToAppend, preparedLogs[i])
 			assignedUsers = append(assignedUsers, user)
+		}
+		logsToAppend, err := prepareAutoGroupAuditLogs(ctx, scanAuditStore, "assign", assignedUsers, "default", targetGroup, "system")
+		if err != nil {
+			_ = tx.Rollback()
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("prepare scan audit logs failed; all group changes were rolled back: %v", err),
+			}
 		}
 
 		if err := scanAuditStore.StageLogs(ctx, logsToAppend); err != nil {
@@ -1387,18 +2084,32 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 				"message": fmt.Sprintf("scan audit staging failed; all group changes were rolled back: %v", err),
 			}
 		}
-		if err := tx.Commit(); err != nil {
+		commitErr := tx.Commit()
+		auditCtx, auditCancel := context.WithTimeout(context.Background(), autoGroupAuditFinalizeTimeout)
+		defer auditCancel()
+		if commitErr != nil {
+			_ = tx.Rollback()
+			stateErr := setAutoGroupPendingState(auditCtx, scanAuditStore, logsToAppend, autoGroupPendingStateAmbiguous)
+			message := fmt.Sprintf("提交扫描事务失败，提交结果不明确；pending 审计将永久保留，必须人工 finalize/discard: %v", commitErr)
+			if stateErr != nil {
+				message += fmt.Sprintf("; pending 状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+			}
 			return map[string]interface{}{
 				"success": false,
 				"dry_run": false,
-				"message": fmt.Sprintf("提交扫描事务失败: %v", err),
+				"message": message,
 			}
 		}
-		if err := commitAutoGroupAuditLogs(ctx, scanAuditStore, logsToAppend); err != nil {
+		stateErr := setAutoGroupPendingState(auditCtx, scanAuditStore, logsToAppend, autoGroupPendingStateSQLCommitted)
+		if err := commitAutoGroupAuditLogs(auditCtx, scanAuditStore, logsToAppend); err != nil {
+			message := fmt.Sprintf("扫描分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s，需人工处置: %v", autoGroupPendingLogsKey, err)
+			if stateErr != nil {
+				message += fmt.Sprintf("; SQL 已提交状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+			}
 			return map[string]interface{}{
 				"success": false,
 				"dry_run": false,
-				"message": fmt.Sprintf("扫描分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+				"message": message,
 			}
 		}
 
@@ -1469,9 +2180,12 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 	logger.L.Business(fmt.Sprintf("自动分组扫描完成 dry_run=%v total=%d assigned=%d skipped=%d errors=%d elapsed=%.2fs",
 		dryRun, len(users), assignedCount, skippedCount, errorCount, elapsed))
 
+	success := errorCount == 0
+	partialSuccess := !dryRun && assignedCount > 0 && errorCount > 0
 	return map[string]interface{}{
-		"success": true,
-		"dry_run": dryRun,
+		"success":         success,
+		"partial_success": partialSuccess,
+		"dry_run":         dryRun,
 		"stats": map[string]interface{}{
 			"total":    len(users),
 			"assigned": assignedCount,
@@ -1602,7 +2316,8 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), autoGroupMutationTimeout)
+	defer cancel()
 	store, err := s.requireAuditStore(ctx)
 	if err != nil {
 		return map[string]interface{}{
@@ -1651,6 +2366,21 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		return map[string]interface{}{
 			"success": false,
 			"message": "日志记录不存在",
+		}
+	}
+	if rawRevertible, exists := targetLog["revertible"]; exists {
+		revertible, valid := rawRevertible.(bool)
+		if !valid {
+			return map[string]interface{}{
+				"success": false,
+				"message": "日志记录的可恢复标记无效",
+			}
+		}
+		if !revertible {
+			return map[string]interface{}{
+				"success": false,
+				"message": "该日志由人工处理歧义提交后归档，不允许自动恢复",
+			}
 		}
 	}
 	requiresCommitMarker, err := autoGroupLogRequiresCommitMarker(targetLog)
@@ -1734,7 +2464,7 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	tx, err := s.db.DB.Beginx()
+	tx, err := s.db.DB.BeginTxx(ctx, nil)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1785,16 +2515,30 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 			"message": fmt.Sprintf("revert audit staging failed; user group was rolled back: %v", err),
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	commitErr := tx.Commit()
+	auditCtx, auditCancel := context.WithTimeout(context.Background(), autoGroupAuditFinalizeTimeout)
+	defer auditCancel()
+	if commitErr != nil {
+		_ = tx.Rollback()
+		stateErr := setAutoGroupPendingState(auditCtx, store, revertLogs, autoGroupPendingStateAmbiguous)
+		message := fmt.Sprintf("提交恢复事务失败，提交结果不明确；pending 审计将永久保留，必须人工 finalize/discard: %v", commitErr)
+		if stateErr != nil {
+			message += fmt.Sprintf("; pending 状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+		}
 		return map[string]interface{}{
 			"success": false,
-			"message": fmt.Sprintf("提交恢复事务失败: %v", err),
+			"message": message,
 		}
 	}
-	if err := commitAutoGroupAuditLogs(ctx, store, revertLogs); err != nil {
+	stateErr := setAutoGroupPendingState(auditCtx, store, revertLogs, autoGroupPendingStateSQLCommitted)
+	if err := commitAutoGroupAuditLogs(auditCtx, store, revertLogs); err != nil {
+		message := fmt.Sprintf("用户分组已恢复，但审计记录最终化失败；pending 记录保留在 Redis %s，需人工处置: %v", autoGroupPendingLogsKey, err)
+		if stateErr != nil {
+			message += fmt.Sprintf("; SQL 已提交状态标记失败，记录仍为不可在线处置的 commit_unknown，需停止工具实例后离线核对: %v", stateErr)
+		}
 		return map[string]interface{}{
 			"success": false,
-			"message": fmt.Sprintf("用户分组已恢复，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+			"message": message,
 		}
 	}
 

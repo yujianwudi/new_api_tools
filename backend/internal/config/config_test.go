@@ -44,6 +44,20 @@ func TestIPRecordingEnforcementIsExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesLoginBackoffMaxBaseInvariant(t *testing.T) {
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("LOGIN_BACKOFF_BASE_MS", "60000")
+	t.Setenv("LOGIN_BACKOFF_MAX_SECONDS", "30")
+
+	loaded := Load()
+	if loaded.LoginBackoffBase != time.Minute {
+		t.Fatalf("LoginBackoffBase = %s, want 1m", loaded.LoginBackoffBase)
+	}
+	if loaded.LoginBackoffMax != loaded.LoginBackoffBase {
+		t.Fatalf("LoginBackoffMax = %s, want at least base %s", loaded.LoginBackoffMax, loaded.LoginBackoffBase)
+	}
+}
+
 func TestNormalizeMySQLURLDSNPreservesCredentialsAndOptions(t *testing.T) {
 	raw := "mysql://user:p%40ss@[2001:db8::1]:3307/prod%2Ddb?parseTime=true&tls=preferred&timeout=5s&loc=Asia%2FShanghai"
 	normalized := normalizeMySQLURLDSN(raw)

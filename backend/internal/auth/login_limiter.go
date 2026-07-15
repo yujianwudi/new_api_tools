@@ -40,8 +40,11 @@ func NewLoginLimiter(maxAttempts int, window, baseBackoff, maxBackoff time.Durat
 	if baseBackoff <= 0 {
 		baseBackoff = 500 * time.Millisecond
 	}
-	if maxBackoff < baseBackoff {
+	if maxBackoff <= 0 {
 		maxBackoff = 30 * time.Second
+	}
+	if maxBackoff < baseBackoff {
+		maxBackoff = baseBackoff
 	}
 	return &LoginLimiter{
 		attempts:    make(map[string]loginAttempt),
@@ -128,9 +131,16 @@ func (l *LoginLimiter) makeRoomLocked() {
 	if len(l.attempts) < maxTrackedLoginClients {
 		return
 	}
-	for key := range l.attempts {
-		delete(l.attempts, key)
-		return
+	var oldestKey string
+	var oldestSeen time.Time
+	for key, attempt := range l.attempts {
+		if oldestKey == "" || attempt.lastSeen.Before(oldestSeen) {
+			oldestKey = key
+			oldestSeen = attempt.lastSeen
+		}
+	}
+	if oldestKey != "" {
+		delete(l.attempts, oldestKey)
 	}
 }
 

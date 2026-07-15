@@ -121,3 +121,17 @@ func TestBuildInsertSQLUsesSafeHexTextLiterals(t *testing.T) {
 		t.Fatalf("PostgreSQL SQL did not encode text literals: %s", postgresSQL)
 	}
 }
+
+func TestGenerateCodesRejectsUnsafeKeyPrefixBeforeDatabaseAccess(t *testing.T) {
+	_, err := GenerateCodes(GenerateParams{
+		Name:      "test",
+		Count:     1,
+		KeyPrefix: "VIP",
+	})
+	if err == nil {
+		t.Fatal("GenerateCodes accepted an uppercase key prefix")
+	}
+	if !strings.Contains(err.Error(), "prefix") {
+		t.Fatalf("GenerateCodes error = %q, want prefix validation error", err)
+	}
+}

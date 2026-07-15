@@ -22,6 +22,8 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 COMPOSE_HOST_FILE="${SCRIPT_DIR}/docker-compose.host.yml"
 COMPOSE_LOGDB_FILE="${SCRIPT_DIR}/docker-compose.logdb.yml"
 SOURCE_SQL_DSN=""
+NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
+REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 
 # 由 detect_environment() 设置：host 模式下需要追加 overlay compose 文件
 COMPOSE_FILES=("-f" "$COMPOSE_FILE")
@@ -38,6 +40,38 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
+
+validate_newapi_tools_image() {
+  local image="${1:-}"
+  [[ -n "$image" ]] || die "NEWAPI_TOOLS_IMAGE 不能为空"
+  (( ${#image} <= 512 )) || die "NEWAPI_TOOLS_IMAGE 过长"
+  [[ ! "$image" =~ [[:space:][:cntrl:]] ]] ||
+    die "NEWAPI_TOOLS_IMAGE 不能包含空白或控制字符"
+  [[ "$image" != -* ]] || die "NEWAPI_TOOLS_IMAGE 格式无效"
+}
+
+resolve_deploy_image() {
+  local image="$REQUESTED_NEWAPI_TOOLS_IMAGE"
+
+  if [[ -z "$image" ]] && command -v git >/dev/null 2>&1 &&
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local commit tag
+    commit="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)" ||
+      die "无法解析当前 Git commit"
+    tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+    if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+      image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${BASH_REMATCH[1]}"
+    else
+      image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
+    fi
+  fi
+
+  image="${image:-${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.2.0}"
+  validate_newapi_tools_image "$image"
+  NEWAPI_TOOLS_IMAGE="$image"
+  export NEWAPI_TOOLS_IMAGE
+  log_info "部署镜像: ${NEWAPI_TOOLS_IMAGE}"
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少必要命令: $1"
@@ -74,6 +108,13 @@ require_docker_compose_v224() {
   [[ -n "$version" ]] || version="$(get_docker_compose_v2_version)"
   [[ -n "$version" ]] || die "无法识别 Docker Compose v2 版本；${reason} 需要 v2.24+"
   version_at_least "$version" "2.24.0" || die "Docker Compose v${version} 过旧；${reason} 依赖 !reset 语法，最低需要 v2.24.0"
+}
+
+configure_host_compose_files() {
+  [[ -f "$COMPOSE_HOST_FILE" ]] ||
+    die "host 模式需要 ${COMPOSE_HOST_FILE}，缺少该叠加层时无法安全移除基础 external network 配置"
+  require_docker_compose_v224 "host 网络叠加层 ${COMPOSE_HOST_FILE}"
+  COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
 }
 
 # 优先使用 docker compose v2；仅在没有 v2 时兼容旧 docker-compose。
@@ -730,11 +771,14 @@ detect_environment() {
 
   DB_ENGINE=""
   DB_DNS=""
+  DB_PORT=""
   if [[ -n "$detected_dsn" ]]; then
     DB_ENGINE="$(extract_dsn_engine "$detected_dsn")" ||
       die "NewAPI 数据库 DSN 不受支持或格式不安全；原始 DSN 已隐藏"
     DB_DNS="$(extract_dsn_host "$detected_dsn")" ||
       die "无法从 NewAPI 数据库 DSN 安全解析 host；原始 DSN 已隐藏"
+    DB_PORT="$(extract_dsn_port "$detected_dsn")" ||
+      die "无法从 NewAPI 数据库 DSN 安全解析端口；原始 DSN 已隐藏"
   fi
 
   # ===== Host 模式：完全从 DSN 解析凭证，跳过数据库容器探测 =====
@@ -809,12 +853,7 @@ detect_environment() {
     if [[ "$USE_HOST_MODE" == "true" ]]; then
       # 情形 (a)/(c)：数据库走宿主机（host.docker.internal）或外部地址，
       # newapi-tools 无需任何 external 网络 → 加载 host overlay 去掉 newapi-network 依赖。
-      if [[ -f "$COMPOSE_HOST_FILE" ]]; then
-        require_docker_compose_v224 "host 网络叠加层 ${COMPOSE_HOST_FILE}"
-        COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
-      else
-        log_warn "未找到 $COMPOSE_HOST_FILE，host 模式可能启动失败"
-      fi
+      configure_host_compose_files
       log_success "检测到数据库 (host 模式): $DB_ENGINE @ $DB_DNS:$DB_PORT/$DB_NAME"
     else
       # 情形 (b)：数据库在另一条 bridge 网络上，newapi-tools 已改为挂进该网络（NEWAPI_NETWORK）。
@@ -914,14 +953,14 @@ detect_environment() {
 
   # 获取数据库凭证
   if [[ "$DB_ENGINE" == "postgres" ]]; then
-    DB_PORT="5432"
+    DB_PORT="${DB_PORT:-5432}"
     DB_USER="$(docker_inspect_env_value "$db_container" 'POSTGRES_USER' || true)"
     DB_NAME="$(docker_inspect_env_value "$db_container" 'POSTGRES_DB' || true)"
     DB_PASSWORD="$(docker_inspect_env_value "$db_container" 'POSTGRES_PASSWORD' || true)"
     DB_USER="${DB_USER:-postgres}"
     DB_NAME="${DB_NAME:-new-api}"
   elif [[ "$DB_ENGINE" == "mysql" ]]; then
-    DB_PORT="3306"
+    DB_PORT="${DB_PORT:-3306}"
     DB_USER="$(docker_inspect_env_value "$db_container" 'MYSQL_USER' || true)"
     DB_NAME="$(docker_inspect_env_value "$db_container" 'MYSQL_DATABASE' || true)"
     DB_PASSWORD="$(docker_inspect_env_value "$db_container" 'MYSQL_PASSWORD' || true)"
@@ -1129,6 +1168,9 @@ generate_env_file() {
 # 由 deploy.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 网络部署模式: ${network_mode_tag}
 
+# 完整镜像引用（支持 tag 或 repo@sha256:digest）
+NEWAPI_TOOLS_IMAGE=$(dotenv_quote "$NEWAPI_TOOLS_IMAGE")
+
 # NewAPI 环境
 NEWAPI_CONTAINER=${NEWAPI_CONTAINER}
 NEWAPI_NETWORK=${NEWAPI_NETWORK}
@@ -1137,6 +1179,8 @@ NEWAPI_NETWORK_MODE=${network_mode_tag}
 NEWAPI_ORIGINAL_NETWORK=${ORIGINAL_NETWORK:-}
 # 仅当 NewAPI 容器明确配置 REDIS_CONN_STRING=（空）时为 true；未知或非空均为 false
 NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
+# 高风险兼容开关：默认禁止旁路批量判定/删除不活跃用户，请优先使用 NewAPI 管理 API
+ALLOW_UNSAFE_BATCH_DELETE=false
 # 高风险兼容开关：默认禁止不完整的直接数据库永久删除，请优先使用 NewAPI 管理 API
 ALLOW_UNSAFE_HARD_DELETE=false
 # 隐私敏感：默认不持续覆盖用户的 record_ip_log 设置
@@ -1252,15 +1296,17 @@ start_services() {
   # 下载 GeoIP 数据库
   download_geoip_database
 
+  # 先拉取成功再停止旧容器，避免镜像不存在/网络失败造成不必要停机。
+  log_info "拉取部署镜像 ${NEWAPI_TOOLS_IMAGE}..."
+  if ! $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
+
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
     log_warn "发现已存在的服务容器，正在停止..."
     $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" down 2>/dev/null || true
   fi
-
-  # 拉取最新镜像
-  log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull
 
   # 启动服务
   $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" up -d
@@ -1394,6 +1440,7 @@ NewAPI Middleware Tool - 一键部署脚本
   NEWAPI_NETWORK     指定 Docker 网络名 (默认: 自动检测)
   ADMIN_PASSWORD     前端访问密码 (默认: 交互式输入)
   API_KEY            后端 API Key (默认: 交互式输入或自动生成)
+  NEWAPI_TOOLS_IMAGE 完整镜像 tag/digest (默认: 当前 Git tag/commit；无 Git 时为 0.2.0)
   FRONTEND_PORT      前端端口 (默认: 1145)
   FRONTEND_BIND      前端端口绑定网卡 0.0.0.0/127.0.0.1 (默认: 交互式选择)
   TRUSTED_PROXY_CIDRS 允许解析其 XFF 的精确代理 IP/CIDR (默认: loopback)
@@ -1434,6 +1481,7 @@ main() {
       ;;
     "")
       # 正常部署流程
+      resolve_deploy_image
       echo ""
       echo -e "${BLUE}========================================${NC}"
       echo -e "${BLUE}  NewAPI Middleware Tool 部署脚本${NC}"

@@ -1,9 +1,11 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,11 +15,42 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func installDestructiveSnapshotStoreForTest(t *testing.T) {
+	t.Helper()
+	previousStore := storeDestructiveSnapshot
+	previousClaim := claimDestructiveSnapshot
+	var mu sync.Mutex
+	values := make(map[string][]byte)
+	storeDestructiveSnapshot = func(key string, value interface{}, _ time.Duration) error {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		values[key] = append([]byte(nil), raw...)
+		mu.Unlock()
+		return nil
+	}
+	claimDestructiveSnapshot = func(key string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		raw := values[key]
+		delete(values, key)
+		return append([]byte(nil), raw...), nil
+	}
+	t.Cleanup(func() {
+		storeDestructiveSnapshot = previousStore
+		claimDestructiveSnapshot = previousClaim
+	})
+}
+
 func installUserManagementSafetyDB(t *testing.T) (*sqlx.DB, *UserManagementService) {
 	t.Helper()
+	installDestructiveSnapshotStoreForTest(t)
 	setMutationSafetyConfigForTest(t, &config.Config{
-		NewAPIRedisDisabled:   true,
-		AllowUnsafeHardDelete: true,
+		NewAPIRedisDisabled:    true,
+		AllowUnsafeBatchDelete: true,
+		AllowUnsafeHardDelete:  true,
 	})
 	db, err := sqlx.Connect("sqlite", ":memory:")
 	if err != nil {
@@ -62,7 +95,10 @@ func installUserManagementSafetyDB(t *testing.T) (*sqlx.DB, *UserManagementServi
 func TestPermanentDeleteEntrypointsRequireUnsafeOptIn(t *testing.T) {
 	t.Run("single hard delete", func(t *testing.T) {
 		db, svc := installUserManagementSafetyDB(t)
-		setMutationSafetyConfigForTest(t, &config.Config{NewAPIRedisDisabled: true})
+		setMutationSafetyConfigForTest(t, &config.Config{
+			NewAPIRedisDisabled:    true,
+			AllowUnsafeBatchDelete: true,
+		})
 		db.MustExec(`INSERT INTO users (id, username) VALUES (1, 'alice')`)
 
 		if _, err := svc.DeleteUser(1, true); err == nil || !strings.Contains(err.Error(), "ALLOW_UNSAFE_HARD_DELETE=true") {
@@ -95,7 +131,10 @@ func TestPermanentDeleteEntrypointsRequireUnsafeOptIn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("preview hard delete: %v", err)
 		}
-		setMutationSafetyConfigForTest(t, &config.Config{NewAPIRedisDisabled: true})
+		setMutationSafetyConfigForTest(t, &config.Config{
+			NewAPIRedisDisabled:    true,
+			AllowUnsafeBatchDelete: true,
+		})
 		_, err = svc.BatchDeleteInactiveUsers(ActivityNever, false, true, toString(preview["snapshot_id"]))
 		if err == nil || !strings.Contains(err.Error(), "ALLOW_UNSAFE_HARD_DELETE=true") {
 			t.Fatalf("expected unsafe batch hard-delete opt-in error, got %v", err)
@@ -198,6 +237,145 @@ func TestBatchDeleteRejectsConfiguredLogFallback(t *testing.T) {
 	}
 	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
 		t.Fatal("configured log fallback allowed a mutation")
+	}
+}
+
+func TestBatchDeleteExecutionFailsClosedWithSeparateLogDatabaseWithoutConsumingSnapshot(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	db.MustExec(`INSERT INTO users (id, username, request_count) VALUES (1, 'candidate', 0)`)
+	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES (99, 2, ?)`, time.Now().Unix())
+
+	logDB, err := sqlx.Connect("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open dedicated log sqlite: %v", err)
+	}
+	logDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = logDB.Close() })
+	logDB.MustExec(`CREATE TABLE logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		type INTEGER NOT NULL,
+		created_at INTEGER NOT NULL
+	)`)
+	logDB.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES (99, 2, ?)`, time.Now().Unix())
+	logManager := &database.Manager{DB: logDB, IsPG: false}
+	database.SetLogForTesting(logManager, database.LogSourceStatus{
+		Mode:       database.LogSourceModeDedicated,
+		Configured: true,
+		Healthy:    true,
+	})
+	svc.logDB = logManager
+
+	preview, err := svc.BatchDeleteInactiveUsers(ActivityNever, true, false, "")
+	if err != nil {
+		t.Fatalf("preview with dedicated log DB: %v", err)
+	}
+	snapshotID := toString(preview["snapshot_id"])
+	_, err = svc.BatchDeleteInactiveUsers(ActivityNever, false, false, snapshotID)
+	if !errors.Is(err, ErrSeparateLogDBBatchDeleteBlocked) {
+		t.Fatalf("expected separate-log fail-closed error, got %v", err)
+	}
+	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
+		t.Fatal("separate log database allowed a batch deletion")
+	}
+
+	// The unsupported execution must reject before claiming the one-time
+	// snapshot. Reusing it after switching to the atomically guarded main DB is
+	// therefore safe and proves the fail-closed check is in the right place.
+	svc.logDB = svc.db
+	database.SetLogForTesting(svc.db, database.LogSourceStatus{
+		Mode:    database.LogSourceModeMain,
+		Healthy: true,
+	})
+	result, err := svc.BatchDeleteInactiveUsers(ActivityNever, false, false, snapshotID)
+	if err != nil {
+		t.Fatalf("snapshot was consumed by blocked separate-log execution: %v", err)
+	}
+	if got := toInt64(result["affected_count"]); got != 1 {
+		t.Fatalf("unexpected affected count after guarded execution: %d", got)
+	}
+}
+
+func TestBatchDeleteExecutionRequiresUnsafeOptInWithoutConsumingSnapshot(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	db.MustExec(`INSERT INTO users (id, username, request_count) VALUES (1, 'candidate', 0)`)
+	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES (99, 2, ?)`, time.Now().Unix())
+
+	preview, err := svc.BatchDeleteInactiveUsers(ActivityNever, true, false, "")
+	if err != nil {
+		t.Fatalf("preview batch delete: %v", err)
+	}
+	snapshotID := toString(preview["snapshot_id"])
+	setMutationSafetyConfigForTest(t, &config.Config{NewAPIRedisDisabled: true})
+	_, err = svc.BatchDeleteInactiveUsers(ActivityNever, false, false, snapshotID)
+	if err == nil || !strings.Contains(err.Error(), "ALLOW_UNSAFE_BATCH_DELETE=true") {
+		t.Fatalf("expected unsafe batch-delete opt-in error, got %v", err)
+	}
+	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
+		t.Fatal("blocked batch delete changed the user")
+	}
+
+	setMutationSafetyConfigForTest(t, &config.Config{
+		NewAPIRedisDisabled:    true,
+		AllowUnsafeBatchDelete: true,
+	})
+	result, err := svc.BatchDeleteInactiveUsers(ActivityNever, false, false, snapshotID)
+	if err != nil {
+		t.Fatalf("blocked unsafe guard consumed the snapshot: %v", err)
+	}
+	if got := toInt64(result["affected_count"]); got != 1 {
+		t.Fatalf("unexpected affected count after guarded execution: %d", got)
+	}
+}
+
+func TestBatchDeletePreviewPaginatesPastActiveCandidatePages(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	now := time.Now().Unix()
+	tx := db.MustBegin()
+	for id := 1; id <= batchDeleteCandidatePageSize+2; id++ {
+		if _, err := tx.Exec(`INSERT INTO users (id, username, request_count) VALUES (?, ?, 0)`, id, fmt.Sprintf("user-%d", id)); err != nil {
+			t.Fatalf("seed candidate %d: %v", id, err)
+		}
+		if id <= batchDeleteCandidatePageSize {
+			if _, err := tx.Exec(`INSERT INTO logs (user_id, type, created_at) VALUES (?, 2, ?)`, id, now); err != nil {
+				t.Fatalf("seed active log %d: %v", id, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit pagination seed: %v", err)
+	}
+
+	preview, err := svc.BatchDeleteInactiveUsers(ActivityNever, true, false, "")
+	if err != nil {
+		t.Fatalf("paginated preview: %v", err)
+	}
+	if got := toInt64(preview["affected_count"]); got != 2 {
+		t.Fatalf("paginated preview found %d eligible users, want 2", got)
+	}
+}
+
+func TestBatchDeletePreviewStopsAfterMaxPlusOneEligibleUser(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	tx := db.MustBegin()
+	for id := 1; id <= maxBatchDeleteUsers+500; id++ {
+		if _, err := tx.Exec(`INSERT INTO users (id, username, request_count) VALUES (?, ?, 0)`, id, fmt.Sprintf("user-%d", id)); err != nil {
+			t.Fatalf("seed candidate %d: %v", id, err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO logs (user_id, type, created_at) VALUES (99999, 2, ?)`, time.Now().Unix()); err != nil {
+		t.Fatalf("seed freshness log: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit over-limit seed: %v", err)
+	}
+
+	_, err := svc.BatchDeleteInactiveUsers(ActivityNever, true, false, "")
+	if err == nil || !strings.Contains(err.Error(), "1001 users") {
+		t.Fatalf("expected bounded max+1 rejection, got %v", err)
+	}
+	if strings.Contains(err.Error(), "1500 users") {
+		t.Fatalf("preview scanned the full eligible population: %v", err)
 	}
 }
 
@@ -347,6 +525,47 @@ func TestPurgeSoftDeletedUsesExactPreviewSnapshot(t *testing.T) {
 	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 2"); got != 1 {
 		t.Fatal("purge deleted a user that was not in the preview snapshot")
 	}
+}
+
+func TestPurgeSoftDeletedReturnsTypedSnapshotErrors(t *testing.T) {
+	t.Run("invalid or expired", func(t *testing.T) {
+		_, svc := installUserManagementSafetyDB(t)
+		if _, err := svc.PurgeSoftDeleted("not-a-snapshot"); !errors.Is(err, ErrInvalidOrExpiredSnapshot) {
+			t.Fatalf("expected typed invalid snapshot error, got %v", err)
+		}
+	})
+
+	t.Run("invalidated after preview", func(t *testing.T) {
+		db, svc := installUserManagementSafetyDB(t)
+		db.MustExec(`INSERT INTO users (id, username, deleted_at) VALUES (1, 'previewed', 1)`)
+		preview, err := svc.PreviewSoftDeletedUsers()
+		if err != nil {
+			t.Fatalf("preview purge: %v", err)
+		}
+		db.MustExec(`UPDATE users SET role = 10 WHERE id = 1`)
+		_, err = svc.PurgeSoftDeleted(toString(preview["snapshot_id"]))
+		if !errors.Is(err, ErrSnapshotInvalidated) {
+			t.Fatalf("expected typed invalidated snapshot error, got %v", err)
+		}
+	})
+
+	t.Run("restored and soft-deleted again", func(t *testing.T) {
+		db, svc := installUserManagementSafetyDB(t)
+		db.MustExec(`INSERT INTO users (id, username, deleted_at) VALUES (1, 'previewed', 1)`)
+		preview, err := svc.PreviewSoftDeletedUsers()
+		if err != nil {
+			t.Fatalf("preview purge: %v", err)
+		}
+		db.MustExec(`UPDATE users SET deleted_at = NULL WHERE id = 1`)
+		db.MustExec(`UPDATE users SET deleted_at = 2 WHERE id = 1`)
+		_, err = svc.PurgeSoftDeleted(toString(preview["snapshot_id"]))
+		if !errors.Is(err, ErrSnapshotInvalidated) {
+			t.Fatalf("expected ABA-invalidated snapshot error, got %v", err)
+		}
+		if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1"); got != 1 {
+			t.Fatal("old purge snapshot deleted a newly soft-deleted generation")
+		}
+	})
 }
 
 func TestBanUserRollsBackAndPropagatesTokenUpdateError(t *testing.T) {

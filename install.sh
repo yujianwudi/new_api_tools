@@ -5,7 +5,8 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/main/install.sh)
+#   bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
+#   NEWAPI_TOOLS_REF=main bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh) # 显式跟随开发分支
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -29,7 +30,79 @@ die() { log_error "$*"; exit 1; }
 
 REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
+NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.2.0}"
+REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
+INSTALL_COMMIT=""
 REINSTALL=false
+
+validate_newapi_tools_image() {
+  local image="${1:-}"
+  [[ -n "$image" ]] || die "NEWAPI_TOOLS_IMAGE 不能为空"
+  (( ${#image} <= 512 )) || die "NEWAPI_TOOLS_IMAGE 过长"
+  [[ ! "$image" =~ [[:space:][:cntrl:]] ]] ||
+    die "NEWAPI_TOOLS_IMAGE 不能包含空白或控制字符"
+  [[ "$image" != -* ]] || die "NEWAPI_TOOLS_IMAGE 格式无效"
+}
+
+resolve_install_image() {
+  local ref="$1" commit="$2" requested_image="${3:-}"
+  [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || die "无法根据无效 Git commit 推导镜像"
+
+  local image=""
+  if [[ -n "$requested_image" ]]; then
+    image="$requested_image"
+  elif [[ "$ref" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${BASH_REMATCH[1]}"
+  elif [[ "$ref" == "main" ]]; then
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
+  else
+    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置 NEWAPI_TOOLS_IMAGE（完整 tag 或 digest）"
+  fi
+
+  validate_newapi_tools_image "$image"
+  printf '%s\n' "$image"
+}
+
+validate_install_ref() {
+  [[ "$INSTALL_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]] ||
+    die "NEWAPI_TOOLS_REF 格式无效"
+  [[ "$INSTALL_REF" != *..* && "$INSTALL_REF" != *@\{* && "$INSTALL_REF" != */ && "$INSTALL_REF" != *. ]] ||
+    die "NEWAPI_TOOLS_REF 格式无效"
+}
+
+checkout_install_ref() {
+  validate_install_ref
+  git fetch --force --prune --tags origin
+
+  local target=""
+  if [[ "$INSTALL_REF" == "main" ]]; then
+    git show-ref --verify --quiet "refs/remotes/origin/main" ||
+      die "远端 main 分支不存在"
+    target="refs/remotes/origin/main"
+  elif [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+    git show-ref --verify --quiet "refs/tags/${INSTALL_REF}"; then
+    target="refs/tags/${INSTALL_REF}"
+  elif git show-ref --verify --quiet "refs/remotes/origin/${INSTALL_REF}"; then
+    target="refs/remotes/origin/${INSTALL_REF}"
+  elif git rev-parse --verify --quiet "${INSTALL_REF}^{commit}" >/dev/null; then
+    target="$INSTALL_REF"
+  else
+    git fetch --force origin "$INSTALL_REF"
+    target="FETCH_HEAD"
+  fi
+
+  local commit
+  commit="$(git rev-parse --verify "${target}^{commit}")" ||
+    die "无法解析安装版本 ${INSTALL_REF}"
+  git reset --hard "$commit"
+  INSTALL_COMMIT="$commit"
+  NEWAPI_TOOLS_IMAGE="$(resolve_install_image "$INSTALL_REF" "$commit" "$REQUESTED_NEWAPI_TOOLS_IMAGE")"
+  export NEWAPI_TOOLS_IMAGE
+  export NEWAPI_TOOLS_SOURCE_COMMIT="$commit"
+  log_success "项目已固定到 ${INSTALL_REF} (${commit:0:12})"
+  log_success "部署镜像已固定到 ${NEWAPI_TOOLS_IMAGE}"
+}
 
 get_docker_compose_v2_version() {
   local output
@@ -83,6 +156,62 @@ dotenv_quote() {
   printf "'%s'" "$escaped"
 }
 
+legacy_image_version_to_reference() {
+  local version="${1:-}"
+  [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+    die "旧 NEWAPI_TOOLS_VERSION 格式无效；请改用完整 NEWAPI_TOOLS_IMAGE"
+  printf '%s:%s\n' "$NEWAPI_TOOLS_IMAGE_REPOSITORY" "$version"
+}
+
+# 将最终镜像引用以单一活动键幂等写入 .env，并停用旧版 tag-only 配置。
+migrate_image_env_file() {
+  local env_file="$1" selected_image="${2:-${NEWAPI_TOOLS_IMAGE:-}}"
+  [[ -f "$env_file" ]] || return 0
+
+  local current_image legacy_version
+  current_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+  legacy_version="$(env_file_value "$env_file" 'NEWAPI_TOOLS_VERSION')"
+
+  if [[ -z "$selected_image" ]]; then
+    if [[ -n "$current_image" ]]; then
+      selected_image="$current_image"
+    elif [[ -n "$legacy_version" ]]; then
+      selected_image="$(legacy_image_version_to_reference "$legacy_version")"
+    else
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.2.0"
+    fi
+  fi
+  validate_newapi_tools_image "$selected_image"
+
+  local tmp
+  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
+  awk '
+    index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
+    index($0, "NEWAPI_TOOLS_VERSION=") == 1 {
+      print "# Deprecated by install.sh: " $0
+      next
+    }
+    { print }
+  ' "$env_file" > "$tmp"
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$selected_image")" >> "$tmp"
+  chmod 600 "$tmp"
+
+  if cmp -s "$env_file" "$tmp"; then
+    rm -f "$tmp"
+    chmod 600 "$env_file"
+  else
+    mv "$tmp" "$env_file"
+    if [[ -n "$legacy_version" ]]; then
+      log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为完整 NEWAPI_TOOLS_IMAGE"
+    else
+      log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${selected_image}"
+    fi
+  fi
+
+  NEWAPI_TOOLS_IMAGE="$selected_image"
+  export NEWAPI_TOOLS_IMAGE
+}
+
 #######################################
 # 根据 .env 中的网络配置叠加 host / 日志库 overlay，
 # 设置 COMPOSE_FILE 让所有后续 docker compose 调用使用相同文件集合。
@@ -108,7 +237,9 @@ setup_compose_files() {
     nw="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
 
     # NEWAPI_NETWORK= （空值）→ deploy.sh 在 host 模式下生成的标记
-    if [[ -z "$nw" && -f "$host_overlay" ]]; then
+    if [[ -z "$nw" ]]; then
+      [[ -f "$host_overlay" ]] ||
+        die "host 模式需要 ${host_overlay}，缺少该叠加层时无法安全移除基础 external network 配置"
       require_docker_compose_v224 "host 网络叠加层 ${host_overlay}"
       compose_files+=("$host_overlay")
     fi
@@ -329,6 +460,11 @@ sync_newapi_mutation_safety_config() {
   if ! grep -q '^ALLOW_UNSAFE_HARD_DELETE=' "$env_file" 2>/dev/null; then
     echo "ALLOW_UNSAFE_HARD_DELETE=false" >> "$env_file"
     log_info "已加入安全默认值 ALLOW_UNSAFE_HARD_DELETE=false"
+  fi
+
+  if ! grep -q '^ALLOW_UNSAFE_BATCH_DELETE=' "$env_file" 2>/dev/null; then
+    echo "ALLOW_UNSAFE_BATCH_DELETE=false" >> "$env_file"
+    log_info "已加入安全默认值 ALLOW_UNSAFE_BATCH_DELETE=false"
   fi
 
   if ! grep -q '^ENFORCE_IP_RECORDING=' "$env_file" 2>/dev/null; then
@@ -934,9 +1070,8 @@ do_update_interactive() {
 
   # 更新代码
   if [[ -d ".git" ]]; then
-    log_info "更新代码..."
-    git fetch origin 2>/dev/null || true
-    git reset --hard origin/main 2>/dev/null || log_warn "代码更新跳过"
+    log_info "同步代码到固定版本 ${INSTALL_REF}..."
+    checkout_install_ref
   fi
 
   # 下载 GeoIP 数据库
@@ -957,7 +1092,9 @@ do_update_interactive() {
 
   # 拉取最新镜像并重启
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE pull
+  if ! $DOCKER_COMPOSE pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
 
   log_info "重启服务..."
   $DOCKER_COMPOSE down
@@ -1259,16 +1396,15 @@ clone_or_update_project() {
   local target_dir="${INSTALL_DIR}/${PROJECT_NAME}"
 
   if [[ -d "$target_dir" ]]; then
-    log_info "项目已存在，正在更新..."
+    log_info "项目已存在，正在同步到 ${INSTALL_REF}..."
     cd "$target_dir"
-    git fetch origin
-    git reset --hard origin/main
-    log_success "项目已更新到最新版本"
+    checkout_install_ref
   else
     log_info "正在克隆项目到: $target_dir"
-    git clone "$REPO_URL" "$target_dir"
+    git clone --no-checkout "$REPO_URL" "$target_dir"
     log_success "项目克隆完成"
     cd "$target_dir"
+    checkout_install_ref
   fi
 
   PROJECT_DIR="$target_dir"
@@ -1347,6 +1483,9 @@ migrate_env_file() {
   [[ -f "$env_file" ]] || return 0
 
   local migrated=false
+
+  # 镜像与当前安装 ref/显式覆盖保持一致；旧 tag-only 键只用于一次性迁移。
+  migrate_image_env_file "$env_file" "${NEWAPI_TOOLS_IMAGE:-}"
 
   # 补充 SQL_DSN（从分离字段构建）
   if ! grep -q '^SQL_DSN=' "$env_file" 2>/dev/null; then
@@ -1486,7 +1625,9 @@ quick_update() {
 
   # 拉取最新镜像
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${compose_args[@]}" pull
+  if ! $DOCKER_COMPOSE "${compose_args[@]}" pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
 
   log_info "重启服务..."
   $DOCKER_COMPOSE "${compose_args[@]}" down
@@ -1599,8 +1740,10 @@ NewAPI Middleware Tool - 安装管理脚本
   --help          显示此帮助信息
 
 环境变量:
-  PROJECT_DIR      指定项目目录（默认: 自动检测）
-  NEWAPI_CONTAINER 指定 NewAPI 容器名（默认: 自动检测）
+  PROJECT_DIR        指定项目目录（默认: 自动检测）
+  NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
+  NEWAPI_TOOLS_REF   Git 安装版本（默认: v0.2.0；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_IMAGE 完整镜像 tag/digest；自定义 ref 必须显式设置
 
 更多信息: https://github.com/yujianwudi/new_api_tools
 EOF
@@ -1639,4 +1782,6 @@ main() {
   run_deploy
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

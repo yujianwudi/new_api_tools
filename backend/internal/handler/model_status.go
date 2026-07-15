@@ -10,12 +10,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/config"
-	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
-const maxTrackedPublicModelClients = 10000
+const (
+	maxTrackedPublicModelClients         = 10000
+	authenticatedModelStatusMaxBatch     = 200
+	authenticatedModelStatusMaxBodyBytes = int64(1 << 20)
+)
 
 type publicModelRateEntry struct {
 	windowStart time.Time
@@ -157,10 +160,8 @@ func RegisterModelStatusEmbedRoutes(r *gin.Engine) {
 	}
 }
 
-func publicModelStatusError(c *gin.Context, operation string, err error) {
-	logger.L.Error(fmt.Sprintf("Public model-status %s failed: %v", operation, err), logger.CatAPI)
-	c.JSON(http.StatusInternalServerError, models.ErrorResp(
-		"QUERY_ERROR", "Model status data is temporarily unavailable", ""))
+func modelStatusQueryError(c *gin.Context, operation string, err error) {
+	respondInternalError(c, "QUERY_ERROR", "Model status data is temporarily unavailable", "model-status "+operation, err)
 }
 
 // GET /time-windows
@@ -177,7 +178,7 @@ func GetAvailableModels(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	data, err := svc.GetAvailableModels()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		modelStatusQueryError(c, "models query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -187,7 +188,7 @@ func GetPublicAvailableModels(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	data, err := svc.GetAvailableModels()
 	if err != nil {
-		publicModelStatusError(c, "models query", err)
+		modelStatusQueryError(c, "public models query", err)
 		return
 	}
 	maxModels := config.Get().PublicModelMaxBatch
@@ -219,9 +220,9 @@ func getSingleModelStatus(c *gin.Context, publicRequest bool) {
 	data, err := svc.GetModelStatus(modelName, window)
 	if err != nil {
 		if publicRequest {
-			publicModelStatusError(c, "single status query", err)
+			modelStatusQueryError(c, "public single status query", err)
 		} else {
-			c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+			modelStatusQueryError(c, "single status query", err)
 		}
 		return
 	}
@@ -238,18 +239,16 @@ func GetPublicMultipleModelsStatusHandler(c *gin.Context) {
 }
 
 func getMultipleModelsStatus(c *gin.Context, publicRequest bool) {
-	maxModels := int(^uint(0) >> 1)
+	maxModels := authenticatedModelStatusMaxBatch
+	maxBodyBytes := authenticatedModelStatusMaxBodyBytes
 	if publicRequest {
 		maxModels = config.Get().PublicModelMaxBatch
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, config.Get().PublicModelMaxBodyBytes)
+		maxBodyBytes = config.Get().PublicModelMaxBodyBytes
 	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 	var modelNames []string
 	if err := c.ShouldBindJSON(&modelNames); err != nil {
-		details := err.Error()
-		if publicRequest {
-			details = ""
-		}
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Expected array of model names", details))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Expected array of model names", ""))
 		return
 	}
 	window := c.DefaultQuery("window", service.DefaultTimeWindow)
@@ -267,9 +266,9 @@ func getMultipleModelsStatus(c *gin.Context, publicRequest bool) {
 	data, err := svc.GetMultipleModelsStatus(modelNames, window)
 	if err != nil {
 		if publicRequest {
-			publicModelStatusError(c, "multiple status query", err)
+			modelStatusQueryError(c, "public multiple status query", err)
 		} else {
-			c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+			modelStatusQueryError(c, "multiple status query", err)
 		}
 		return
 	}
@@ -292,7 +291,7 @@ func GetAllModelsStatusHandler(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	data, err := svc.GetAllModelsStatus(window)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		modelStatusQueryError(c, "all model statuses query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -313,7 +312,7 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	available, err := svc.GetAvailableModels()
 	if err != nil {
-		publicModelStatusError(c, "all models query", err)
+		modelStatusQueryError(c, "public all models query", err)
 		return
 	}
 	maxModels := config.Get().PublicModelMaxBatch
@@ -330,7 +329,7 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 	}
 	data, err := svc.GetMultipleModelsStatus(names, window)
 	if err != nil {
-		publicModelStatusError(c, "all model statuses query", err)
+		modelStatusQueryError(c, "public all model statuses query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -397,7 +396,7 @@ func SetSelectedModels(c *gin.Context) {
 		Models []string `json:"models"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewModelStatusService()
@@ -425,7 +424,7 @@ func SetTimeWindowConfig(c *gin.Context) {
 		TimeWindow string `json:"time_window"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	// Validate
@@ -466,7 +465,7 @@ func SetThemeConfig(c *gin.Context) {
 		Theme string `json:"theme"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	// Map legacy theme names to valid ones
@@ -511,7 +510,7 @@ func SetRefreshIntervalConfig(c *gin.Context) {
 		RefreshInterval int `json:"refresh_interval"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	valid := false
@@ -551,7 +550,7 @@ func SetSortModeConfig(c *gin.Context) {
 		SortMode string `json:"sort_mode"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	valid := false
@@ -580,7 +579,7 @@ func SetCustomOrderConfig(c *gin.Context) {
 		CustomOrder []string `json:"custom_order"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewModelStatusService()
@@ -615,7 +614,7 @@ func SetCustomGroupsConfig(c *gin.Context) {
 		Groups []map[string]interface{} `json:"groups"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewModelStatusService()
@@ -632,7 +631,7 @@ func GetTokenGroupsForModelStatus(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	groups, err := svc.GetTokenGroups()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		modelStatusQueryError(c, "token groups query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -645,7 +644,7 @@ func GetPublicTokenGroupsForModelStatus(c *gin.Context) {
 	svc := service.NewModelStatusService()
 	groups, err := svc.GetTokenGroups()
 	if err != nil {
-		publicModelStatusError(c, "token groups query", err)
+		modelStatusQueryError(c, "public token groups query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -669,7 +668,7 @@ func SetSiteTitleConfig(c *gin.Context) {
 		SiteTitle string `json:"site_title"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewModelStatusService()

@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/models"
@@ -22,6 +24,8 @@ func RegisterAutoGroupRoutes(r *gin.RouterGroup) {
 		g.POST("/scan", RunAutoGroupScan)
 		g.POST("/batch-move", BatchMoveAutoGroupUsers)
 		g.GET("/logs", GetAutoGroupLogs)
+		g.GET("/pending-audits", GetPendingAutoGroupAudits)
+		g.POST("/pending-audits/resolve", ResolvePendingAutoGroupAudit)
 		g.POST("/revert", RevertAutoGroupUser)
 	}
 }
@@ -36,7 +40,7 @@ func GetAutoGroupConfig(c *gin.Context) {
 func SaveAutoGroupConfig(c *gin.Context) {
 	var req map[string]interface{}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 
@@ -71,7 +75,7 @@ func SaveAutoGroupConfig(c *gin.Context) {
 
 	svc := service.NewAutoGroupService()
 	if !svc.SaveConfig(req) {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("SAVE_ERROR", "保存配置失败", ""))
+		respondInternalError(c, "SAVE_ERROR", "Unable to save auto-group configuration", "auto-group configuration save", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -157,7 +161,7 @@ func BatchMoveAutoGroupUsers(c *gin.Context) {
 		TargetGroup string  `json:"target_group"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	if len(req.UserIDs) == 0 {
@@ -192,13 +196,50 @@ func GetAutoGroupLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
+// GET /api/auto-group/pending-audits
+func GetPendingAutoGroupAudits(c *gin.Context) {
+	svc := service.NewAutoGroupService()
+	data, err := svc.GetPendingAudits()
+	if err != nil {
+		respondHandlerError(c, http.StatusServiceUnavailable, "AUDIT_STORAGE_ERROR", "Pending audit storage is temporarily unavailable", "auto-group pending audit list", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// POST /api/auto-group/pending-audits/resolve
+func ResolvePendingAutoGroupAudit(c *gin.Context) {
+	var req struct {
+		OperationID  string `json:"operation_id"`
+		Resolution   string `json:"resolution"`
+		Confirmation string `json:"confirmation"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+		return
+	}
+	actor := "admin"
+	if subject, exists := c.Get("user_sub"); exists {
+		if value := strings.TrimSpace(fmt.Sprint(subject)); value != "" {
+			actor = value
+		}
+	}
+	svc := service.NewAutoGroupService()
+	data, err := svc.ResolvePendingAudit(req.OperationID, req.Resolution, req.Confirmation, actor)
+	if err != nil {
+		respondHandlerError(c, http.StatusBadRequest, "PENDING_AUDIT_RESOLUTION_ERROR", "Unable to resolve pending audit operation", "auto-group pending audit resolution", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
 // POST /api/auto-group/revert
 func RevertAutoGroupUser(c *gin.Context) {
 	var req struct {
 		LogID int `json:"log_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewAutoGroupService()

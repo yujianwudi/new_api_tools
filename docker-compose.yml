@@ -10,7 +10,7 @@
 
 services:
   newapi-tools:
-    image: ghcr.io/yujianwudi/new_api_tools:latest
+    image: "${NEWAPI_TOOLS_IMAGE:-ghcr.io/yujianwudi/new_api_tools:0.2.0}"
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
@@ -65,6 +65,7 @@ services:
       - NEWAPI_BASEURL=${NEWAPI_BASEURL:-}
       # NewAPI Redis/直接写库安全边界（工具自身 Redis 与此无关）
       - NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
+      - ALLOW_UNSAFE_BATCH_DELETE=${ALLOW_UNSAFE_BATCH_DELETE:-false}
       - ALLOW_UNSAFE_HARD_DELETE=${ALLOW_UNSAFE_HARD_DELETE:-false}
       - ENFORCE_IP_RECORDING=${ENFORCE_IP_RECORDING:-false}
     volumes:
@@ -96,11 +97,12 @@ services:
   redis:
     image: redis:7-alpine
     container_name: newapi-tools-redis
+    # 只允许淘汰带 TTL 的普通缓存/一次性快照；AutoGroup 审计键无 TTL，必须保留。
     command: >
       redis-server
       --appendonly yes
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
       ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
     volumes:
       - redis_data:/data

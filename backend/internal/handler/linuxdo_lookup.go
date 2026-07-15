@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -66,6 +67,10 @@ func LinuxDoLookup(c *gin.Context) {
 			"success":    false,
 			"message":    lookupErr.Message,
 			"error_type": lookupErr.ErrorType,
+		}
+		if lookupErr.StatusCode >= http.StatusInternalServerError {
+			logger.L.Error(fmt.Sprintf("Linux.do lookup failed: type=%s status=%d error=%v", lookupErr.ErrorType, lookupErr.StatusCode, lookupErr), logger.CatAPI)
+			resp["message"] = "Linux.do lookup is temporarily unavailable"
 		}
 		if lookupErr.WaitSeconds > 0 {
 			resp["wait_seconds"] = lookupErr.WaitSeconds

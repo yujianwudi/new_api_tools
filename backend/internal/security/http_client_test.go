@@ -33,6 +33,8 @@ func TestValidateHTTPSURLRejectsUnsafeDestinations(t *testing.T) {
 		{name: "plain HTTP", rawURL: "http://public.example/v1", wantErr: true},
 		{name: "loopback literal", rawURL: "https://127.0.0.1/v1", wantErr: true},
 		{name: "link local metadata", rawURL: "https://169.254.169.254/latest", wantErr: true},
+		{name: "well-known translation literal", rawURL: "https://[64:ff9b::7f00:1]/v1", wantErr: true},
+		{name: "local-use translation literal", rawURL: "https://[64:ff9b:1::1]/v1", wantErr: true},
 		{name: "metadata hostname", rawURL: "https://metadata.google.internal/", wantErr: true},
 		{name: "private DNS result", rawURL: "https://private.example/v1", wantErr: true},
 		{name: "embedded credentials", rawURL: "https://user:pass@public.example/v1", wantErr: true},

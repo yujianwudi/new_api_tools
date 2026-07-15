@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/logger"
+	"github.com/redis/go-redis/v9"
 )
 
 // Activity level constants
@@ -27,12 +29,16 @@ const (
 	ActiveThreshold   = 7 * 24 * 3600  // 7 days
 	InactiveThreshold = 30 * 24 * 3600 // 30 days
 
-	destructiveLogMaxAge       = 24 * time.Hour
-	destructiveLogFutureSkew   = 5 * time.Minute
-	destructiveMutationTimeout = 30 * time.Second
-	batchDeleteSnapshotTTL     = 10 * time.Minute
-	maxBatchDeleteUsers        = 1000
-	protectedAdminRole         = 10
+	destructiveLogMaxAge            = 24 * time.Hour
+	destructiveLogFutureSkew        = 5 * time.Minute
+	destructiveMutationTimeout      = 30 * time.Second
+	batchDeleteSnapshotTTL          = 10 * time.Minute
+	destructiveSnapshotRedisTimeout = 5 * time.Second
+	maxBatchDeleteUsers             = 1000
+	batchDeleteCandidatePageSize    = 250
+	maxBatchDeletePreviewScanRows   = 50000
+	batchDeletePreviewScanTimeout   = 30 * time.Second
+	protectedAdminRole              = 10
 )
 
 type batchDeleteUser struct {
@@ -51,17 +57,108 @@ type batchDeleteSnapshot struct {
 }
 
 type purgeSoftDeletedSnapshot struct {
-	IDs       []int64 `json:"ids"`
-	CreatedAt int64   `json:"created_at"`
+	IDs       []int64  `json:"ids"`
+	DeletedAt []string `json:"deleted_at"`
+	CreatedAt int64    `json:"created_at"`
 }
 
-var batchDeleteSnapshotMu sync.Mutex
-var purgeSoftDeletedSnapshotMu sync.Mutex
+func canonicalSnapshotDBValue(value interface{}) (string, error) {
+	switch typed := value.(type) {
+	case nil:
+		return "", errors.New("snapshot database value is null")
+	case time.Time:
+		return typed.UTC().Format(time.RFC3339Nano), nil
+	case []byte:
+		return string(typed), nil
+	case string:
+		return typed, nil
+	default:
+		return fmt.Sprint(typed), nil
+	}
+}
+
+var claimDestructiveSnapshotScript = redis.NewScript(`
+local value = redis.call('GET', KEYS[1])
+if not value then
+  return false
+end
+redis.call('DEL', KEYS[1])
+return value
+`)
+
+var storeDestructiveSnapshot = storeDestructiveSnapshotInRedis
+var claimDestructiveSnapshot = claimDestructiveSnapshotFromRedis
+
+func destructiveSnapshotRedisClient() (*redis.Client, error) {
+	rdb := cache.Get().RedisClient()
+	if rdb == nil {
+		return nil, fmt.Errorf("%w: Redis is required for one-time destructive-operation snapshots", ErrDestructiveSnapshotStoreUnavailable)
+	}
+	return rdb, nil
+}
+
+func storeDestructiveSnapshotInRedis(key string, value interface{}, ttl time.Duration) error {
+	rdb, err := destructiveSnapshotRedisClient()
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("serialize destructive-operation snapshot: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), destructiveSnapshotRedisTimeout)
+	defer cancel()
+	if err := rdb.Set(ctx, key, raw, ttl).Err(); err != nil {
+		return fmt.Errorf("%w: write snapshot to Redis: %v", ErrDestructiveSnapshotStoreUnavailable, err)
+	}
+	return nil
+}
+
+func claimDestructiveSnapshotFromRedis(key string) ([]byte, error) {
+	rdb, err := destructiveSnapshotRedisClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), destructiveSnapshotRedisTimeout)
+	defer cancel()
+	result, err := claimDestructiveSnapshotScript.Run(ctx, rdb, []string{key}).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: atomically claim snapshot: %v", ErrDestructiveSnapshotStoreUnavailable, err)
+	}
+	if result == nil {
+		return nil, nil
+	}
+	raw, ok := result.(string)
+	if !ok {
+		return nil, fmt.Errorf("atomically claim destructive-operation snapshot: unexpected Redis result %T", result)
+	}
+	return []byte(raw), nil
+}
 
 // ErrBulkTokenReactivationDisabled rejects the legacy enable_tokens contract.
 // Without a durable snapshot of exactly which tokens a ban changed, bulk
 // restoration could reactivate credentials disabled for an unrelated incident.
 var ErrBulkTokenReactivationDisabled = errors.New("bulk token reactivation is disabled")
+
+// ErrInvalidOrExpiredSnapshot identifies malformed, expired, missing, or
+// already-consumed destructive-operation previews. Handlers should return a
+// client error and ask the operator to preview again.
+var ErrInvalidOrExpiredSnapshot = errors.New("invalid or expired operation snapshot")
+
+// ErrSnapshotInvalidated identifies a valid preview whose protected rows have
+// changed since it was created.
+var ErrSnapshotInvalidated = errors.New("operation snapshot invalidated")
+
+// ErrDestructiveSnapshotStoreUnavailable means Redis could not provide the
+// cross-instance atomic one-time claim required by destructive previews.
+var ErrDestructiveSnapshotStoreUnavailable = errors.New("destructive-operation snapshot store unavailable")
+
+// ErrSeparateLogDBBatchDeleteBlocked prevents pretending that a users-row lock
+// can fence billable-log inserts made through an independent database.
+var ErrSeparateLogDBBatchDeleteBlocked = errors.New("batch delete is blocked when logs use a separate database")
 
 func newBatchDeleteSnapshotID() (string, error) {
 	raw := make([]byte, 32)
@@ -74,7 +171,7 @@ func newBatchDeleteSnapshotID() (string, error) {
 func batchDeleteSnapshotKey(id string) (string, error) {
 	decoded, err := hex.DecodeString(id)
 	if err != nil || len(decoded) != 32 {
-		return "", fmt.Errorf("invalid or expired batch-delete snapshot")
+		return "", fmt.Errorf("%w: batch-delete snapshot", ErrInvalidOrExpiredSnapshot)
 	}
 	return "user_management:batch_delete_snapshot:" + id, nil
 }
@@ -85,7 +182,7 @@ func storeBatchDeleteSnapshot(snapshot batchDeleteSnapshot) (string, error) {
 		return "", err
 	}
 	key, _ := batchDeleteSnapshotKey(id)
-	if err := cache.Get().Set(key, snapshot, batchDeleteSnapshotTTL); err != nil {
+	if err := storeDestructiveSnapshot(key, snapshot, batchDeleteSnapshotTTL); err != nil {
 		return "", fmt.Errorf("store batch-delete snapshot: %w", err)
 	}
 	return id, nil
@@ -96,25 +193,25 @@ func consumeBatchDeleteSnapshot(id, activityLevel string, hardDelete bool) (*bat
 	if err != nil {
 		return nil, err
 	}
-	batchDeleteSnapshotMu.Lock()
-	defer batchDeleteSnapshotMu.Unlock()
-
-	var snapshot batchDeleteSnapshot
-	found, err := cache.Get().GetJSON(key, &snapshot)
+	raw, err := claimDestructiveSnapshot(key)
 	if err != nil {
-		return nil, fmt.Errorf("read batch-delete snapshot: %w", err)
+		return nil, fmt.Errorf("claim batch-delete snapshot: %w", err)
 	}
-	if !found || time.Since(time.Unix(snapshot.CreatedAt, 0)) > batchDeleteSnapshotTTL {
-		return nil, fmt.Errorf("invalid or expired batch-delete snapshot")
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%w: batch-delete snapshot", ErrInvalidOrExpiredSnapshot)
+	}
+	var snapshot batchDeleteSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return nil, fmt.Errorf("%w: malformed batch-delete snapshot", ErrInvalidOrExpiredSnapshot)
+	}
+	if time.Since(time.Unix(snapshot.CreatedAt, 0)) > batchDeleteSnapshotTTL {
+		return nil, fmt.Errorf("%w: batch-delete snapshot", ErrInvalidOrExpiredSnapshot)
 	}
 	if snapshot.ActivityLevel != activityLevel || snapshot.HardDelete != hardDelete {
-		return nil, fmt.Errorf("batch-delete snapshot does not match the confirmed operation")
+		return nil, fmt.Errorf("%w: batch-delete snapshot does not match the confirmed operation", ErrInvalidOrExpiredSnapshot)
 	}
 	if len(snapshot.IDs) != len(snapshot.RequestCounts) {
-		return nil, fmt.Errorf("invalid batch-delete snapshot")
-	}
-	if err := cache.Get().Delete(key); err != nil {
-		return nil, fmt.Errorf("claim batch-delete snapshot: %w", err)
+		return nil, fmt.Errorf("%w: malformed batch-delete snapshot", ErrInvalidOrExpiredSnapshot)
 	}
 	return &snapshot, nil
 }
@@ -122,7 +219,7 @@ func consumeBatchDeleteSnapshot(id, activityLevel string, hardDelete bool) (*bat
 func purgeSoftDeletedSnapshotKey(id string) (string, error) {
 	decoded, err := hex.DecodeString(id)
 	if err != nil || len(decoded) != 32 {
-		return "", fmt.Errorf("invalid or expired purge snapshot")
+		return "", fmt.Errorf("%w: purge snapshot", ErrInvalidOrExpiredSnapshot)
 	}
 	return "user_management:purge_soft_deleted_snapshot:" + id, nil
 }
@@ -133,7 +230,7 @@ func storePurgeSoftDeletedSnapshot(snapshot purgeSoftDeletedSnapshot) (string, e
 		return "", err
 	}
 	key, _ := purgeSoftDeletedSnapshotKey(id)
-	if err := cache.Get().Set(key, snapshot, batchDeleteSnapshotTTL); err != nil {
+	if err := storeDestructiveSnapshot(key, snapshot, batchDeleteSnapshotTTL); err != nil {
 		return "", fmt.Errorf("store purge snapshot: %w", err)
 	}
 	return id, nil
@@ -144,22 +241,22 @@ func consumePurgeSoftDeletedSnapshot(id string) (*purgeSoftDeletedSnapshot, erro
 	if err != nil {
 		return nil, err
 	}
-	purgeSoftDeletedSnapshotMu.Lock()
-	defer purgeSoftDeletedSnapshotMu.Unlock()
-
-	var snapshot purgeSoftDeletedSnapshot
-	found, err := cache.Get().GetJSON(key, &snapshot)
+	raw, err := claimDestructiveSnapshot(key)
 	if err != nil {
-		return nil, fmt.Errorf("read purge snapshot: %w", err)
-	}
-	if !found || time.Since(time.Unix(snapshot.CreatedAt, 0)) > batchDeleteSnapshotTTL {
-		return nil, fmt.Errorf("invalid or expired purge snapshot")
-	}
-	if len(snapshot.IDs) == 0 || len(snapshot.IDs) > maxBatchDeleteUsers {
-		return nil, fmt.Errorf("invalid purge snapshot size")
-	}
-	if err := cache.Get().Delete(key); err != nil {
 		return nil, fmt.Errorf("claim purge snapshot: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%w: purge snapshot", ErrInvalidOrExpiredSnapshot)
+	}
+	var snapshot purgeSoftDeletedSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		return nil, fmt.Errorf("%w: malformed purge snapshot", ErrInvalidOrExpiredSnapshot)
+	}
+	if time.Since(time.Unix(snapshot.CreatedAt, 0)) > batchDeleteSnapshotTTL {
+		return nil, fmt.Errorf("%w: purge snapshot", ErrInvalidOrExpiredSnapshot)
+	}
+	if len(snapshot.IDs) == 0 || len(snapshot.IDs) > maxBatchDeleteUsers || len(snapshot.IDs) != len(snapshot.DeletedAt) {
+		return nil, fmt.Errorf("%w: invalid purge snapshot size", ErrInvalidOrExpiredSnapshot)
 	}
 	return &snapshot, nil
 }
@@ -221,7 +318,15 @@ func (s *UserManagementService) activeUserIDsSince(since int64) (map[int64]bool,
 // This is especially important for ActivityNever, where a created_at >= 0 scan
 // over the complete lifetime of a large logs table would otherwise be costly.
 func (s *UserManagementService) activeCandidateUserIDsSince(candidateIDs []int64, since int64) (map[int64]bool, error) {
+	return s.activeCandidateUserIDsSinceWithTimeout(candidateIDs, since, 60*time.Second)
+}
+
+func (s *UserManagementService) activeCandidateUserIDsSinceWithTimeout(candidateIDs []int64, since int64, timeout time.Duration) (map[int64]bool, error) {
 	set := make(map[int64]bool)
+	if timeout <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+	deadline := time.Now().Add(timeout)
 	const lookupBatchSize = 500
 	for start := 0; start < len(candidateIDs); start += lookupBatchSize {
 		end := start + lookupBatchSize
@@ -240,7 +345,11 @@ func (s *UserManagementService) activeCandidateUserIDsSince(candidateIDs []int64
 		query := s.logDB.RebindQuery(fmt.Sprintf(
 			"SELECT DISTINCT user_id FROM logs WHERE type IN (2,5) AND created_at >= ? AND user_id IN (%s)",
 			strings.Join(placeholders, ",")))
-		rows, err := s.logDB.QueryWithTimeout(60*time.Second, query, args...)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		rows, err := s.logDB.QueryWithTimeout(remaining, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -253,37 +362,94 @@ func (s *UserManagementService) activeCandidateUserIDsSince(candidateIDs []int64
 	return set, nil
 }
 
-func (s *UserManagementService) activeCandidateUserIDsSinceLocked(ctx context.Context, tx *sqlx.Tx, candidateIDs []int64, since int64) (map[int64]bool, error) {
-	if s.logDB != s.db {
-		set := make(map[int64]bool)
-		const lookupBatchSize = 500
-		for start := 0; start < len(candidateIDs); start += lookupBatchSize {
-			end := start + lookupBatchSize
-			if end > len(candidateIDs) {
-				end = len(candidateIDs)
+// previewBatchDeleteCandidates walks the main user table with keyset
+// pagination and checks one bounded page against the log database at a time.
+// It stops as soon as maxBatchDeleteUsers+1 eligible rows are found, which is
+// enough to reject an oversized operation without scanning the full population.
+func (s *UserManagementService) previewBatchDeleteCandidates(activityLevel string, threshold int64) ([]batchDeleteUser, error) {
+	requestCountPredicate := "request_count > 0"
+	if activityLevel == ActivityNever {
+		requestCountPredicate = "request_count = 0"
+	}
+	maxRow, err := s.db.QueryOneWithTimeout(10*time.Second, s.db.RebindQuery(fmt.Sprintf(`SELECT COALESCE(MAX(id), 0) AS max_id
+		FROM users WHERE deleted_at IS NULL AND role < 10 AND %s`, requestCountPredicate)))
+	if err != nil {
+		return nil, fmt.Errorf("read batch-delete scan ceiling: %w", err)
+	}
+	scanCeiling := toInt64(maxRow["max_id"])
+	if scanCeiling <= 0 {
+		return []batchDeleteUser{}, nil
+	}
+	query := s.db.RebindQuery(fmt.Sprintf(`SELECT id, username, request_count
+		FROM users
+		WHERE deleted_at IS NULL AND role < 10 AND %s AND id > ? AND id <= ?
+		ORDER BY id ASC LIMIT ?`, requestCountPredicate))
+
+	eligible := make([]batchDeleteUser, 0, maxBatchDeleteUsers+1)
+	lastID := int64(0)
+	scannedRows := 0
+	deadline := time.Now().Add(batchDeletePreviewScanTimeout)
+	for len(eligible) <= maxBatchDeleteUsers {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("batch-delete preview exceeded its %s scan budget", batchDeletePreviewScanTimeout)
+		}
+		rows, err := s.db.QueryWithTimeout(remaining, query, lastID, scanCeiling, batchDeleteCandidatePageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		scannedRows += len(rows)
+		if scannedRows > maxBatchDeletePreviewScanRows {
+			return nil, fmt.Errorf("batch-delete preview exceeded the safe scan limit of %d candidate rows", maxBatchDeletePreviewScanRows)
+		}
+
+		pageIDs := make([]int64, 0, len(rows))
+		pageLastID := lastID
+		for _, row := range rows {
+			id := toInt64(row["id"])
+			if id > pageLastID {
+				pageLastID = id
 			}
-			batch := candidateIDs[start:end]
-			placeholders := make([]string, len(batch))
-			args := make([]interface{}, 0, len(batch)+1)
-			args = append(args, since)
-			for i, id := range batch {
-				placeholders[i] = "?"
-				args = append(args, id)
-			}
-			query := s.logDB.RebindQuery(fmt.Sprintf(
-				"SELECT DISTINCT user_id FROM logs WHERE type IN (2,5) AND created_at >= ? AND user_id IN (%s)",
-				strings.Join(placeholders, ",")))
-			rows, err := s.logDB.QueryContext(ctx, query, args...)
-			if err != nil {
-				return nil, err
-			}
-			for _, row := range rows {
-				if id := toInt64(row["user_id"]); id > 0 {
-					set[id] = true
-				}
+			if id > 0 {
+				pageIDs = append(pageIDs, id)
 			}
 		}
-		return set, nil
+		if pageLastID <= lastID {
+			return nil, errors.New("batch-delete candidate pagination made no progress")
+		}
+
+		activeSet, err := s.activeCandidateUserIDsSinceWithTimeout(pageIDs, threshold, time.Until(deadline))
+		if err != nil {
+			return nil, fmt.Errorf("无法从日志库判定用户活跃度，已中止删除以防误删: %w", err)
+		}
+		for _, row := range rows {
+			uid := toInt64(row["id"])
+			if uid <= 0 || activeSet[uid] {
+				continue
+			}
+			eligible = append(eligible, batchDeleteUser{
+				id:           uid,
+				username:     toString(row["username"]),
+				requestCount: toInt64(row["request_count"]),
+			})
+			if len(eligible) > maxBatchDeleteUsers {
+				return eligible, nil
+			}
+		}
+		lastID = pageLastID
+		if len(rows) < batchDeleteCandidatePageSize {
+			break
+		}
+	}
+	return eligible, nil
+}
+
+func (s *UserManagementService) activeCandidateUserIDsSinceLocked(ctx context.Context, tx *sqlx.Tx, candidateIDs []int64, since int64) (map[int64]bool, error) {
+	if s.logDB != s.db {
+		return nil, ErrSeparateLogDBBatchDeleteBlocked
 	}
 
 	set := make(map[int64]bool)
@@ -1024,6 +1190,16 @@ func (s *UserManagementService) PurgeSoftDeleted(snapshotID string) (int64, erro
 		return 0, err
 	}
 	ids := append([]int64(nil), snapshot.IDs...)
+	expectedDeletedAt := make(map[int64]string, len(ids))
+	for i, id := range ids {
+		if id <= 0 {
+			return 0, fmt.Errorf("%w: invalid purge snapshot user ID", ErrInvalidOrExpiredSnapshot)
+		}
+		if _, duplicate := expectedDeletedAt[id]; duplicate {
+			return 0, fmt.Errorf("%w: duplicate purge snapshot user ID", ErrInvalidOrExpiredSnapshot)
+		}
+		expectedDeletedAt[id] = snapshot.DeletedAt[i]
+	}
 
 	var affected int64
 	err = s.withMutationTransaction(func(ctx context.Context, tx *sqlx.Tx) error {
@@ -1034,15 +1210,42 @@ func (s *UserManagementService) PurgeSoftDeleted(snapshotID string) (int64, erro
 			args[i] = id
 		}
 		inClause := strings.Join(placeholders, ",")
-		var lockedIDs []int64
 		lockQuery := fmt.Sprintf(
-			"SELECT id FROM users WHERE id IN (%s) AND deleted_at IS NOT NULL AND role < 10 ORDER BY id%s",
+			"SELECT id, deleted_at FROM users WHERE id IN (%s) AND deleted_at IS NOT NULL AND role < 10 ORDER BY id%s",
 			inClause, s.mutationRowLockClause())
-		if err := tx.SelectContext(ctx, &lockedIDs, tx.Rebind(lockQuery), args...); err != nil {
+		rows, err := tx.QueryxContext(ctx, tx.Rebind(lockQuery), args...)
+		if err != nil {
 			return fmt.Errorf("lock purge candidates: %w", err)
 		}
-		if len(lockedIDs) != len(ids) {
-			return fmt.Errorf("purge snapshot invalidated: expected %d eligible users, found %d", len(ids), len(lockedIDs))
+		lockedCount := 0
+		for rows.Next() {
+			row := make(map[string]interface{})
+			if err := rows.MapScan(row); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan locked purge candidate: %w", err)
+			}
+			id := toInt64(row["id"])
+			deletedAt, err := canonicalSnapshotDBValue(row["deleted_at"])
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("read locked purge candidate %d: %w", id, err)
+			}
+			expected, exists := expectedDeletedAt[id]
+			if !exists || deletedAt != expected {
+				_ = rows.Close()
+				return fmt.Errorf("%w: soft-deleted user %d changed after preview", ErrSnapshotInvalidated, id)
+			}
+			lockedCount++
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read locked purge candidates: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close locked purge candidates: %w", err)
+		}
+		if lockedCount != len(ids) {
+			return fmt.Errorf("%w: purge expected %d eligible users, found %d", ErrSnapshotInvalidated, len(ids), lockedCount)
 		}
 
 		const purgeBatchSize = 500
@@ -1077,7 +1280,7 @@ func (s *UserManagementService) PurgeSoftDeleted(snapshotID string) (int64, erro
 			affected += count
 		}
 		if affected != int64(len(ids)) {
-			return fmt.Errorf("purge candidates changed concurrently: expected %d users, deleted %d; no changes committed", len(ids), affected)
+			return fmt.Errorf("%w: purge candidates changed concurrently; expected %d users, deleted %d; no changes committed", ErrSnapshotInvalidated, len(ids), affected)
 		}
 		return nil
 	})
@@ -1090,7 +1293,7 @@ func (s *UserManagementService) PurgeSoftDeleted(snapshotID string) (int64, erro
 
 // PreviewSoftDeletedUsers returns count and sample usernames for the purge dialog.
 func (s *UserManagementService) PreviewSoftDeletedUsers() (map[string]interface{}, error) {
-	rows, err := s.db.Query(`SELECT id, username FROM users
+	rows, err := s.db.Query(`SELECT id, username, deleted_at FROM users
 		WHERE deleted_at IS NOT NULL AND role < 10
 		ORDER BY deleted_at DESC, id DESC LIMIT 1001`)
 	if err != nil {
@@ -1100,13 +1303,19 @@ func (s *UserManagementService) PreviewSoftDeletedUsers() (map[string]interface{
 		return nil, fmt.Errorf("purge blocked: more than %d eligible users; purge in smaller reviewed batches", maxBatchDeleteUsers)
 	}
 	ids := make([]int64, 0, len(rows))
+	deletedAtValues := make([]string, 0, len(rows))
 	users := make([]string, 0, 20)
 	for _, row := range rows {
 		id := toInt64(row["id"])
 		if id <= 0 {
 			continue
 		}
+		deletedAt, err := canonicalSnapshotDBValue(row["deleted_at"])
+		if err != nil {
+			return nil, fmt.Errorf("snapshot soft-deleted user %d: %w", id, err)
+		}
 		ids = append(ids, id)
+		deletedAtValues = append(deletedAtValues, deletedAt)
 		if len(users) < 20 {
 			users = append(users, toString(row["username"]))
 		}
@@ -1115,6 +1324,7 @@ func (s *UserManagementService) PreviewSoftDeletedUsers() (map[string]interface{
 	if len(ids) > 0 {
 		snapshotID, err = storePurgeSoftDeletedSnapshot(purgeSoftDeletedSnapshot{
 			IDs:       ids,
+			DeletedAt: deletedAtValues,
 			CreatedAt: time.Now().Unix(),
 		})
 		if err != nil {
@@ -1160,43 +1370,9 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 	}
 
 	if dryRun {
-		// Candidate users from the main DB (never request admins, never touch deleted).
-		var candidateSQL string
-		if activityLevel == ActivityNever {
-			candidateSQL = "SELECT id, username, request_count FROM users WHERE deleted_at IS NULL AND role < 10 AND request_count = 0 ORDER BY id ASC"
-		} else {
-			candidateSQL = "SELECT id, username, request_count FROM users WHERE deleted_at IS NULL AND role < 10 AND request_count > 0 ORDER BY id ASC"
-		}
-		candidates, err := s.db.Query(candidateSQL)
+		toDelete, err := s.previewBatchDeleteCandidates(activityLevel, threshold)
 		if err != nil {
 			return nil, err
-		}
-		candidateIDs := make([]int64, 0, len(candidates))
-		for _, row := range candidates {
-			if id := toInt64(row["id"]); id > 0 {
-				candidateIDs = append(candidateIDs, id)
-			}
-		}
-
-		// Exclude users that are still active per the LOG DB. For ActivityNever this
-		// reads the complete billable-log history (created_at >= 0), so a stale or
-		// inconsistent request_count cannot make a known user look unused.
-		activeSet, err := s.activeCandidateUserIDsSince(candidateIDs, threshold)
-		if err != nil {
-			return nil, fmt.Errorf("无法从日志库判定用户活跃度，已中止删除以防误删: %w", err)
-		}
-
-		toDelete := make([]batchDeleteUser, 0, len(candidates))
-		for _, row := range candidates {
-			uid := toInt64(row["id"])
-			if uid <= 0 || activeSet[uid] {
-				continue
-			}
-			toDelete = append(toDelete, batchDeleteUser{
-				id:           uid,
-				username:     toString(row["username"]),
-				requestCount: toInt64(row["request_count"]),
-			})
 		}
 		if len(toDelete) > maxBatchDeleteUsers {
 			return nil, fmt.Errorf("batch delete blocked: %d users exceed the per-operation limit of %d", len(toDelete), maxBatchDeleteUsers)
@@ -1237,7 +1413,10 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 			"snapshot_ttl":   int64(batchDeleteSnapshotTTL / time.Second),
 		}, nil
 	}
-	if err := ensureNewAPIDirectMutationSafe(); err != nil {
+	if s.logDB != s.db {
+		return nil, fmt.Errorf("%w: billable-log inserts cannot be atomically fenced with the user deletion transaction; use the NewAPI admin API or co-locate logs in the main database", ErrSeparateLogDBBatchDeleteBlocked)
+	}
+	if err := ensureUnsafeBatchDeleteAllowed(); err != nil {
 		return nil, err
 	}
 	if hardDelete {
@@ -1279,7 +1458,7 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 		return nil, fmt.Errorf("无法重新验证预览用户的活跃度，已中止删除: %w", err)
 	}
 	if len(activeSet) > 0 {
-		return nil, fmt.Errorf("batch-delete snapshot invalidated: %d previewed users became active; preview again", len(activeSet))
+		return nil, fmt.Errorf("%w: %d previewed users became active; preview again", ErrSnapshotInvalidated, len(activeSet))
 	}
 
 	// Lock and compare the exact previewed request counters before the final log
@@ -1308,7 +1487,7 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 			lockedCount += len(lockedIDs)
 		}
 		if lockedCount != len(ids) {
-			return fmt.Errorf("batch-delete snapshot invalidated: expected %d eligible users, found %d", len(ids), lockedCount)
+			return fmt.Errorf("%w: expected %d eligible users, found %d", ErrSnapshotInvalidated, len(ids), lockedCount)
 		}
 
 		activeSet, err := s.activeCandidateUserIDsSinceLocked(ctx, tx, ids, snapshot.ActivityCutoff)
@@ -1316,7 +1495,7 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 			return fmt.Errorf("无法在锁定候选后重新验证用户活跃度，已中止删除: %w", err)
 		}
 		if len(activeSet) > 0 {
-			return fmt.Errorf("batch-delete snapshot invalidated: %d locked users became active; preview again", len(activeSet))
+			return fmt.Errorf("%w: %d locked users became active; preview again", ErrSnapshotInvalidated, len(activeSet))
 		}
 
 		for start := 0; start < len(ids); start += batchSize {
@@ -1361,7 +1540,7 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 			}
 		}
 		if actualAffected != int64(len(ids)) {
-			return fmt.Errorf("batch-delete snapshot invalidated: expected %d eligible users, found %d; no changes committed", len(ids), actualAffected)
+			return fmt.Errorf("%w: expected %d eligible users, found %d; no changes committed", ErrSnapshotInvalidated, len(ids), actualAffected)
 		}
 		return nil
 	})

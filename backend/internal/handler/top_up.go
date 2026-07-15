@@ -45,6 +45,10 @@ func RegisterTopUpRoutes(r *gin.RouterGroup) {
 	}
 }
 
+func topUpQueryError(c *gin.Context, operation string, err error) {
+	respondInternalError(c, "QUERY_ERROR", "Top-up data is temporarily unavailable", "top-up "+operation, err)
+}
+
 // GET /api/top-ups
 func ListTopUps(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -52,7 +56,7 @@ func ListTopUps(c *gin.Context) {
 
 	params, err := parseTopUpFilters(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", err.Error(), ""))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid top-up filters", ""))
 		return
 	}
 	params.Page = page
@@ -60,7 +64,7 @@ func ListTopUps(c *gin.Context) {
 
 	result, err := service.ListTopUpRecords(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		topUpQueryError(c, "list query", err)
 		return
 	}
 
@@ -116,7 +120,7 @@ func GetTopUpStatistics(c *gin.Context) {
 
 	stats, err := service.GetTopUpStatistics(startDate, endDate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		topUpQueryError(c, "statistics query", err)
 		return
 	}
 
@@ -130,7 +134,7 @@ func GetTopUpStatistics(c *gin.Context) {
 func GetPaymentMethods(c *gin.Context) {
 	methods, err := service.GetPaymentMethods()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		topUpQueryError(c, "payment methods query", err)
 		return
 	}
 
@@ -144,7 +148,7 @@ func GetPaymentMethods(c *gin.Context) {
 func GetPaymentProviders(c *gin.Context) {
 	providers, err := service.GetPaymentProviders()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		topUpQueryError(c, "payment providers query", err)
 		return
 	}
 
@@ -190,13 +194,13 @@ func ExportTopUps(c *gin.Context) {
 
 	params, err := parseTopUpFilters(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", err.Error(), ""))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid top-up filters", ""))
 		return
 	}
 
 	total, err := service.CountTopUps(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		topUpQueryError(c, "export count query", err)
 		return
 	}
 	if total > service.TopUpExportLimit {

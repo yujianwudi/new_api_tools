@@ -2,6 +2,23 @@ package database
 
 import "time"
 
+const postgresIndexExistsQuery = `
+	SELECT 1
+	FROM pg_catalog.pg_index AS index_meta
+	JOIN pg_catalog.pg_class AS index_class
+		ON index_class.oid = index_meta.indexrelid
+	WHERE index_meta.indrelid = to_regclass($1)
+		AND index_class.relname = $2
+	LIMIT 1`
+
+const mysqlIndexExistsQuery = `
+	SELECT 1
+	FROM information_schema.statistics
+	WHERE table_schema = DATABASE()
+		AND table_name = ?
+		AND index_name = ?
+	LIMIT 1`
+
 // IndexDef describes an index that operators may evaluate for the upstream
 // NewAPI database. These definitions are diagnostic-only: this service never
 // creates or drops upstream indexes.
@@ -27,23 +44,17 @@ var RecommendedIndexes = []IndexDef{
 
 // IndexExists checks metadata without mutating the connected database.
 func (m *Manager) IndexExists(indexName, tableName string) (bool, error) {
-	if m.IsPG {
-		row, err := m.QueryOneWithTimeout(5*time.Second, `
-			SELECT 1
-			FROM pg_indexes
-			WHERE schemaname = current_schema()
-				AND tablename = $1
-				AND indexname = $2
-			LIMIT 1`, tableName, indexName)
-		return row != nil, err
-	}
-
-	row, err := m.QueryOneWithTimeout(5*time.Second, `
-		SELECT 1
-		FROM information_schema.statistics
-		WHERE table_schema = DATABASE()
-			AND table_name = ?
-			AND index_name = ?
-		LIMIT 1`, tableName, indexName)
+	query, args := indexExistsLookup(m.IsPG, indexName, tableName)
+	row, err := m.QueryOneWithTimeout(5*time.Second, query, args...)
 	return row != nil, err
+}
+
+func indexExistsLookup(isPG bool, indexName, tableName string) (string, []interface{}) {
+	if isPG {
+		// Resolve the table exactly as PostgreSQL resolves an unqualified query
+		// target through search_path. current_schema() only returns the first
+		// valid schema and can miss a table selected from a later schema.
+		return postgresIndexExistsQuery, []interface{}{tableName, indexName}
+	}
+	return mysqlIndexExistsQuery, []interface{}{tableName, indexName}
 }

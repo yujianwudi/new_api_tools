@@ -48,6 +48,19 @@ func TestLoginLimiterResetClearsFailures(t *testing.T) {
 	}
 }
 
+func TestLoginLimiterPreservesBackoffMaxBaseInvariant(t *testing.T) {
+	limiter := NewLoginLimiter(3, time.Minute, 45*time.Second, 30*time.Second)
+	now := time.Unix(1200, 0)
+	limiter.now = func() time.Time { return now }
+
+	if limiter.maxBackoff != limiter.baseBackoff {
+		t.Fatalf("maxBackoff = %s, want baseBackoff %s", limiter.maxBackoff, limiter.baseBackoff)
+	}
+	if allowed, retry := limiter.Reserve("client"); !allowed || retry != 45*time.Second {
+		t.Fatalf("first reservation = allowed=%v retry=%s, want allowed with 45s backoff", allowed, retry)
+	}
+}
+
 func TestLoginLimiterConcurrentBurstReservesAtomically(t *testing.T) {
 	limiter := NewLoginLimiter(8, time.Minute, time.Second, 8*time.Second)
 	now := time.Unix(1500, 0)
@@ -114,5 +127,28 @@ func TestLoginLimiterSeparatesPeriodicCleanupFromCapacityEviction(t *testing.T) 
 	}
 	if len(limiter.attempts) != maxTrackedLoginClients {
 		t.Fatalf("map exceeded capacity: %d", len(limiter.attempts))
+	}
+}
+
+func TestLoginLimiterCapacityEvictsLeastRecentlySeenClient(t *testing.T) {
+	limiter := NewLoginLimiter(3, time.Minute, time.Second, 8*time.Second)
+	now := time.Unix(3000, 0)
+	for i := 0; i < maxTrackedLoginClients; i++ {
+		key := fmt.Sprintf("client-%d", i)
+		limiter.attempts[key] = loginAttempt{
+			windowStart: now,
+			lastSeen:    now.Add(time.Duration(i) * time.Second),
+		}
+	}
+
+	limiter.makeRoomLocked()
+	if _, exists := limiter.attempts["client-0"]; exists {
+		t.Fatal("least-recently-seen client was not evicted")
+	}
+	if _, exists := limiter.attempts[fmt.Sprintf("client-%d", maxTrackedLoginClients-1)]; !exists {
+		t.Fatal("most-recently-seen client was evicted")
+	}
+	if len(limiter.attempts) != maxTrackedLoginClients-1 {
+		t.Fatalf("tracked clients after eviction = %d, want %d", len(limiter.attempts), maxTrackedLoginClients-1)
 	}
 }

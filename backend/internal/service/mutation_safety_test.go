@@ -24,8 +24,8 @@ func TestDirectMutationSafetyFailsClosedForRedisUnknownOrEnabled(t *testing.T) {
 	if err := validateNewAPIDirectMutationSafety(&config.Config{NewAPIRedisDisabled: true}); err != nil {
 		t.Fatalf("explicitly disabled NewAPI Redis should allow protected direct writes: %v", err)
 	}
-	if err := validateNewAPIDirectMutationSafety(nil); err != nil {
-		t.Fatalf("isolated unit tests without loaded config should remain supported: %v", err)
+	if err := validateNewAPIDirectMutationSafety(nil); err == nil || !strings.Contains(err.Error(), "configuration is unavailable") {
+		t.Fatalf("missing configuration did not fail closed: %v", err)
 	}
 }
 
@@ -35,6 +35,11 @@ func TestUnsafeHardDeleteRequiresBothExplicitGuards(t *testing.T) {
 		cfg     *config.Config
 		wantErr string
 	}{
+		{
+			name:    "configuration unavailable",
+			cfg:     nil,
+			wantErr: "configuration is unavailable",
+		},
 		{
 			name:    "hard-delete opt-in missing",
 			cfg:     &config.Config{NewAPIRedisDisabled: true},
@@ -57,6 +62,52 @@ func TestUnsafeHardDeleteRequiresBothExplicitGuards(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateUnsafeHardDeleteSafety(tt.cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestUnsafeBatchDeleteRequiresExplicitRiskAcceptance(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		wantErr string
+	}{
+		{
+			name:    "configuration unavailable",
+			cfg:     nil,
+			wantErr: "configuration is unavailable",
+		},
+		{
+			name:    "batch-delete opt-in missing",
+			cfg:     &config.Config{NewAPIRedisDisabled: true},
+			wantErr: "ALLOW_UNSAFE_BATCH_DELETE=true",
+		},
+		{
+			name:    "Redis state unsafe",
+			cfg:     &config.Config{AllowUnsafeBatchDelete: true},
+			wantErr: "NEWAPI_REDIS_DISABLED=true",
+		},
+		{
+			name: "both explicitly enabled",
+			cfg: &config.Config{
+				NewAPIRedisDisabled:    true,
+				AllowUnsafeBatchDelete: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUnsafeBatchDeleteSafety(tt.cfg)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)

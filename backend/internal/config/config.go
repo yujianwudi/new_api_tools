@@ -66,11 +66,12 @@ type Config struct {
 	PublicModelRequestsPerMinute int   `json:"public_model_requests_per_minute"`
 
 	// NewAPI
-	NewAPIBaseURL         string `json:"newapi_base_url"`
-	NewAPIRedisDisabled   bool   `json:"newapi_redis_disabled"`
-	AllowUnsafeHardDelete bool   `json:"allow_unsafe_hard_delete"`
-	EnforceIPRecording    bool   `json:"enforce_ip_recording"`
-	NewAPIKey             string `json:"newapi_api_key"`
+	NewAPIBaseURL          string `json:"newapi_base_url"`
+	NewAPIRedisDisabled    bool   `json:"newapi_redis_disabled"`
+	AllowUnsafeBatchDelete bool   `json:"allow_unsafe_batch_delete"`
+	AllowUnsafeHardDelete  bool   `json:"allow_unsafe_hard_delete"`
+	EnforceIPRecording     bool   `json:"enforce_ip_recording"`
+	NewAPIKey              string `json:"newapi_api_key"`
 
 	// Logging
 	LogFile  string `json:"log_file"`
@@ -126,11 +127,12 @@ func Load() *Config {
 		PublicModelRequestsPerMinute: getEnvInt("PUBLIC_MODEL_REQUESTS_PER_MINUTE", 30),
 
 		// NewAPI
-		NewAPIBaseURL:         getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
-		NewAPIRedisDisabled:   getEnvBool("NEWAPI_REDIS_DISABLED", false),
-		AllowUnsafeHardDelete: getEnvBool("ALLOW_UNSAFE_HARD_DELETE", false),
-		EnforceIPRecording:    getEnvBool("ENFORCE_IP_RECORDING", false),
-		NewAPIKey:             getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
+		NewAPIBaseURL:          getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
+		NewAPIRedisDisabled:    getEnvBool("NEWAPI_REDIS_DISABLED", false),
+		AllowUnsafeBatchDelete: getEnvBool("ALLOW_UNSAFE_BATCH_DELETE", false),
+		AllowUnsafeHardDelete:  getEnvBool("ALLOW_UNSAFE_HARD_DELETE", false),
+		EnforceIPRecording:     getEnvBool("ENFORCE_IP_RECORDING", false),
+		NewAPIKey:              getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
 
 		// Logging
 		LogFile:  getEnvStr("LOG_FILE", ""),
@@ -178,8 +180,11 @@ func Load() *Config {
 	if cfg.LoginBackoffBase <= 0 {
 		cfg.LoginBackoffBase = 500 * time.Millisecond
 	}
-	if cfg.LoginBackoffMax < cfg.LoginBackoffBase {
+	if cfg.LoginBackoffMax <= 0 {
 		cfg.LoginBackoffMax = 30 * time.Second
+	}
+	if cfg.LoginBackoffMax < cfg.LoginBackoffBase {
+		cfg.LoginBackoffMax = cfg.LoginBackoffBase
 	}
 	if cfg.PublicModelMaxBatch < 1 || cfg.PublicModelMaxBatch > 200 {
 		cfg.PublicModelMaxBatch = 50

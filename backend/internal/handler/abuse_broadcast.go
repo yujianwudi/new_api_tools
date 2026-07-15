@@ -2,19 +2,15 @@ package handler
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/new-api-tools/backend/internal/logger"
-	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
 func abuseBroadcastError(c *gin.Context, status int, code, message, operation string, err error) {
-	logger.L.Error(fmt.Sprintf("Abuse broadcast %s failed: %v", operation, err), logger.CatAPI)
-	c.JSON(status, models.ErrorResp(code, message, ""))
+	respondHandlerError(c, status, code, message, "abuse broadcast "+operation, err)
 }
 
 // RegisterAbuseBroadcastRoutes registers /api/abuse-broadcast endpoints.

@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -42,7 +41,7 @@ func GetTopUpTrends(c *gin.Context) {
 
 	data, err := service.GetTopUpTrends(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up trends query", err)
 		return
 	}
 
@@ -61,7 +60,7 @@ func GetTopUpFinancialSummary(c *gin.Context) {
 
 	data, err := service.GetTopUpFinancialSummary(months)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up financial summary query", err)
 		return
 	}
 
@@ -84,7 +83,7 @@ func GetTopUpTopUsers(c *gin.Context) {
 
 	data, err := service.GetTopUpTopUsers(limit, days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up top users query", err)
 		return
 	}
 
@@ -103,7 +102,7 @@ func GetPaymentMethodDistribution(c *gin.Context) {
 
 	data, err := service.GetPaymentMethodDistribution(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up payment method distribution query", err)
 		return
 	}
 
@@ -117,7 +116,7 @@ func GetPaymentMethodDistribution(c *gin.Context) {
 func GetTopUpRealtimeStats(c *gin.Context) {
 	data, err := service.GetTopUpRealtimeStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up realtime statistics query", err)
 		return
 	}
 
@@ -136,7 +135,7 @@ func GetTopUpHourlyHeatmap(c *gin.Context) {
 
 	data, err := service.GetTopUpHourlyHeatmap(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up hourly heatmap query", err)
 		return
 	}
 
@@ -155,7 +154,7 @@ func GetTopUpFunnel(c *gin.Context) {
 
 	data, err := service.GetTopUpFunnel(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up funnel query", err)
 		return
 	}
 
@@ -174,7 +173,7 @@ func GetTopUpPayerCohorts(c *gin.Context) {
 
 	data, err := service.GetTopUpPayerCohorts(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up payer cohort query", err)
 		return
 	}
 
@@ -193,7 +192,7 @@ func GetTopUpProviderHealth(c *gin.Context) {
 
 	data, err := service.GetTopUpProviderHealth(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up provider health query", err)
 		return
 	}
 
@@ -220,7 +219,7 @@ func GetTopUpAnomalies(c *gin.Context) {
 
 	data, err := service.GetTopUpAnomalies(days, pendingHours, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "top-up anomaly query", err)
 		return
 	}
 
