@@ -66,6 +66,7 @@ services:
       # NewAPI Redis/直接写库安全边界（工具自身 Redis 与此无关）
       - NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
       - ALLOW_UNSAFE_HARD_DELETE=${ALLOW_UNSAFE_HARD_DELETE:-false}
+      - ENFORCE_IP_RECORDING=${ENFORCE_IP_RECORDING:-false}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

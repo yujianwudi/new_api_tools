@@ -1139,6 +1139,8 @@ NEWAPI_ORIGINAL_NETWORK=${ORIGINAL_NETWORK:-}
 NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
 # 高风险兼容开关：默认禁止不完整的直接数据库永久删除，请优先使用 NewAPI 管理 API
 ALLOW_UNSAFE_HARD_DELETE=false
+# 隐私敏感：默认不持续覆盖用户的 record_ip_log 设置
+ENFORCE_IP_RECORDING=false
 
 # 数据库配置 (Go 版本推荐 SQL_DSN)
 SQL_DSN=$(dotenv_quote "$sql_dsn")

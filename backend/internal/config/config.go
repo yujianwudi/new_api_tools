@@ -69,6 +69,7 @@ type Config struct {
 	NewAPIBaseURL         string `json:"newapi_base_url"`
 	NewAPIRedisDisabled   bool   `json:"newapi_redis_disabled"`
 	AllowUnsafeHardDelete bool   `json:"allow_unsafe_hard_delete"`
+	EnforceIPRecording    bool   `json:"enforce_ip_recording"`
 	NewAPIKey             string `json:"newapi_api_key"`
 
 	// Logging
@@ -128,6 +129,7 @@ func Load() *Config {
 		NewAPIBaseURL:         getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
 		NewAPIRedisDisabled:   getEnvBool("NEWAPI_REDIS_DISABLED", false),
 		AllowUnsafeHardDelete: getEnvBool("ALLOW_UNSAFE_HARD_DELETE", false),
+		EnforceIPRecording:    getEnvBool("ENFORCE_IP_RECORDING", false),
 		NewAPIKey:             getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
 
 		// Logging
@@ -444,12 +446,16 @@ func getEnvIntMulti(keys []string, defaultVal int) int {
 	return defaultVal
 }
 
-// generateRandomSecret generates a cryptographically secure random hex string
+var cryptoRandomRead = rand.Read
+
+// generateRandomSecret generates a cryptographically secure random hex string.
+// JWT signing must never fall back to timestamps, process IDs, or another
+// predictable value: if the operating-system CSPRNG is unavailable, startup
+// stops instead of issuing forgeable tokens.
 func generateRandomSecret(bytes int) string {
 	b := make([]byte, bytes)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback: use timestamp-based key (still better than hardcoded)
-		return fmt.Sprintf("auto-%d-%d", time.Now().UnixNano(), os.Getpid())
+	if n, err := cryptoRandomRead(b); err != nil || n != len(b) {
+		panic("cryptographically secure JWT secret generation failed")
 	}
 	return hex.EncodeToString(b)
 }

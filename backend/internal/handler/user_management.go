@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +16,19 @@ const (
 	confirmTextSoftDelete = "注销用户"
 	confirmTextHardDelete = "彻底删除"
 )
+
+type unbanUserRequest struct {
+	Reason       string `json:"reason"`
+	EnableTokens bool   `json:"enable_tokens"`
+}
+
+func bindOptionalUnbanUserRequest(c *gin.Context) (unbanUserRequest, error) {
+	var req unbanUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		return unbanUserRequest{}, err
+	}
+	return req, nil
+}
 
 func RegisterUserManagementRoutes(r *gin.RouterGroup) {
 	g := r.Group("/users")
@@ -275,14 +290,22 @@ func UnbanUser(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Reason       string `json:"reason"`
-		EnableTokens bool   `json:"enable_tokens"`
+	req, err := bindOptionalUnbanUserRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
 	}
-	c.ShouldBindJSON(&req)
 
 	svc := service.NewUserManagementService()
 	if err := svc.UnbanUser(userID, req.EnableTokens); err != nil {
+		if errors.Is(err, service.ErrBulkTokenReactivationDisabled) {
+			c.JSON(http.StatusBadRequest, models.ErrorResp(
+				"TOKEN_REACTIVATION_DISABLED",
+				"批量恢复 Token 已禁用，请逐个复核后启用",
+				"",
+			))
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("UNBAN_ERROR", err.Error(), ""))
 		return
 	}

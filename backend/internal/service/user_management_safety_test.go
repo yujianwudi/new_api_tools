@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -379,7 +380,7 @@ func TestBanUserPreservesNonActiveTokenStates(t *testing.T) {
 	}
 }
 
-func TestUnbanUserOnlyEnablesEligibleDisabledTokens(t *testing.T) {
+func TestUnbanUserNeverReactivatesPreviouslyDisabledTokens(t *testing.T) {
 	db, svc := installUserManagementSafetyDB(t)
 	now := time.Now().Unix()
 	db.MustExec(`INSERT INTO users (id, username, status) VALUES (1, 'alice', 2)`)
@@ -393,25 +394,28 @@ func TestUnbanUserOnlyEnablesEligibleDisabledTokens(t *testing.T) {
 		(6, 1, 2, 0,     0, 1, NULL),
 		(7, 1, 2, 0,    10, 0, 1)`, now-1, now-1)
 
-	if err := svc.UnbanUser(1, true); err != nil {
+	if err := svc.UnbanUser(1, false); err != nil {
 		t.Fatalf("unban user: %v", err)
 	}
 	for id, want := range map[int]int64{
-		1: 1, // valid quota
+		1: 2, // pre-existing disabled token remains disabled
 		2: 3, // expired status is preserved
 		3: 4, // exhausted status is preserved
 		4: 2, // disabled but expired remains disabled
 		5: 2, // disabled and exhausted remains disabled
-		6: 1, // unlimited quota remains eligible
+		6: 2, // unlimited quota does not make restoration safe
 		7: 2, // soft-deleted token remains disabled
 	} {
 		if got := queryInt64(t, db, "SELECT status FROM tokens WHERE id = ?", id); got != want {
 			t.Errorf("token %d status=%d, want %d", id, got, want)
 		}
 	}
+	if got := queryInt64(t, db, "SELECT status FROM users WHERE id = 1"); got != 1 {
+		t.Fatalf("user status=%d, want active", got)
+	}
 }
 
-func TestUnbanUserRollsBackAndPropagatesTokenUpdateError(t *testing.T) {
+func TestUnbanUserRejectsLegacyTokenReactivationBeforeMutation(t *testing.T) {
 	db, svc := installUserManagementSafetyDB(t)
 	db.MustExec(`INSERT INTO users (id, username, status) VALUES (1, 'alice', 2)`)
 	db.MustExec(`INSERT INTO tokens
@@ -420,11 +424,14 @@ func TestUnbanUserRollsBackAndPropagatesTokenUpdateError(t *testing.T) {
 	db.MustExec(`CREATE TRIGGER reject_token_enable BEFORE UPDATE OF status ON tokens
 		WHEN NEW.status = 1 BEGIN SELECT RAISE(ABORT, 'token enable rejected'); END`)
 
-	if err := svc.UnbanUser(1, true); err == nil || !strings.Contains(err.Error(), "enable eligible user tokens") {
-		t.Fatalf("expected propagated token update error, got %v", err)
+	if err := svc.UnbanUser(1, true); !errors.Is(err, ErrBulkTokenReactivationDisabled) {
+		t.Fatalf("expected ErrBulkTokenReactivationDisabled, got %v", err)
 	}
 	if got := queryInt64(t, db, "SELECT status FROM users WHERE id = 1"); got != 2 {
-		t.Fatalf("expected user unban rollback, status=%d", got)
+		t.Fatalf("legacy request mutated user before rejection, status=%d", got)
+	}
+	if got := queryInt64(t, db, "SELECT status FROM tokens WHERE id = 10"); got != 2 {
+		t.Fatalf("disabled token was reactivated, status=%d", got)
 	}
 }
 
@@ -441,7 +448,7 @@ func TestRootUserMutationsAreBlocked(t *testing.T) {
 		{name: "soft delete", run: func() error { _, err := svc.DeleteUser(1, false); return err }},
 		{name: "hard delete", run: func() error { _, err := svc.DeleteUser(1, true); return err }},
 		{name: "ban", run: func() error { return svc.BanUser(1, true) }},
-		{name: "unban", run: func() error { return svc.UnbanUser(1, true) }},
+		{name: "unban", run: func() error { return svc.UnbanUser(1, false) }},
 		{name: "disable token", run: func() error { return svc.DisableToken(10) }},
 	}
 	for _, operation := range operations {

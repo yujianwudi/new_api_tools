@@ -1,11 +1,48 @@
 package config
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 )
+
+func TestGenerateRandomSecretUsesCSPRNG(t *testing.T) {
+	secret := generateRandomSecret(32)
+	if len(secret) != 64 {
+		t.Fatalf("secret length = %d, want 64", len(secret))
+	}
+	if strings.HasPrefix(secret, "auto-") {
+		t.Fatalf("secret used predictable fallback: %q", secret)
+	}
+}
+
+func TestGenerateRandomSecretFailsClosedWhenEntropyUnavailable(t *testing.T) {
+	original := cryptoRandomRead
+	cryptoRandomRead = func([]byte) (int, error) { return 0, errors.New("entropy unavailable") }
+	defer func() { cryptoRandomRead = original }()
+
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("expected CSPRNG failure to stop startup")
+		}
+	}()
+	_ = generateRandomSecret(32)
+}
+
+func TestIPRecordingEnforcementIsExplicitOptIn(t *testing.T) {
+	t.Setenv("ENFORCE_IP_RECORDING", "")
+	if loaded := Load(); loaded.EnforceIPRecording {
+		t.Fatal("IP recording enforcement must be disabled by default")
+	}
+
+	t.Setenv("ENFORCE_IP_RECORDING", "true")
+	if loaded := Load(); !loaded.EnforceIPRecording {
+		t.Fatal("explicit ENFORCE_IP_RECORDING=true was not honored")
+	}
+}
 
 func TestNormalizeMySQLURLDSNPreservesCredentialsAndOptions(t *testing.T) {
 	raw := "mysql://user:p%40ss@[2001:db8::1]:3307/prod%2Ddb?parseTime=true&tls=preferred&timeout=5s&loc=Asia%2FShanghai"

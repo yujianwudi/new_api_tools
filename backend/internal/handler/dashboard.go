@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -138,25 +140,40 @@ func InvalidateDashboardCache(c *gin.Context) {
 
 // GET /api/dashboard/refresh-estimate
 func GetRefreshEstimate(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"show_estimate":  false,
-			"estimated_time": 0,
-		},
-	})
+	period := c.DefaultQuery("period", "7d")
+	if !service.IsValidDashboardRefreshPeriod(period) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   gin.H{"message": "Invalid period value"},
+		})
+		return
+	}
+
+	svc := service.NewDashboardService()
+	data, err := svc.GetDashboardRefreshEstimate(period)
+	if err != nil {
+		logger.L.Error(fmt.Sprintf("Dashboard refresh estimate failed: %v", err), logger.CatAnalytics)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"success": false,
+			"error":   gin.H{"message": "Dashboard refresh estimate unavailable"},
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/dashboard/system-info
 func GetDashboardSystemInfo(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"scale":     "medium",
-			"cache_ttl": 300,
-			"tips":      []string{},
-		},
-	})
+	svc := service.NewDashboardService()
+	data, err := svc.GetDashboardSystemInfo()
+	if err != nil {
+		// This endpoint controls a frontend safety gate. Keep the response usable
+		// but conservatively classify the system as xlarge when metrics are not
+		// trustworthy, rather than allowing an unconfirmed refresh.
+		logger.L.Error(fmt.Sprintf("Dashboard system scale detection failed: %v", err), logger.CatAnalytics)
+		data = service.FailClosedDashboardSystemInfo()
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/dashboard/ip-distribution

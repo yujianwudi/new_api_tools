@@ -234,7 +234,9 @@ export function IPAnalysis() {
   const IP_REFRESH_KEY = 'ip_analysis_refresh_interval'
   const [refreshInterval, setRefreshInterval] = useState<number>(() => {
     const saved = localStorage.getItem(IP_REFRESH_KEY)
-    return saved ? parseInt(saved, 10) : 0  // 默认0，等待从后端获取
+    if (saved === null) return 0 // 未设置时等待后端推荐值
+    const parsed = parseInt(saved, 10)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   })
   const [countdown, setCountdown] = useState(refreshInterval)
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -264,6 +266,7 @@ export function IPAnalysis() {
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const [mapError, setMapError] = useState(false)
+  const [chinaMapError, setChinaMapError] = useState(false)
   
   // 加载世界地图 - 多源备用 + 超时处理
   useEffect(() => {
@@ -345,6 +348,7 @@ export function IPAnalysis() {
         }
       }
       console.error('[ChinaMap] All sources failed')
+      setChinaMapError(true)
     }
     
     tryLoadChinaMap()
@@ -367,7 +371,7 @@ export function IPAnalysis() {
 
         // 只有在用户没有手动设置过时，才使用系统推荐值
         const saved = localStorage.getItem(IP_REFRESH_KEY)
-        if (!saved) {
+        if (saved === null) {
           setRefreshInterval(interval)
           setCountdown(interval)
           refreshIntervalRef.current = interval
@@ -431,7 +435,9 @@ export function IPAnalysis() {
       const label = val >= 60 ? `${val / 60}分钟` : `${val}秒`
       showToast('success', `IP 分析自动刷新已设置为 ${label}`)
     } else {
-      localStorage.removeItem(IP_REFRESH_KEY)
+      // Persist the explicit off state so a reload does not restore the
+      // backend-recommended interval as though the user never chose.
+      localStorage.setItem(IP_REFRESH_KEY, '0')
       showToast('info', 'IP 分析自动刷新已关闭')
     }
   }, [showToast])
@@ -964,7 +970,7 @@ export function IPAnalysis() {
           </div>
         </CardHeader>
         <CardContent className="p-0">
-          {mapError && mapType === 'world' ? (
+          {(mapType === 'world' ? mapError : chinaMapError) ? (
             <div className="h-[450px] flex flex-col items-center justify-center text-muted-foreground bg-muted/20 rounded-b-lg gap-3">
               <AlertTriangle className="h-10 w-10 text-yellow-500" />
               <span>地图加载失败，请刷新页面重试</span>

@@ -53,8 +53,12 @@ func NewLoginLimiter(maxAttempts int, window, baseBackoff, maxBackoff time.Durat
 	}
 }
 
-// Allow reports whether the client may make a login attempt now.
-func (l *LoginLimiter) Allow(key string) (bool, time.Duration) {
+// Reserve atomically checks the current limit and consumes one login attempt.
+// Reserving before password verification closes the gap where many concurrent
+// requests could all pass a read-only Allow check before any failure was
+// recorded. A successful login calls Reset; every other outcome keeps the
+// reservation and its computed backoff.
+func (l *LoginLimiter) Reserve(key string) (bool, time.Duration) {
 	if key == "" {
 		key = "unknown"
 	}
@@ -63,34 +67,16 @@ func (l *LoginLimiter) Allow(key string) (bool, time.Duration) {
 	now := l.now()
 	l.cleanupLocked(now)
 	attempt, ok := l.attempts[key]
-	if !ok {
-		return true, 0
-	}
-	if now.Sub(attempt.windowStart) >= l.window {
+	if ok && now.Sub(attempt.windowStart) >= l.window {
 		delete(l.attempts, key)
-		return true, 0
+		ok = false
 	}
-	if now.Before(attempt.nextAllowed) {
+	if ok && now.Before(attempt.nextAllowed) {
 		return false, attempt.nextAllowed.Sub(now)
 	}
-	return true, 0
-}
-
-// RecordFailure advances the exponential backoff for a client.
-func (l *LoginLimiter) RecordFailure(key string) time.Duration {
-	if key == "" {
-		key = "unknown"
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	l.cleanupLocked(now)
-	attempt, ok := l.attempts[key]
 	if !ok {
 		l.makeRoomLocked()
-	}
-	if !ok || now.Sub(attempt.windowStart) >= l.window {
-		attempt = loginAttempt{windowStart: now}
+		attempt = loginAttempt{windowStart: now, lastSeen: now}
 	}
 	attempt.failures++
 	attempt.lastSeen = now
@@ -114,7 +100,7 @@ func (l *LoginLimiter) RecordFailure(key string) time.Duration {
 		}
 	}
 	l.attempts[key] = attempt
-	return attempt.nextAllowed.Sub(now)
+	return true, attempt.nextAllowed.Sub(now)
 }
 
 func (l *LoginLimiter) Reset(key string) {
@@ -170,12 +156,8 @@ func configuredLoginLimiter() *LoginLimiter {
 	return defaultLoginLimiter
 }
 
-func AllowLoginAttempt(key string) (bool, time.Duration) {
-	return configuredLoginLimiter().Allow(key)
-}
-
-func RecordLoginFailure(key string) time.Duration {
-	return configuredLoginLimiter().RecordFailure(key)
+func ReserveLoginAttempt(key string) (bool, time.Duration) {
+	return configuredLoginLimiter().Reserve(key)
 }
 
 func ResetLoginFailures(key string) {

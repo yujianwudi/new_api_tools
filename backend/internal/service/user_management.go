@@ -58,6 +58,11 @@ type purgeSoftDeletedSnapshot struct {
 var batchDeleteSnapshotMu sync.Mutex
 var purgeSoftDeletedSnapshotMu sync.Mutex
 
+// ErrBulkTokenReactivationDisabled rejects the legacy enable_tokens contract.
+// Without a durable snapshot of exactly which tokens a ban changed, bulk
+// restoration could reactivate credentials disabled for an unrelated incident.
+var ErrBulkTokenReactivationDisabled = errors.New("bulk token reactivation is disabled")
+
 func newBatchDeleteSnapshotID() (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -940,12 +945,15 @@ func (s *UserManagementService) BanUser(userID int64, disableTokens bool) error 
 	return nil
 }
 
-// UnbanUser sets user status to active (1)
+// UnbanUser sets user status to active (1). Legacy callers requesting bulk token
+// restoration are rejected before any database mutation.
 func (s *UserManagementService) UnbanUser(userID int64, enableTokens bool) error {
+	if enableTokens {
+		return ErrBulkTokenReactivationDisabled
+	}
 	if err := ensureNewAPIDirectMutationSafe(); err != nil {
 		return err
 	}
-	now := time.Now().Unix()
 	err := s.withMutationTransaction(func(ctx context.Context, tx *sqlx.Tx) error {
 		if err := s.ensureNonRootUserMutation(ctx, tx, userID); err != nil {
 			return err
@@ -960,21 +968,6 @@ func (s *UserManagementService) UnbanUser(userID int64, enableTokens bool) error
 		}
 		if err := verifyUserStatusMutation(ctx, tx, userID, 1, affected, "unban"); err != nil {
 			return err
-		}
-		if !enableTokens {
-			return nil
-		}
-
-		// Conservative restore: only disabled, non-deleted tokens that are not
-		// expired and still have quota (or unlimited quota) may be re-enabled.
-		// Statuses used for expired/exhausted tokens are never overwritten.
-		_, err = tx.ExecContext(ctx, tx.Rebind(`
-			UPDATE tokens SET status = 1
-			WHERE user_id = ? AND status = 2 AND deleted_at IS NULL
-			  AND (expired_time IS NULL OR expired_time <= 0 OR expired_time > ?)
-			  AND (unlimited_quota = ? OR remain_quota > 0)`), userID, now, true)
-		if err != nil {
-			return fmt.Errorf("enable eligible user tokens: %w", err)
 		}
 		return nil
 	})

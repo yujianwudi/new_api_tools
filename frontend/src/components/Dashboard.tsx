@@ -69,6 +69,7 @@ interface SystemInfo {
 interface RefreshEstimate {
   show_estimate: boolean
   scale?: string
+  scale_description?: string
   estimated_logs?: number
   estimated_logs_formatted?: string
   estimated_seconds?: number
@@ -100,6 +101,7 @@ export function Dashboard() {
     const saved = localStorage.getItem(DASHBOARD_REFRESH_KEY)
     return saved ? parseInt(saved, 10) : 0
   })
+  const countdownRef = useRef(countdown)
 
   const [lastRefreshTime, setLastRefreshTime] = useState<Date | null>(null)
   const [showIntervalDropdown, setShowIntervalDropdown] = useState(false)
@@ -107,12 +109,22 @@ export function Dashboard() {
 
   // Ref to always call the latest handleRefresh from timer
   const handleRefreshRef = useRef<() => void>(() => { })
+  const mountedRef = useRef(true)
+  const periodRef = useRef<PeriodType>(period)
+  const refreshEstimateInFlightRef = useRef(false)
+  const refreshEstimateAbortRef = useRef<AbortController | null>(null)
+  const refreshInFlightRef = useRef(false)
+  const refreshAbortRef = useRef<AbortController | null>(null)
 
   // 大型系统刷新提示相关状态
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null)
   const [refreshEstimate, setRefreshEstimate] = useState<RefreshEstimate | null>(null)
+  const [estimatingRefresh, setEstimatingRefresh] = useState(false)
   const [showRefreshConfirm, setShowRefreshConfirm] = useState(false)
   const [refreshProgress, setRefreshProgress] = useState<string | null>(null)
+  // Until the backend proves the system is not large, refresh stays fail-closed.
+  const requiresRefreshConfirmation = systemInfo?.is_large_system !== false
+  const requiresExtendedRefresh = requiresRefreshConfirmation || refreshEstimate?.show_estimate === true
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const requestTimeoutMs = 30_000
@@ -120,6 +132,25 @@ export function Dashboard() {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`,
   }), [token])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      refreshEstimateAbortRef.current?.abort('unmount')
+      refreshAbortRef.current?.abort('unmount')
+    }
+  }, [])
+
+  useEffect(() => {
+    periodRef.current = period
+    // An estimate belongs to exactly one period. Discard a pending or displayed
+    // estimate when the user switches ranges so it cannot authorize stale work.
+    refreshEstimateAbortRef.current?.abort('period-change')
+    refreshAbortRef.current?.abort('period-change')
+    setRefreshEstimate(null)
+    setShowRefreshConfirm(false)
+  }, [period])
 
   const fetchOverview = useCallback(async (noCache = false, signal?: AbortSignal): Promise<boolean> => {
     try {
@@ -129,7 +160,12 @@ export function Dashboard() {
         { headers: getAuthHeaders(), signal },
       )
       const data = await response.json()
-      if (data.success) setOverview(data.data)
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch overview:', response.status)
+        return false
+      }
+      if (signal?.aborted) return false
+      setOverview(data.data)
       return true
     } catch (error) { console.error('Failed to fetch overview:', error) }
     return false
@@ -143,7 +179,12 @@ export function Dashboard() {
         { headers: getAuthHeaders(), signal },
       )
       const data = await response.json()
-      if (data.success) setUsage(data.data)
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch usage:', response.status)
+        return false
+      }
+      if (signal?.aborted) return false
+      setUsage(data.data)
       return true
     } catch (error) { console.error('Failed to fetch usage:', error) }
     return false
@@ -157,7 +198,12 @@ export function Dashboard() {
         { headers: getAuthHeaders(), signal },
       )
       const data = await response.json()
-      if (data.success) setModels(data.data ?? [])
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch models:', response.status)
+        return false
+      }
+      if (signal?.aborted) return false
+      setModels(data.data ?? [])
       return true
     } catch (error) { console.error('Failed to fetch models:', error) }
     return false
@@ -181,7 +227,12 @@ export function Dashboard() {
         )
       }
       const data = await response.json()
-      if (data.success) setDailyTrends(data.data ?? [])
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch trends:', response.status)
+        return false
+      }
+      if (signal?.aborted) return false
+      setDailyTrends(data.data ?? [])
       return true
     } catch (error) { console.error('Failed to fetch trends:', error) }
     return false
@@ -196,7 +247,13 @@ export function Dashboard() {
       )
       const data = await response.json()
 
-      if (data.success && Array.isArray(data.data) && data.data.length > 0) {
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch analytics summary:', response.status)
+        return false
+      }
+      if (signal?.aborted) return false
+
+      if (Array.isArray(data.data) && data.data.length > 0) {
         const sortedByRequest = [...data.data].sort((a: any, b: any) => b.request_count - a.request_count)
         const sortedByQuota = [...data.data].sort((a: any, b: any) => b.quota_used - a.quota_used)
 
@@ -250,29 +307,56 @@ export function Dashboard() {
         { headers: getAuthHeaders() },
       )
       const data = await response.json()
-      if (data.success) {
-        setSystemInfo(data.data)
+      if (!response.ok || !data.success || typeof data.data?.is_large_system !== 'boolean') {
+        console.error('Failed to fetch system info:', response.status)
+        return
       }
+      if (mountedRef.current) setSystemInfo(data.data)
     } catch (error) {
       console.error('Failed to fetch system info:', error)
     }
   }, [apiUrl, getAuthHeaders])
 
   // 获取刷新预估信息
-  const fetchRefreshEstimate = useCallback(async () => {
+  const fetchRefreshEstimate = useCallback(async (requestedPeriod: PeriodType): Promise<RefreshEstimate | null> => {
+    if (!mountedRef.current || refreshEstimateInFlightRef.current) return null
+
+    refreshEstimateInFlightRef.current = true
+    setEstimatingRefresh(true)
+    const controller = new AbortController()
+    refreshEstimateAbortRef.current = controller
+    const timeoutId = window.setTimeout(() => controller.abort('timeout'), requestTimeoutMs)
+
     try {
       const response = await fetch(
-        `${apiUrl}/api/dashboard/refresh-estimate?period=${period}`,
-        { headers: getAuthHeaders() },
+        `${apiUrl}/api/dashboard/refresh-estimate?period=${requestedPeriod}`,
+        { headers: getAuthHeaders(), signal: controller.signal },
       )
       const data = await response.json()
-      if (data.success) {
-        setRefreshEstimate(data.data)
+      if (!response.ok || !data.success) {
+        console.error('Failed to fetch refresh estimate:', response.status)
+        return null
       }
+      if (!mountedRef.current || controller.signal.aborted || periodRef.current !== requestedPeriod) {
+        return null
+      }
+      const estimate = data.data as RefreshEstimate
+      setRefreshEstimate(estimate)
+      return estimate
     } catch (error) {
-      console.error('Failed to fetch refresh estimate:', error)
+      if (!controller.signal.aborted) {
+        console.error('Failed to fetch refresh estimate:', error)
+      }
+      return null
+    } finally {
+      window.clearTimeout(timeoutId)
+      if (refreshEstimateAbortRef.current === controller) {
+        refreshEstimateAbortRef.current = null
+      }
+      refreshEstimateInFlightRef.current = false
+      if (mountedRef.current) setEstimatingRefresh(false)
     }
-  }, [apiUrl, getAuthHeaders, period])
+  }, [apiUrl, getAuthHeaders, requestTimeoutMs])
 
   // 首次加载时获取系统信息
   useEffect(() => {
@@ -293,7 +377,10 @@ export function Dashboard() {
       }, requestTimeoutMs)
 
       try {
-        await fetchAll(false, controller.signal)
+        const ok = await fetchAll(false, controller.signal)
+        if (!ok && mounted && !controller.signal.aborted) {
+          setLoadError('仪表盘加载失败，请稍后重试（部分数据请求未成功）')
+        }
       } finally {
         window.clearTimeout(timeoutId)
         if (mounted) setLoading(false)
@@ -308,54 +395,59 @@ export function Dashboard() {
   }, [fetchAll, requestTimeoutMs])
 
   const handleRetry = async () => {
+    if (refreshInFlightRef.current) return
+    refreshInFlightRef.current = true
     setRefreshing(true)
     setLoadError(null)
 
     const controller = new AbortController()
-    const timeoutId = window.setTimeout(() => controller.abort(), requestTimeoutMs)
+    refreshAbortRef.current = controller
+    const timeoutId = window.setTimeout(() => controller.abort('timeout'), requestTimeoutMs)
 
     try {
       const ok = await fetchAll(false, controller.signal)
-      if (!ok || controller.signal.aborted) {
+      if (mountedRef.current && (!ok || controller.signal.aborted)) {
         showToast('error', '重试失败，请稍后再试')
         setLoadError('重试失败，请稍后再试（可能是数据库负载过高）')
       }
     } finally {
       window.clearTimeout(timeoutId)
-      setRefreshing(false)
       controller.abort()
+      if (refreshAbortRef.current === controller) refreshAbortRef.current = null
+      refreshInFlightRef.current = false
+      if (mountedRef.current) setRefreshing(false)
     }
   }
 
-  const handleRefresh = async () => {
-    // 大型系统：先获取预估信息并显示确认
-    if (systemInfo?.is_large_system && !showRefreshConfirm) {
-      await fetchRefreshEstimate()
-      setShowRefreshConfirm(true)
-      return
-    }
+  const performRefresh = useCallback(async () => {
+    if (!mountedRef.current || refreshInFlightRef.current) return
 
-    // 关闭确认对话框
+    refreshInFlightRef.current = true
+    const requestedPeriod = periodRef.current
     setShowRefreshConfirm(false)
     setRefreshing(true)
     setLoadError(null)
 
     // 大型系统显示进度
-    if (systemInfo?.is_large_system) {
+    if (requiresExtendedRefresh) {
       setRefreshProgress('正在刷新数据...')
     }
 
     const controller = new AbortController()
+    refreshAbortRef.current = controller
     // 大型系统给更长的超时时间
-    const timeout = systemInfo?.is_large_system ? 60_000 : requestTimeoutMs
-    const timeoutId = window.setTimeout(() => controller.abort(), timeout)
+    const timeout = requiresExtendedRefresh ? 60_000 : requestTimeoutMs
+    const timeoutId = window.setTimeout(() => controller.abort('timeout'), timeout)
 
     try {
       const ok = await refreshAll(controller.signal)
+      if (!mountedRef.current) return
+      if (periodRef.current !== requestedPeriod || controller.signal.reason === 'period-change') return
       if (ok && !controller.signal.aborted) {
         showToast('success', '数据已刷新')
         setLastRefreshTime(new Date())
         if (refreshInterval > 0) {
+          countdownRef.current = refreshInterval
           setCountdown(refreshInterval)
         }
       } else {
@@ -364,16 +456,44 @@ export function Dashboard() {
       }
     } finally {
       window.clearTimeout(timeoutId)
-      setRefreshing(false)
-      setRefreshProgress(null)
       controller.abort()
+      if (refreshAbortRef.current === controller) refreshAbortRef.current = null
+      refreshInFlightRef.current = false
+      if (mountedRef.current) {
+        setRefreshing(false)
+        setRefreshProgress(null)
+      }
     }
-  }
+  }, [refreshAll, refreshInterval, requestTimeoutMs, requiresExtendedRefresh, showToast])
+
+  const handleRefresh = useCallback(async () => {
+    if (!mountedRef.current || loading || refreshing || refreshInFlightRef.current || refreshEstimateInFlightRef.current) return
+
+    // 大型系统的每次刷新都必须经过独立确认。自动刷新计时器即使再次触发，
+    // 也只能保持确认框打开，不能把“已显示”误当成“已确认”。
+    if (showRefreshConfirm) return
+    const requestedPeriod = periodRef.current
+    const estimate = await fetchRefreshEstimate(requestedPeriod)
+
+    // The request may have completed after an unmount, a range switch, or a
+    // separate refresh operation. Never let that stale continuation start work.
+    if (!mountedRef.current || periodRef.current !== requestedPeriod || refreshInFlightRef.current) return
+    if (!estimate) {
+      showToast('error', '无法获取刷新预估，请稍后再试')
+      return
+    }
+    if (requiresRefreshConfirmation || estimate.show_estimate) {
+      setShowRefreshConfirm(true)
+      return
+    }
+
+    await performRefresh()
+  }, [fetchRefreshEstimate, loading, performRefresh, refreshing, requiresRefreshConfirmation, showRefreshConfirm, showToast])
 
   // Keep ref in sync with latest handleRefresh
   useEffect(() => {
     handleRefreshRef.current = handleRefresh
-  })
+  }, [handleRefresh])
 
   // 取消刷新确认
   const handleCancelRefresh = () => {
@@ -395,19 +515,21 @@ export function Dashboard() {
   // 自动刷新倒计时 - 使用 ref 避免过期闭包
   useEffect(() => {
     if (refreshInterval === 0) {
+      countdownRef.current = 0
       setCountdown(0)
       return
     }
 
     const timer = setInterval(() => {
-      setCountdown(prev => {
-        if (prev <= 1) {
-          // 通过 ref 调用最新的 handleRefresh，确保使用当前 period
-          handleRefreshRef.current()
-          return refreshInterval
-        }
-        return prev - 1
-      })
+      const shouldRefresh = countdownRef.current <= 1
+      const nextCountdown = shouldRefresh ? refreshInterval : countdownRef.current - 1
+      countdownRef.current = nextCountdown
+      setCountdown(nextCountdown)
+      if (shouldRefresh) {
+        // Keep side effects outside the state updater; refs provide both the
+        // latest callback and the in-flight guards used by handleRefresh.
+        void handleRefreshRef.current()
+      }
     }, 1000)
 
     return () => clearInterval(timer)
@@ -416,6 +538,7 @@ export function Dashboard() {
   // 设置刷新间隔时初始化倒计时
   const handleSetRefreshInterval = (interval: RefreshInterval) => {
     setRefreshInterval(interval)
+    countdownRef.current = interval
     if (interval > 0) {
       setCountdown(interval)
       localStorage.setItem(DASHBOARD_REFRESH_KEY, interval.toString())
@@ -479,7 +602,7 @@ export function Dashboard() {
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
       {/* 大型系统刷新确认对话框 */}
-      {showRefreshConfirm && refreshEstimate?.show_estimate && (
+      {showRefreshConfirm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-background border rounded-lg shadow-lg p-6 max-w-md mx-4 animate-in zoom-in-95 duration-200">
             <div className="flex items-center gap-3 mb-4">
@@ -488,7 +611,9 @@ export function Dashboard() {
               </div>
               <div>
                 <h3 className="font-semibold">确认刷新数据</h3>
-                <p className="text-sm text-muted-foreground">{refreshEstimate.scale === 'large' ? '大型系统' : '超大型系统'}</p>
+                <p className="text-sm text-muted-foreground">
+                  {refreshEstimate?.scale_description || '系统规模待确认'}
+                </p>
               </div>
             </div>
 
@@ -496,15 +621,15 @@ export function Dashboard() {
               <div className="bg-muted/50 rounded-lg p-4 space-y-2">
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">预计扫描日志</span>
-                  <span className="font-medium">{refreshEstimate.estimated_logs_formatted} 条</span>
+                  <span className="font-medium">{refreshEstimate?.estimated_logs_formatted ?? '未知'} 条</span>
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">预计耗时</span>
-                  <span className="font-medium">{refreshEstimate.estimated_time_formatted}</span>
+                  <span className="font-medium">{refreshEstimate?.estimated_time_formatted ?? '未知'}</span>
                 </div>
               </div>
 
-              {refreshEstimate.warning && (
+              {refreshEstimate?.warning && (
                 <p className="text-xs text-yellow-600 dark:text-yellow-400 flex items-center gap-1">
                   <Activity className="h-3 w-3" />
                   {refreshEstimate.warning}
@@ -522,7 +647,8 @@ export function Dashboard() {
               </Button>
               <Button
                 className="flex-1"
-                onClick={handleRefresh}
+                onClick={performRefresh}
+                disabled={refreshing}
               >
                 确认刷新
               </Button>
@@ -560,9 +686,9 @@ export function Dashboard() {
         <div className="flex items-center gap-3 flex-wrap">
           {/* 刷新按钮和自动刷新控制 */}
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing} className="h-9">
-              <RefreshCw className={cn("h-4 w-4 mr-2", refreshing && "animate-spin")} />
-              {refreshing ? '刷新中...' : '刷新'}
+            <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing || estimatingRefresh} className="h-9">
+              <RefreshCw className={cn("h-4 w-4 mr-2", (refreshing || estimatingRefresh) && "animate-spin")} />
+              {estimatingRefresh ? '预估中...' : refreshing ? '刷新中...' : '刷新'}
             </Button>
 
             {/* 自动刷新下拉菜单 */}

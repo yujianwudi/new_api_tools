@@ -112,9 +112,15 @@ func main() {
 
 	// ========== 7. Background tasks ==========
 
-	// IP recording enforcement: check every 10 minutes, enable if any user disabled it
+	// IP recording enforcement changes every user's privacy setting, so it is
+	// opt-in rather than an unconditional background write.
 	stopIPEnforce := make(chan struct{})
-	go backgroundEnforceIPRecording(stopIPEnforce)
+	if cfg.EnforceIPRecording {
+		logger.L.Warn("[IP记录] ENFORCE_IP_RECORDING=true，已启用每 10 分钟强制写入任务")
+		go backgroundEnforceIPRecording(stopIPEnforce)
+	} else {
+		logger.L.System("[IP记录] 自动强制开启已禁用；可在管理界面手动执行")
+	}
 
 	stopAbuseBroadcast := make(chan struct{})
 	go backgroundSyncAbuseBroadcast(stopAbuseBroadcast)

@@ -18,7 +18,7 @@ set -euo pipefail
 #
 # 用法：
 #   ./setup-log-db.sh            # 交互式：检测 + 写入 .env + 重建
-#   ./setup-log-db.sh --print    # 只检测并打印将写入的 LOG_SQL_DSN，不改任何东西
+#   ./setup-log-db.sh --print    # 只检测并打印脱敏后的连接目标，不改任何东西
 #   ./setup-log-db.sh --no-restart  # 写入 .env 但不自动重建容器
 #
 # 环境变量：
@@ -265,7 +265,7 @@ main() {
       exit 0
     fi
   fi
-  log_success "检测到 LOG_SQL_DSN（原始）: ${raw_dsn}"
+  log_success "检测到 LOG_SQL_DSN（原始内容与凭据已隐藏）"
 
   # 2) 解析
   local host port user pass db
@@ -274,7 +274,7 @@ main() {
   user="$(dsn_field "$raw_dsn" user)"
   pass="$(dsn_field "$raw_dsn" password)"
   db="$(dsn_field "$raw_dsn" dbname)"
-  [[ -n "$host" && -n "$db" ]] || die "无法解析 LOG_SQL_DSN（host/dbname 缺失）: $raw_dsn"
+  [[ -n "$host" && -n "$db" ]] || die "无法解析 LOG_SQL_DSN（host/dbname 缺失；原始内容已隐藏）"
 
   # 3) 决定工具怎么连到日志库（与 deploy.sh 主库逻辑同款）
   local need_network=""
@@ -312,8 +312,8 @@ main() {
   final_dsn="$(build_pg_keyword_dsn "$host" "$port" "$user" "$pass" "$db")"
 
   echo ""
-  log_success "最终写入的 LOG_SQL_DSN:"
-  echo -e "    ${GREEN}${final_dsn}${NC}"
+  log_success "最终连接目标（用户名与密码已隐藏）:"
+  echo -e "    ${GREEN}host=${host} port=${port} dbname=${db} user=*** password=***${NC}"
   [[ -n "$need_network" ]] && echo -e "    需接入网络: ${GREEN}${need_network}${NC}"
   echo ""
 
@@ -324,6 +324,7 @@ main() {
 
   # 4) 写入 .env
   upsert_env "LOG_SQL_DSN" "$final_dsn"
+  chmod 600 "$ENV_FILE"
   log_success "已写入 $ENV_FILE"
 
   # 5) 固化网络：写 override（持久）+ 立即接入（当前生效）

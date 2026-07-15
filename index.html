@@ -1272,6 +1272,11 @@
             return Math.round(amount * 500000);
         }
 
+        function sqlEscape(value, dbType) {
+            const escaped = String(value).replace(/'/g, "''");
+            return dbType === 'mysql' ? escaped.replace(/\\/g, '\\\\') : escaped;
+        }
+
         function showToast(msg, type = 'success') {
             const toast = document.getElementById('toast');
             const msgSpan = document.getElementById('toastMsg');
@@ -1305,14 +1310,14 @@
             
             // 验证逻辑前置
             const name = document.getElementById('name').value.trim();
-            const count = parseInt(document.getElementById('count').value);
+            const count = Number(document.getElementById('count').value);
             
              if (!name) {
                 showToast('请输入兑换码名称', 'error');
                 document.getElementById('name').focus();
                 return;
             }
-             if (count < 1 || count > 1000) {
+             if (!Number.isInteger(count) || count < 1 || count > 1000) {
                 showToast('生成数量必须在 1-1000 之间', 'error');
                 return;
             }
@@ -1333,10 +1338,19 @@
         function generateSQL() {
             const name = document.getElementById('name').value.trim();
             const keyPrefix = document.getElementById('keyPrefix').value.trim();
-            const count = parseInt(document.getElementById('count').value);
+            const count = Number(document.getElementById('count').value);
             const userId = 1;
             const mode = document.querySelector('input[name="quotaMode"]:checked').value;
             const expireMode = document.querySelector('input[name="expireMode"]:checked').value;
+
+            if (!name) {
+                showToast('请输入兑换码名称', 'error');
+                return;
+            }
+            if (!Number.isInteger(count) || count < 1 || count > 1000) {
+                showToast('生成数量必须在 1-1000 之间', 'error');
+                return;
+            }
             
             let minAmount, maxAmount, fixedQuota;
 
@@ -1376,6 +1390,7 @@
             }
 
             const dbType = document.querySelector('input[name="dbType"]:checked').value;
+            const escapedName = sqlEscape(name, dbType);
             let sql = '';
             const values = [];
             generatedKeys = [];
@@ -1385,6 +1400,7 @@
                 for (let i = 0; i < count; i++) {
                     const key = generateRandomKey(keyPrefix, 32);
                     generatedKeys.push(key);
+                    const escapedKey = sqlEscape(key, dbType);
                     
                     let quota = fixedQuota;
                     if (mode === 'random') {
@@ -1392,7 +1408,7 @@
                         quota = amountToQuota(randomVal);
                     }
                     
-                    values.push(`(${userId}, '${key}', '${name}', ${quota}, UNIX_TIMESTAMP(), 0, 0, NULL, ${expireTime})`);
+                    values.push(`(${userId}, '${escapedKey}', '${escapedName}', ${quota}, UNIX_TIMESTAMP(), 0, 0, NULL, ${expireTime})`);
                 }
                 sql += values.join(',\n') + ';';
             } else {
@@ -1401,6 +1417,7 @@
                 for (let i = 0; i < count; i++) {
                     const key = generateRandomKey(keyPrefix, 32);
                     generatedKeys.push(key);
+                    const escapedKey = sqlEscape(key, dbType);
                     
                     let quota = fixedQuota;
                     if (mode === 'random') {
@@ -1408,7 +1425,7 @@
                         quota = amountToQuota(randomVal);
                     }
                     
-                    values.push(`(${userId}, '${key}', '${name}', ${quota}, EXTRACT(EPOCH FROM NOW())::INTEGER, 0, 0, NULL, ${expireTime})`);
+                    values.push(`(${userId}, '${escapedKey}', '${escapedName}', ${quota}, EXTRACT(EPOCH FROM NOW())::INTEGER, 0, 0, NULL, ${expireTime})`);
                 }
                 sql += values.join(',\n') + ';';
             }

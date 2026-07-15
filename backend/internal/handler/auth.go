@@ -55,7 +55,8 @@ func RegisterAuthRoutes(rg *gin.RouterGroup) {
 //	{"success": false, "message": "密码错误"}
 func Login(c *gin.Context) {
 	clientIP := loginClientKey(c)
-	if allowed, retryAfter := auth.AllowLoginAttempt(clientIP); !allowed {
+	allowed, retryAfter := auth.ReserveLoginAttempt(clientIP)
+	if !allowed {
 		setRetryAfter(c, retryAfter)
 		c.JSON(http.StatusTooManyRequests, models.LoginResponse{
 			Success: false,
@@ -67,7 +68,7 @@ func Login(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		setRetryAfter(c, auth.RecordLoginFailure(clientIP))
+		setRetryAfter(c, retryAfter)
 		c.JSON(http.StatusBadRequest, models.LoginResponse{
 			Success: false,
 			Message: "请求格式错误",
@@ -77,7 +78,7 @@ func Login(c *gin.Context) {
 
 	// Verify password
 	if !auth.VerifyPassword(req.Password) {
-		setRetryAfter(c, auth.RecordLoginFailure(clientIP))
+		setRetryAfter(c, retryAfter)
 		logger.L.AuthFail("登录失败 | ip=" + clientIP)
 		c.JSON(http.StatusUnauthorized, models.LoginResponse{
 			Success: false,
@@ -85,6 +86,7 @@ func Login(c *gin.Context) {
 		})
 		return
 	}
+	auth.ResetLoginFailures(clientIP)
 
 	// Generate JWT token
 	token, expiresAt, err := auth.GenerateToken("admin")
@@ -97,7 +99,6 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	auth.ResetLoginFailures(clientIP)
 	logger.L.Auth("登录成功 | ip=" + clientIP)
 
 	c.JSON(http.StatusOK, models.LoginResponse{

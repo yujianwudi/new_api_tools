@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,13 +15,303 @@ import (
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/logger"
+	"github.com/redis/go-redis/v9"
 )
+
+const (
+	autoGroupLogsKey            = "auto_group:logs"
+	autoGroupLogSequenceKey     = "auto_group:log_sequence"
+	autoGroupPendingLogsKey     = "auto_group:pending_logs"
+	autoGroupCommittedLogIDsKey = "auto_group:committed_log_ids"
+	autoGroupCommitSequenceKey  = "auto_group:commit_sequence"
+	autoGroupAuditVersion       = int64(2)
+	autoGroupMaxLogs            = int64(1000)
+	maxJSONSafeInteger          = int64(1<<53 - 1)
+)
+
+var reserveAutoGroupLogIDsScript = redis.NewScript(`
+local current_raw = redis.call('GET', KEYS[1])
+local current = 0
+if current_raw then
+  current = tonumber(current_raw)
+  if not current then
+    return redis.error_reply('invalid auto-group audit sequence')
+  end
+end
+local seed = tonumber(ARGV[1])
+local count = tonumber(ARGV[2])
+
+if not current_raw then
+  local logs = redis.call('LRANGE', KEYS[2], 0, -1)
+  for _, raw in ipairs(logs) do
+    local ok, entry = pcall(cjson.decode, raw)
+    if ok and entry['id'] then
+      local legacy_id = tonumber(entry['id'])
+      if legacy_id and legacy_id > current then
+        current = legacy_id
+      end
+    end
+  end
+  local pending_ids = redis.call('HKEYS', KEYS[3])
+  for _, raw_id in ipairs(pending_ids) do
+    local pending_id = tonumber(raw_id)
+    if pending_id and pending_id > current then
+      current = pending_id
+    end
+  end
+end
+
+if seed > current then
+  current = seed
+end
+redis.call('SET', KEYS[1], current)
+return redis.call('INCRBY', KEYS[1], count)
+`)
+
+var commitAutoGroupAuditLogsScript = redis.NewScript(`
+local max_logs = tonumber(ARGV[1])
+local pending = {}
+
+local logs_type = redis.call('TYPE', KEYS[1]).ok
+if logs_type ~= 'none' and logs_type ~= 'list' then
+  return redis.error_reply('invalid committed auto-group audit log key type')
+end
+local pending_type = redis.call('TYPE', KEYS[2]).ok
+if pending_type ~= 'hash' then
+  return redis.error_reply('invalid pending auto-group audit log key type')
+end
+local markers_type = redis.call('TYPE', KEYS[3]).ok
+if markers_type ~= 'none' and markers_type ~= 'zset' then
+  return redis.error_reply('invalid auto-group audit marker key type')
+end
+local sequence_type = redis.call('TYPE', KEYS[4]).ok
+if sequence_type ~= 'none' and sequence_type ~= 'string' then
+  return redis.error_reply('invalid auto-group audit commit sequence key type')
+end
+
+local commit_sequence_raw = redis.call('GET', KEYS[4])
+if commit_sequence_raw and not tonumber(commit_sequence_raw) then
+  return redis.error_reply('invalid auto-group audit commit sequence')
+end
+local commit_sequence_seed = 0
+if not commit_sequence_raw then
+  local latest_marker = redis.call('ZREVRANGE', KEYS[3], 0, 0, 'WITHSCORES')
+  if latest_marker[2] then
+    commit_sequence_seed = tonumber(latest_marker[2]) or 0
+  end
+end
+
+-- Validate the complete batch before mutating any Redis key. A missing field
+-- therefore leaves every pending record available for manual recovery.
+for i = 2, #ARGV do
+  local id = ARGV[i]
+  local raw = redis.call('HGET', KEYS[2], id)
+  if not raw then
+    return redis.error_reply('missing pending auto-group audit log ' .. id)
+  end
+  pending[#pending + 1] = {id = id, raw = raw}
+end
+
+if not commit_sequence_raw then
+  redis.call('SET', KEYS[4], commit_sequence_seed)
+end
+
+for _, item in ipairs(pending) do
+  local commit_sequence = redis.call('INCR', KEYS[4])
+  redis.call('LPUSH', KEYS[1], item.raw)
+  redis.call('ZADD', KEYS[3], commit_sequence, item.id)
+  redis.call('HDEL', KEYS[2], item.id)
+end
+
+redis.call('LTRIM', KEYS[1], 0, max_logs - 1)
+local marker_count = redis.call('ZCARD', KEYS[3])
+if marker_count > max_logs then
+  redis.call('ZREMRANGEBYRANK', KEYS[3], 0, marker_count - max_logs - 1)
+end
+return #pending
+`)
+
+// Audit records are staged in a separate Redis hash before the corresponding
+// SQL transaction commits. A SQL failure can leave a pending recovery record,
+// but it cannot evict committed history or leave an unaudited group mutation.
+// After SQL commit, Redis atomically moves the staged records into the capped
+// list and writes commit markers. Only those finalized records are revertible.
+type autoGroupAuditStore interface {
+	Ping(context.Context) error
+	ReserveIDs(context.Context, int) ([]int64, error)
+	StageLogs(context.Context, []string) error
+	CommitLogs(context.Context, []int64) error
+	IsCommitted(context.Context, int64) (bool, error)
+	ReadLogs(context.Context) ([]string, error)
+}
+
+type redisAutoGroupAuditStore struct {
+	client *redis.Client
+}
+
+func (s *redisAutoGroupAuditStore) Ping(ctx context.Context) error {
+	if s == nil || s.client == nil {
+		return errors.New("Redis client is not initialized")
+	}
+	return s.client.Ping(ctx).Err()
+}
+
+func (s *redisAutoGroupAuditStore) ReserveIDs(ctx context.Context, count int) ([]int64, error) {
+	if count <= 0 {
+		return []int64{}, nil
+	}
+	if s == nil || s.client == nil {
+		return nil, errors.New("Redis client is not initialized")
+	}
+
+	// Millisecond time with three sequence digits remains exactly representable
+	// by JSON/JavaScript numbers while keeping new IDs far away from legacy
+	// LLEN-based IDs. Redis atomically advances the sequence across instances.
+	seed := time.Now().UnixMilli() * 1000
+	lastID, err := reserveAutoGroupLogIDsScript.Run(
+		ctx,
+		s.client,
+		[]string{autoGroupLogSequenceKey, autoGroupLogsKey, autoGroupPendingLogsKey},
+		seed,
+		count,
+	).Int64()
+	if err != nil {
+		return nil, fmt.Errorf("reserve audit log IDs: %w", err)
+	}
+	firstID := lastID - int64(count) + 1
+	if firstID <= 0 || lastID > maxJSONSafeInteger {
+		return nil, fmt.Errorf("audit log ID sequence is outside the supported range: %d", lastID)
+	}
+
+	ids := make([]int64, count)
+	for i := range ids {
+		ids[i] = firstID + int64(i)
+	}
+	return ids, nil
+}
+
+func (s *redisAutoGroupAuditStore) StageLogs(ctx context.Context, logs []string) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	if s == nil || s.client == nil {
+		return errors.New("Redis client is not initialized")
+	}
+	ids, err := autoGroupAuditLogIDs(logs)
+	if err != nil {
+		return err
+	}
+	values := make([]interface{}, 0, len(logs)*2)
+	for i, id := range ids {
+		values = append(values, strconv.FormatInt(id, 10), logs[i])
+	}
+	if err := s.client.HSet(ctx, autoGroupPendingLogsKey, values...).Err(); err != nil {
+		return fmt.Errorf("stage audit logs: %w", err)
+	}
+	return nil
+}
+
+func (s *redisAutoGroupAuditStore) CommitLogs(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if s == nil || s.client == nil {
+		return errors.New("Redis client is not initialized")
+	}
+
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, autoGroupMaxLogs)
+	for _, id := range ids {
+		if id <= 0 || id > maxJSONSafeInteger {
+			return fmt.Errorf("invalid committed audit log ID %d", id)
+		}
+		args = append(args, strconv.FormatInt(id, 10))
+	}
+
+	committed, err := commitAutoGroupAuditLogsScript.Run(
+		ctx,
+		s.client,
+		[]string{autoGroupLogsKey, autoGroupPendingLogsKey, autoGroupCommittedLogIDsKey, autoGroupCommitSequenceKey},
+		args...,
+	).Int64()
+	if err != nil {
+		// A connection can drop after Redis executed the atomic script but before
+		// the reply reached this process. Treat the operation as successful only
+		// when every commit marker is independently observable; otherwise fail
+		// closed and leave any still-pending fields untouched.
+		allCommitted := true
+		for _, id := range ids {
+			marked, markerErr := s.IsCommitted(ctx, id)
+			if markerErr != nil || !marked {
+				allCommitted = false
+				break
+			}
+		}
+		if allCommitted {
+			return nil
+		}
+		return fmt.Errorf("commit staged audit logs: %w", err)
+	}
+	if committed != int64(len(ids)) {
+		return fmt.Errorf("committed %d staged audit logs, want %d", committed, len(ids))
+	}
+	return nil
+}
+
+func (s *redisAutoGroupAuditStore) IsCommitted(ctx context.Context, id int64) (bool, error) {
+	if s == nil || s.client == nil {
+		return false, errors.New("Redis client is not initialized")
+	}
+	if id <= 0 || id > maxJSONSafeInteger {
+		return false, nil
+	}
+	_, err := s.client.ZScore(ctx, autoGroupCommittedLogIDsKey, strconv.FormatInt(id, 10)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read audit commit marker: %w", err)
+	}
+	return true, nil
+}
+
+func (s *redisAutoGroupAuditStore) ReadLogs(ctx context.Context) ([]string, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.New("Redis client is not initialized")
+	}
+	return s.client.LRange(ctx, autoGroupLogsKey, 0, -1).Result()
+}
+
+type autoGroupLogUser struct {
+	ID       int64
+	Username string
+	Source   string
+}
+
+type autoGroupAuditEntry struct {
+	AuditVersion int64  `json:"audit_version,omitempty"`
+	ID           int64  `json:"id"`
+	Action       string `json:"action"`
+	UserID       int64  `json:"user_id"`
+	Username     string `json:"username"`
+	OldGroup     string `json:"old_group"`
+	NewGroup     string `json:"new_group"`
+	Source       string `json:"source"`
+	Operator     string `json:"operator"`
+	Affected     int64  `json:"affected"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+type autoGroupSQLExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
 
 // AutoGroupService handles automatic user group assignment
 // Mirrors Python auto_group_service.py functionality
 type AutoGroupService struct {
 	db           *database.Manager
 	cachedConfig map[string]interface{} // 优化3: 请求级配置缓存
+	auditStore   autoGroupAuditStore
 }
 
 // Cached OAuth column existence checks for auto group
@@ -50,18 +344,180 @@ func normalizeAutoGroupName(group string) string {
 }
 
 func (s *AutoGroupService) updateUserGroupIfCurrent(userID int64, targetGroup, expectedGroup string) (int64, error) {
+	return s.updateUserGroupIfCurrentWith(s.db.DB, userID, targetGroup, expectedGroup)
+}
+
+func (s *AutoGroupService) updateUserGroupIfCurrentWith(exec autoGroupSQLExecutor, userID int64, targetGroup, expectedGroup string) (int64, error) {
 	groupCol := s.getGroupCol()
 	expectedGroup = normalizeAutoGroupName(expectedGroup)
+	var result sql.Result
+	var err error
 	if s.db.IsPG {
 		query := fmt.Sprintf(
 			"UPDATE users SET %s = $1 WHERE id = $2 AND role != 100 AND COALESCE(NULLIF(%s, ''), 'default') = $3",
 			groupCol, groupCol)
-		return s.db.Execute(query, targetGroup, userID, expectedGroup)
+		result, err = exec.Exec(query, targetGroup, userID, expectedGroup)
+	} else {
+		query := fmt.Sprintf(
+			"UPDATE users SET %s = ? WHERE id = ? AND role != 100 AND COALESCE(NULLIF(%s, ''), 'default') = ?",
+			groupCol, groupCol)
+		result, err = exec.Exec(query, targetGroup, userID, expectedGroup)
 	}
-	query := fmt.Sprintf(
-		"UPDATE users SET %s = ? WHERE id = ? AND role != 100 AND COALESCE(NULLIF(%s, ''), 'default') = ?",
-		groupCol, groupCol)
-	return s.db.Execute(query, targetGroup, userID, expectedGroup)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *AutoGroupService) getAuditStore() (autoGroupAuditStore, error) {
+	if s.auditStore != nil {
+		return s.auditStore, nil
+	}
+	rdb := cache.Get().RedisClient()
+	if rdb == nil {
+		return nil, errors.New("Redis client is not initialized")
+	}
+	return &redisAutoGroupAuditStore{client: rdb}, nil
+}
+
+func (s *AutoGroupService) requireAuditStore(ctx context.Context) (autoGroupAuditStore, error) {
+	store, err := s.getAuditStore()
+	if err != nil {
+		return nil, fmt.Errorf("audit storage unavailable: %w", err)
+	}
+	if err := store.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("audit storage unavailable: %w", err)
+	}
+	return store, nil
+}
+
+func prepareAutoGroupAuditLogs(
+	ctx context.Context,
+	store autoGroupAuditStore,
+	action string,
+	users []autoGroupLogUser,
+	oldGroup, newGroup, operator string,
+) ([]string, error) {
+	if len(users) == 0 {
+		return []string{}, nil
+	}
+	ids, err := store.ReserveIDs(ctx, len(users))
+	if err != nil {
+		return nil, fmt.Errorf("reserve audit log IDs: %w", err)
+	}
+	if len(ids) != len(users) {
+		return nil, fmt.Errorf("audit storage reserved %d IDs for %d entries", len(ids), len(users))
+	}
+
+	seen := make(map[int64]struct{}, len(ids))
+	createdAt := time.Now().Unix()
+	logs := make([]string, len(users))
+	for i, user := range users {
+		id := ids[i]
+		if id <= 0 || id > maxJSONSafeInteger {
+			return nil, fmt.Errorf("audit storage returned invalid log ID %d", id)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, fmt.Errorf("audit storage returned duplicate log ID %d", id)
+		}
+		seen[id] = struct{}{}
+
+		entry := autoGroupAuditEntry{
+			AuditVersion: autoGroupAuditVersion,
+			ID:           id,
+			Action:       action,
+			UserID:       user.ID,
+			Username:     user.Username,
+			OldGroup:     oldGroup,
+			NewGroup:     newGroup,
+			Source:       user.Source,
+			Operator:     operator,
+			Affected:     1,
+			CreatedAt:    createdAt,
+		}
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("serialize audit log: %w", err)
+		}
+		logs[i] = string(data)
+	}
+	return logs, nil
+}
+
+func autoGroupAuditLogIDs(logs []string) ([]int64, error) {
+	ids := make([]int64, len(logs))
+	seen := make(map[int64]struct{}, len(logs))
+	for i, raw := range logs {
+		var entry autoGroupAuditEntry
+		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+			return nil, fmt.Errorf("decode prepared audit log: %w", err)
+		}
+		if entry.AuditVersion < autoGroupAuditVersion {
+			return nil, fmt.Errorf("prepared audit log %d is missing the current audit version", entry.ID)
+		}
+		if entry.ID <= 0 || entry.ID > maxJSONSafeInteger {
+			return nil, fmt.Errorf("prepared audit log contains invalid ID %d", entry.ID)
+		}
+		if _, duplicate := seen[entry.ID]; duplicate {
+			return nil, fmt.Errorf("prepared audit logs contain duplicate ID %d", entry.ID)
+		}
+		seen[entry.ID] = struct{}{}
+		ids[i] = entry.ID
+	}
+	return ids, nil
+}
+
+func commitAutoGroupAuditLogs(ctx context.Context, store autoGroupAuditStore, logs []string) error {
+	ids, err := autoGroupAuditLogIDs(logs)
+	if err != nil {
+		return err
+	}
+	if err := store.CommitLogs(ctx, ids); err != nil {
+		return fmt.Errorf("finalize audit logs: %w", err)
+	}
+	return nil
+}
+
+func autoGroupLogRequiresCommitMarker(entry map[string]interface{}) (bool, error) {
+	rawVersion, exists := entry["audit_version"]
+	if !exists {
+		// v0.1.x logs predate commit markers and remain readable/revertible.
+		return false, nil
+	}
+	version, valid := parseAutoGroupLogID(rawVersion)
+	if !valid {
+		return false, errors.New("日志记录的审计版本无效")
+	}
+	if version < autoGroupAuditVersion {
+		return false, fmt.Errorf("不支持的审计版本 %d", version)
+	}
+	return true, nil
+}
+
+func parseAutoGroupLogID(value interface{}) (int64, bool) {
+	var id int64
+	switch typed := value.(type) {
+	case int:
+		id = int64(typed)
+	case int32:
+		id = int64(typed)
+	case int64:
+		id = typed
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || typed != math.Trunc(typed) || typed > float64(maxJSONSafeInteger) {
+			return 0, false
+		}
+		id = int64(typed)
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		id = parsed
+	default:
+		return 0, false
+	}
+	return id, id > 0 && id <= maxJSONSafeInteger
 }
 
 // getAvailableOAuthColumns returns OAuth columns that exist in the users table (cached)
@@ -192,7 +648,18 @@ func (s *AutoGroupService) SaveConfig(updates map[string]interface{}) bool {
 		config[k] = v
 	}
 	cm := cache.Get()
+	if cm.RedisClient() == nil {
+		logger.L.Error("保存自动分组配置失败: Redis client is not initialized")
+		return false
+	}
+	if err := cm.RedisClient().Ping(context.Background()).Err(); err != nil {
+		logger.L.Error(fmt.Sprintf("保存自动分组配置失败: Redis unavailable: %v", err))
+		return false
+	}
 	if err := cm.Set("auto_group:config", config, 0); err != nil {
+		// Manager.Set updates its local tier before Redis. Never leave a config
+		// that the caller observed as failed active in this process.
+		cm.DeleteLocal("auto_group:config")
 		logger.L.Error(fmt.Sprintf("保存自动分组配置失败: %v", err))
 		return false
 	}
@@ -326,18 +793,13 @@ func (s *AutoGroupService) GetStats() map[string]interface{} {
 		pendingCount = toInt64(row["cnt"])
 	}
 
-	// 优化4: 使用 Redis LLEN 获取总日志计数
 	totalAssigned := int64(0)
-	cm := cache.Get()
-	rdb := cm.RedisClient()
 	ctx := context.Background()
 
-	// Count assign logs from Redis list
-	logLen, err := rdb.LLen(ctx, "auto_group:logs").Result()
-	if err == nil && logLen > 0 {
-		// Sample to count "assign" actions (read all, they're capped at 1000)
-		logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
-		if err == nil {
+	// Count assign logs from the capped audit list. Read-only statistics degrade
+	// to zero when Redis is unavailable instead of dereferencing a nil client.
+	if store, storeErr := s.getAuditStore(); storeErr == nil {
+		if logStrings, readErr := store.ReadLogs(ctx); readErr == nil {
 			for _, logStr := range logStrings {
 				var entry map[string]interface{}
 				if json.Unmarshal([]byte(logStr), &entry) == nil {
@@ -678,7 +1140,36 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 
-	affected, err := s.updateUserGroupIfCurrent(userID, targetGroup, oldGroup)
+	ctx := context.Background()
+	store, err := s.requireAuditStore(ctx)
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
+	logs, err := prepareAutoGroupAuditLogs(ctx, store, "assign", []autoGroupLogUser{{
+		ID:       userID,
+		Username: username,
+		Source:   source,
+	}}, oldGroup, targetGroup, operator)
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("prepare audit log failed: %v", err),
+		}
+	}
+
+	tx, err := s.db.DB.Beginx()
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("开始用户分组事务失败: %v", err),
+		}
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	affected, err := s.updateUserGroupIfCurrentWith(tx, userID, targetGroup, oldGroup)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -686,6 +1177,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 	if affected == 0 {
+		_ = tx.Rollback()
 		current, checkErr := s.db.QueryOne(userSQL, userID)
 		if checkErr != nil || current == nil {
 			return map[string]interface{}{
@@ -712,7 +1204,27 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 
-	s.addUserLog("assign", userID, username, oldGroup, targetGroup, source, operator)
+	// Stage outside the capped committed list before SQL commit. If Redis fails,
+	// the database transaction rolls back; if SQL fails, committed history is
+	// untouched and the pending record remains available for recovery.
+	if err := store.StageLogs(ctx, logs); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("audit log staging failed; user group was rolled back: %v", err),
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("提交用户分组事务失败: %v", err),
+		}
+	}
+	if err := commitAutoGroupAuditLogs(ctx, store, logs); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("用户分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+		}
+	}
 
 	logger.L.Business(fmt.Sprintf("自动分组: 用户分配 user_id=%d username=%s %s -> %s source=%s operator=%s",
 		userID, username, oldGroup, targetGroup, source, operator))
@@ -728,7 +1240,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 	}
 }
 
-// 优化1: RunScan 使用批量 UPDATE 消除 N+1
+// RunScan assigns pending users while preserving one audit record per mutation.
 func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 	if !dryRun {
 		if err := ensureNewAPIDirectMutationSafe(); err != nil {
@@ -791,77 +1303,117 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 		}
 	}
 
+	var scanAuditStore autoGroupAuditStore
+	if !dryRun {
+		var err error
+		scanAuditStore, err = s.requireAuditStore(context.Background())
+		if err != nil {
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": err.Error(),
+			}
+		}
+	}
+
 	results := make([]map[string]interface{}, 0, len(users))
 	assignedCount := 0
 	skippedCount := 0
 	errorCount := 0
 
 	if mode == "simple" && !dryRun {
-		// 优化1 路径: simple模式批量UPDATE
+		// Keep the batch atomic in SQL, but use per-user compare-and-swap updates
+		// so the audit set exactly matches the rows that were changed. The old
+		// bulk UPDATE could update more rows than the 1000 users loaded above.
 		targetGroup, _ := config["target_group"].(string)
-		groupCol := s.getGroupCol()
-		whitelistIDs := s.getWhitelistIDs()
-		wlCond, wlArgs, nextIdx := s.buildWhitelistCondition(whitelistIDs, 2)
-
-		// Collect user info before update for logging
-		userInfos := make([]map[string]interface{}, 0, len(users))
+		userInfos := make([]autoGroupLogUser, 0, len(users))
 		for _, user := range users {
-			userInfos = append(userInfos, map[string]interface{}{
-				"id":       toInt64(user["id"]),
-				"username": toString(user["username"]),
-				"source":   toString(user["source"]),
+			userInfos = append(userInfos, autoGroupLogUser{
+				ID:       toInt64(user["id"]),
+				Username: toString(user["username"]),
+				Source:   toString(user["source"]),
 			})
 		}
 
-		// Batch UPDATE in one SQL
-		var updateSQL string
-		updateArgs := make([]interface{}, 0)
-		if s.db.IsPG {
-			updateSQL = fmt.Sprintf(`
-				UPDATE users SET %s = $1
-				WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
-				AND deleted_at IS NULL AND status = 1 AND role != 100
-				%s`, groupCol, groupCol, groupCol, wlCond)
-			updateArgs = append(updateArgs, targetGroup)
-			updateArgs = append(updateArgs, wlArgs...)
-		} else {
-			updateSQL = fmt.Sprintf(`
-				UPDATE users SET %s = ?
-				WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
-				AND deleted_at IS NULL AND status = 1 AND role != 100
-				%s`, groupCol, groupCol, groupCol, wlCond)
-			updateArgs = append(updateArgs, targetGroup)
-			updateArgs = append(updateArgs, wlArgs...)
-		}
-		_ = nextIdx
-
-		affected, err := s.db.Execute(updateSQL, updateArgs...)
+		ctx := context.Background()
+		preparedLogs, err := prepareAutoGroupAuditLogs(ctx, scanAuditStore, "assign", userInfos, "default", targetGroup, "system")
 		if err != nil {
-			logger.L.Error(fmt.Sprintf("自动分组批量UPDATE失败: %v", err))
-			errorCount = len(users)
-			for _, user := range userInfos {
-				results = append(results, map[string]interface{}{
-					"user_id": user["id"], "username": user["username"],
-					"source": user["source"], "action": "error",
-					"message": fmt.Sprintf("批量更新失败: %v", err),
-				})
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("prepare scan audit logs failed: %v", err),
 			}
-		} else {
-			assignedCount = int(affected)
-			// Batch log all assigned users via Redis LPUSH
-			s.addBatchLogs("assign", userInfos, "default", targetGroup, "system")
-			for _, user := range userInfos {
-				results = append(results, map[string]interface{}{
-					"user_id":      user["id"],
-					"username":     user["username"],
-					"source":       user["source"],
-					"target_group": targetGroup,
-					"action":       "assigned",
-					"message":      fmt.Sprintf("已分配到 %s", targetGroup),
-				})
-			}
-			logger.L.Business(fmt.Sprintf("自动分组: 批量分配 %d 个用户到 %s", assignedCount, targetGroup))
 		}
+
+		tx, err := s.db.DB.Beginx()
+		if err != nil {
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("开始扫描事务失败: %v", err),
+			}
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		logsToAppend := make([]string, 0, len(preparedLogs))
+		assignedUsers := make([]autoGroupLogUser, 0, len(userInfos))
+		for i, user := range userInfos {
+			affected, updateErr := s.updateUserGroupIfCurrentWith(tx, user.ID, targetGroup, "default")
+			if updateErr != nil {
+				_ = tx.Rollback()
+				return map[string]interface{}{
+					"success": false,
+					"dry_run": false,
+					"message": fmt.Sprintf("扫描更新失败，整批已回滚: %v", updateErr),
+				}
+			}
+			if affected == 0 {
+				errorCount++
+				results = append(results, map[string]interface{}{
+					"user_id": user.ID, "username": user.Username, "source": user.Source,
+					"action": "error", "message": "用户状态已并发变化，分组未更新",
+				})
+				continue
+			}
+			logsToAppend = append(logsToAppend, preparedLogs[i])
+			assignedUsers = append(assignedUsers, user)
+		}
+
+		if err := scanAuditStore.StageLogs(ctx, logsToAppend); err != nil {
+			_ = tx.Rollback()
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("scan audit staging failed; all group changes were rolled back: %v", err),
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("提交扫描事务失败: %v", err),
+			}
+		}
+		if err := commitAutoGroupAuditLogs(ctx, scanAuditStore, logsToAppend); err != nil {
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": fmt.Sprintf("扫描分组已提交，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+			}
+		}
+
+		assignedCount = len(assignedUsers)
+		for _, user := range assignedUsers {
+			results = append(results, map[string]interface{}{
+				"user_id":      user.ID,
+				"username":     user.Username,
+				"source":       user.Source,
+				"target_group": targetGroup,
+				"action":       "assigned",
+				"message":      fmt.Sprintf("已分配到 %s", targetGroup),
+			})
+		}
+		logger.L.Business(fmt.Sprintf("自动分组: 事务内分配 %d 个用户到 %s", assignedCount, targetGroup))
 	} else {
 		// by_source 模式 or dry_run: 逐用户处理
 		for _, user := range users {
@@ -951,6 +1503,12 @@ func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string) m
 			"message": err.Error(),
 		}
 	}
+	if _, err := s.requireAuditStore(context.Background()); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
 
 	successCount := 0
 	failedCount := 0
@@ -977,12 +1535,13 @@ func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string) m
 
 // GetLogs returns group assignment logs — 优化4: 使用 Redis List
 func (s *AutoGroupService) GetLogs(page, pageSize int, action string, userID *int64) map[string]interface{} {
-	cm := cache.Get()
-	rdb := cm.RedisClient()
 	ctx := context.Background()
 
-	// Read all logs from Redis list
-	logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
+	logStrings := []string{}
+	store, err := s.getAuditStore()
+	if err == nil {
+		logStrings, err = store.ReadLogs(ctx)
+	}
 	if err != nil {
 		logger.L.Error(fmt.Sprintf("读取自动分组日志失败: %v", err))
 		logStrings = []string{}
@@ -1043,12 +1602,23 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	cm := cache.Get()
-	rdb := cm.RedisClient()
 	ctx := context.Background()
+	store, err := s.requireAuditStore(ctx)
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
+	if logID <= 0 {
+		return map[string]interface{}{
+			"success": false,
+			"message": "日志 ID 无效",
+		}
+	}
 
 	// Read all logs from Redis list
-	logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
+	logStrings, err := store.ReadLogs(ctx)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1056,15 +1626,24 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	// Find the log entry by ID
+	// Legacy LLEN-based IDs can be duplicated after list trimming. Never pick
+	// the first match: an ambiguous ID could otherwise revert the wrong user.
 	var targetLog map[string]interface{}
+	matchCount := 0
 	for _, logStr := range logStrings {
 		var entry map[string]interface{}
 		if json.Unmarshal([]byte(logStr), &entry) == nil {
-			if toInt64(entry["id"]) == int64(logID) {
+			entryID, valid := parseAutoGroupLogID(entry["id"])
+			if valid && entryID == int64(logID) {
 				targetLog = entry
-				break
+				matchCount++
 			}
+		}
+	}
+	if matchCount > 1 {
+		return map[string]interface{}{
+			"success": false,
+			"message": "日志 ID 存在多条匹配记录，拒绝恢复以避免操作错误用户",
 		}
 	}
 
@@ -1072,6 +1651,28 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		return map[string]interface{}{
 			"success": false,
 			"message": "日志记录不存在",
+		}
+	}
+	requiresCommitMarker, err := autoGroupLogRequiresCommitMarker(targetLog)
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
+	if requiresCommitMarker {
+		committed, markerErr := store.IsCommitted(ctx, int64(logID))
+		if markerErr != nil {
+			return map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("无法确认日志是否已提交，拒绝恢复: %v", markerErr),
+			}
+		}
+		if !committed {
+			return map[string]interface{}{
+				"success": false,
+				"message": "日志对应的数据库变更未确认提交，拒绝恢复",
+			}
 		}
 	}
 
@@ -1121,8 +1722,29 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
+	revertLogs, err := prepareAutoGroupAuditLogs(ctx, store, "revert", []autoGroupLogUser{{
+		ID:       userIDVal,
+		Username: username,
+		Source:   source,
+	}}, newGroup, oldGroup, "admin")
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("prepare revert audit log failed: %v", err),
+		}
+	}
+
+	tx, err := s.db.DB.Beginx()
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("开始恢复事务失败: %v", err),
+		}
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// Revert only if the current group still matches the state captured in the log.
-	affected, err := s.updateUserGroupIfCurrent(userIDVal, oldGroup, newGroup)
+	affected, err := s.updateUserGroupIfCurrentWith(tx, userIDVal, oldGroup, newGroup)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1130,6 +1752,7 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 	if affected == 0 {
+		_ = tx.Rollback()
 		current, checkErr := s.db.QueryOne(userSQL, userIDVal)
 		if checkErr != nil || current == nil {
 			return map[string]interface{}{
@@ -1156,7 +1779,24 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	s.addUserLog("revert", userIDVal, username, newGroup, oldGroup, source, "admin")
+	if err := store.StageLogs(ctx, revertLogs); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("revert audit staging failed; user group was rolled back: %v", err),
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("提交恢复事务失败: %v", err),
+		}
+	}
+	if err := commitAutoGroupAuditLogs(ctx, store, revertLogs); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("用户分组已恢复，但审计记录最终化失败；pending 记录保留在 Redis %s 且不可恢复，请人工核对: %v", autoGroupPendingLogsKey, err),
+		}
+	}
 
 	logger.L.Business(fmt.Sprintf("自动分组: 用户恢复 user_id=%d username=%s %s -> %s", userIDVal, username, newGroup, oldGroup))
 
@@ -1167,73 +1807,5 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		"username":  username,
 		"old_group": newGroup,
 		"new_group": oldGroup,
-	}
-}
-
-// 优化4: addUserLog 使用 Redis LPUSH + LTRIM 原子操作
-func (s *AutoGroupService) addUserLog(action string, userID int64, username, oldGroup, newGroup, source, operator string) {
-	cm := cache.Get()
-	rdb := cm.RedisClient()
-	ctx := context.Background()
-
-	// Get current log count for ID generation
-	logLen, _ := rdb.LLen(ctx, "auto_group:logs").Result()
-
-	entry := map[string]interface{}{
-		"id":         logLen + 1,
-		"action":     action,
-		"user_id":    userID,
-		"username":   username,
-		"old_group":  oldGroup,
-		"new_group":  newGroup,
-		"source":     source,
-		"operator":   operator,
-		"affected":   1,
-		"created_at": time.Now().Unix(),
-	}
-
-	data, err := json.Marshal(entry)
-	if err != nil {
-		logger.L.Error(fmt.Sprintf("序列化自动分组日志失败: %v", err))
-		return
-	}
-
-	// Atomic LPUSH + LTRIM
-	rdb.LPush(ctx, "auto_group:logs", string(data))
-	rdb.LTrim(ctx, "auto_group:logs", 0, 999) // Keep latest 1000
-}
-
-// 优化1: addBatchLogs 批量写入日志
-func (s *AutoGroupService) addBatchLogs(action string, users []map[string]interface{}, oldGroup, newGroup, operator string) {
-	cm := cache.Get()
-	rdb := cm.RedisClient()
-	ctx := context.Background()
-
-	logLen, _ := rdb.LLen(ctx, "auto_group:logs").Result()
-
-	pipe := rdb.Pipeline()
-	for i, user := range users {
-		entry := map[string]interface{}{
-			"id":         logLen + int64(i) + 1,
-			"action":     action,
-			"user_id":    user["id"],
-			"username":   user["username"],
-			"old_group":  oldGroup,
-			"new_group":  newGroup,
-			"source":     user["source"],
-			"operator":   operator,
-			"affected":   1,
-			"created_at": time.Now().Unix(),
-		}
-		data, err := json.Marshal(entry)
-		if err != nil {
-			continue
-		}
-		pipe.LPush(ctx, "auto_group:logs", string(data))
-	}
-	pipe.LTrim(ctx, "auto_group:logs", 0, 999)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		logger.L.Error(fmt.Sprintf("批量写入自动分组日志失败: %v", err))
 	}
 }

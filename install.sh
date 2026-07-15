@@ -330,6 +330,11 @@ sync_newapi_mutation_safety_config() {
     echo "ALLOW_UNSAFE_HARD_DELETE=false" >> "$env_file"
     log_info "已加入安全默认值 ALLOW_UNSAFE_HARD_DELETE=false"
   fi
+
+  if ! grep -q '^ENFORCE_IP_RECORDING=' "$env_file" 2>/dev/null; then
+    echo "ENFORCE_IP_RECORDING=false" >> "$env_file"
+    log_info "已加入隐私安全默认值 ENFORCE_IP_RECORDING=false"
+  fi
 }
 
 #######################################
@@ -1067,7 +1072,9 @@ do_reconfigure_interactive() {
 
   # 备份旧配置
   if [[ -f ".env" ]]; then
-    cp .env ".env.backup.$(date +%Y%m%d_%H%M%S)"
+    local env_backup=".env.backup.$(date +%Y%m%d_%H%M%S)"
+    (umask 077; cp .env "$env_backup")
+    chmod 600 "$env_backup"
     log_info "已备份旧配置文件"
   fi
 
@@ -1388,6 +1395,10 @@ migrate_env_file() {
     echo "TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128" >> "$env_file"
     migrated=true
   fi
+
+  # .env contains database credentials and signing secrets. Older installs may
+  # have inherited a permissive umask, so every migration repairs the mode.
+  chmod 600 "$env_file"
 
   if [[ "$migrated" == "true" ]]; then
     log_success "已自动补充 Go 版本所需的配置字段"

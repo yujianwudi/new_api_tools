@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useToast } from './Toast'
 import { useAuth } from '../contexts/AuthContext'
 import { Key, Loader2, RefreshCw, Filter, Search, CheckCircle2, XCircle, AlertCircle, Clock, Tag } from 'lucide-react'
@@ -99,6 +99,8 @@ export function Tokens() {
   const [refreshing, setRefreshing] = useState(false)
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
   const [selectedUser, setSelectedUser] = useState<{ id: number; username: string } | null>(null)
+  const tokenRequestSequenceRef = useRef(0)
+  const tokenRequestAbortRef = useRef<AbortController | null>(null)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const getAuthHeaders = useCallback(() => ({
@@ -128,16 +130,39 @@ export function Tokens() {
   }, [apiUrl, getAuthHeaders])
 
   const fetchTokens = useCallback(async () => {
+    const requestSequence = ++tokenRequestSequenceRef.current
+    tokenRequestAbortRef.current?.abort()
+    const controller = new AbortController()
+    tokenRequestAbortRef.current = controller
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: page.toString(), page_size: pageSize.toString() })
       if (statusFilter) params.append('status', statusFilter)
       if (nameSearch) params.append('name', nameSearch)
-      if (keySearch.trim()) params.append('key', keySearch.trim())
       if (groupFilter) params.append('group', groupFilter)
 
-      const response = await fetch(`${apiUrl}/api/tokens?${params.toString()}`, { headers: getAuthHeaders() })
+      const exactKey = keySearch.trim()
+      const response = exactKey
+        ? await fetch(`${apiUrl}/api/tokens/search`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          cache: 'no-store',
+          signal: controller.signal,
+          body: JSON.stringify({
+            page,
+            page_size: pageSize,
+            status: statusFilter,
+            name: nameSearch,
+            key: exactKey,
+            group: groupFilter,
+          }),
+        })
+        : await fetch(`${apiUrl}/api/tokens?${params.toString()}`, {
+          headers: getAuthHeaders(),
+          signal: controller.signal,
+        })
       const data = await response.json()
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) return
       if (data.success) {
         const result: PaginatedResponse = data.data
         setTokens(result.items || [])
@@ -147,12 +172,23 @@ export function Tokens() {
         showToast('error', data.message || '获取令牌列表失败')
       }
     } catch (error) {
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) return
       showToast('error', '网络错误，请重试')
       console.error('Failed to fetch tokens:', error)
-    } finally { setLoading(false) }
+    } finally {
+      if (tokenRequestSequenceRef.current === requestSequence) {
+        if (tokenRequestAbortRef.current === controller) tokenRequestAbortRef.current = null
+        setLoading(false)
+      }
+    }
   }, [apiUrl, getAuthHeaders, page, pageSize, statusFilter, nameSearch, keySearch, groupFilter, showToast])
 
   useEffect(() => { fetchTokens() }, [fetchTokens])
+  useEffect(() => () => {
+    tokenRequestSequenceRef.current += 1
+    tokenRequestAbortRef.current?.abort()
+    tokenRequestAbortRef.current = null
+  }, [])
   useEffect(() => { fetchStatistics() }, [fetchStatistics])
   useEffect(() => { fetchGroups() }, [fetchGroups])
   useEffect(() => { setPage(1) }, [statusFilter, nameSearch, keySearch, groupFilter])
@@ -251,13 +287,14 @@ export function Tokens() {
             <div className="relative">
               <Key className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
               <Input
-                type="text"
+                type="password"
                 value={keySearch}
                 onChange={(e) => setKeySearch(e.target.value)}
                 placeholder="粘贴完整令牌 Key（如 sk-xxxx）精确查找所属用户..."
                 className="pl-9 pr-9 font-mono"
                 spellCheck={false}
                 autoComplete="off"
+                autoCapitalize="none"
               />
               {keySearch && (
                 <button
