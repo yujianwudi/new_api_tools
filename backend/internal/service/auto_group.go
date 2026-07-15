@@ -42,6 +42,28 @@ func (s *AutoGroupService) getGroupCol() string {
 	return "`group`"
 }
 
+func normalizeAutoGroupName(group string) string {
+	if group == "" {
+		return "default"
+	}
+	return group
+}
+
+func (s *AutoGroupService) updateUserGroupIfCurrent(userID int64, targetGroup, expectedGroup string) (int64, error) {
+	groupCol := s.getGroupCol()
+	expectedGroup = normalizeAutoGroupName(expectedGroup)
+	if s.db.IsPG {
+		query := fmt.Sprintf(
+			"UPDATE users SET %s = $1 WHERE id = $2 AND role != 100 AND COALESCE(NULLIF(%s, ''), 'default') = $3",
+			groupCol, groupCol)
+		return s.db.Execute(query, targetGroup, userID, expectedGroup)
+	}
+	query := fmt.Sprintf(
+		"UPDATE users SET %s = ? WHERE id = ? AND role != 100 AND COALESCE(NULLIF(%s, ''), 'default') = ?",
+		groupCol, groupCol)
+	return s.db.Execute(query, targetGroup, userID, expectedGroup)
+}
+
 // getAvailableOAuthColumns returns OAuth columns that exist in the users table (cached)
 func (s *AutoGroupService) getAvailableOAuthColumns() []string {
 	agOAuthColumnsOnce.Do(func() {
@@ -291,6 +313,7 @@ func (s *AutoGroupService) GetStats() map[string]interface{} {
 		WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
 		AND deleted_at IS NULL
 		AND status = 1
+		AND role != 100
 		%s`, groupCol, groupCol, wlCond)
 
 	if !s.db.IsPG {
@@ -348,7 +371,7 @@ func (s *AutoGroupService) GetAvailableGroups() []map[string]interface{} {
 	query := fmt.Sprintf(`
 		SELECT COALESCE(%s, 'default') as group_name, COUNT(*) as user_count
 		FROM users
-		WHERE deleted_at IS NULL
+		WHERE deleted_at IS NULL AND role != 100
 		GROUP BY COALESCE(%s, 'default')
 		ORDER BY user_count DESC`, groupCol, groupCol)
 
@@ -391,6 +414,7 @@ func (s *AutoGroupService) GetPendingUsers(page, pageSize int) map[string]interf
 		WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
 		AND deleted_at IS NULL
 		AND status = 1
+		AND role != 100
 		%s`, groupCol, groupCol, wlCond)
 
 	if !s.db.IsPG {
@@ -416,6 +440,7 @@ func (s *AutoGroupService) GetPendingUsers(page, pageSize int) map[string]interf
 			WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
 			AND deleted_at IS NULL
 			AND status = 1
+			AND role != 100
 			%s
 			ORDER BY id DESC
 			LIMIT $%d OFFSET $%d`,
@@ -428,6 +453,7 @@ func (s *AutoGroupService) GetPendingUsers(page, pageSize int) map[string]interf
 			WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
 			AND deleted_at IS NULL
 			AND status = 1
+			AND role != 100
 			%s
 			ORDER BY id DESC
 			LIMIT ? OFFSET ?`,
@@ -478,7 +504,7 @@ func (s *AutoGroupService) GetUsers(page, pageSize int, group, source, keyword s
 	sourceCaseSQL := s.buildSourceCaseSQL()
 
 	offset := (page - 1) * pageSize
-	where := []string{"deleted_at IS NULL"}
+	where := []string{"deleted_at IS NULL", "role != 100"}
 	args := []interface{}{}
 	argIdx := 1
 
@@ -601,17 +627,24 @@ func (s *AutoGroupService) GetUsers(page, pageSize int, group, source, keyword s
 
 // assignUser assigns a single user to a target group — matches Python's assign_user()
 func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string) map[string]interface{} {
+	if err := ensureNewAPIDirectMutationSafe(); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
+
 	groupCol := s.getGroupCol()
 	oauthCols := s.buildOAuthSelectCols()
 
 	var userSQL string
 	if s.db.IsPG {
 		userSQL = fmt.Sprintf(
-			"SELECT id, username, %s as user_group%s FROM users WHERE id = $1 AND deleted_at IS NULL",
+			"SELECT id, username, role, %s as user_group%s FROM users WHERE id = $1 AND deleted_at IS NULL",
 			groupCol, oauthCols)
 	} else {
 		userSQL = fmt.Sprintf(
-			"SELECT id, username, %s as user_group%s FROM users WHERE id = ? AND deleted_at IS NULL",
+			"SELECT id, username, role, %s as user_group%s FROM users WHERE id = ? AND deleted_at IS NULL",
 			groupCol, oauthCols)
 	}
 
@@ -622,26 +655,60 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 			"message": "用户不存在",
 		}
 	}
-
-	oldGroup := toString(userRow["user_group"])
-	if oldGroup == "" {
-		oldGroup = "default"
+	if toInt64(userRow["role"]) == 100 {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("操作已阻止：root 用户 %d 受保护", userID),
+		}
 	}
+
+	oldGroup := normalizeAutoGroupName(toString(userRow["user_group"]))
 	username := toString(userRow["username"])
 	source := s.detectSource(userRow)
 
-	var updateSQL string
-	if s.db.IsPG {
-		updateSQL = fmt.Sprintf("UPDATE users SET %s = $1 WHERE id = $2", groupCol)
-	} else {
-		updateSQL = fmt.Sprintf("UPDATE users SET %s = ? WHERE id = ?", groupCol)
+	if oldGroup == targetGroup {
+		return map[string]interface{}{
+			"success":   true,
+			"message":   fmt.Sprintf("用户 %s 已在 %s 分组", username, targetGroup),
+			"user_id":   userID,
+			"username":  username,
+			"old_group": oldGroup,
+			"new_group": targetGroup,
+			"source":    source,
+		}
 	}
 
-	_, err = s.db.Execute(updateSQL, targetGroup, userID)
+	affected, err := s.updateUserGroupIfCurrent(userID, targetGroup, oldGroup)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
 			"message": fmt.Sprintf("更新用户分组失败: %v", err),
+		}
+	}
+	if affected == 0 {
+		current, checkErr := s.db.QueryOne(userSQL, userID)
+		if checkErr != nil || current == nil {
+			return map[string]interface{}{
+				"success": false,
+				"message": "用户状态已变化，分组未更新",
+			}
+		}
+		if toInt64(current["role"]) == 100 {
+			return map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("操作已阻止：root 用户 %d 受保护", userID),
+			}
+		}
+		currentGroup := normalizeAutoGroupName(toString(current["user_group"]))
+		if currentGroup != oldGroup {
+			return map[string]interface{}{
+				"success": false,
+				"message": "用户状态已并发变化，分组未更新",
+			}
+		}
+		return map[string]interface{}{
+			"success": false,
+			"message": "用户分组未更新，请重试",
 		}
 	}
 
@@ -663,6 +730,16 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 
 // 优化1: RunScan 使用批量 UPDATE 消除 N+1
 func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
+	if !dryRun {
+		if err := ensureNewAPIDirectMutationSafe(); err != nil {
+			return map[string]interface{}{
+				"success": false,
+				"dry_run": false,
+				"message": err.Error(),
+			}
+		}
+	}
+
 	config := s.getConfigCached()
 	mode, _ := config["mode"].(string)
 
@@ -743,7 +820,7 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 			updateSQL = fmt.Sprintf(`
 				UPDATE users SET %s = $1
 				WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
-				AND deleted_at IS NULL AND status = 1
+				AND deleted_at IS NULL AND status = 1 AND role != 100
 				%s`, groupCol, groupCol, groupCol, wlCond)
 			updateArgs = append(updateArgs, targetGroup)
 			updateArgs = append(updateArgs, wlArgs...)
@@ -751,7 +828,7 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 			updateSQL = fmt.Sprintf(`
 				UPDATE users SET %s = ?
 				WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
-				AND deleted_at IS NULL AND status = 1
+				AND deleted_at IS NULL AND status = 1 AND role != 100
 				%s`, groupCol, groupCol, groupCol, wlCond)
 			updateArgs = append(updateArgs, targetGroup)
 			updateArgs = append(updateArgs, wlArgs...)
@@ -868,6 +945,12 @@ func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string) m
 			"message": "未指定目标分组",
 		}
 	}
+	if err := ensureNewAPIDirectMutationSafe(); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
 
 	successCount := 0
 	failedCount := 0
@@ -953,6 +1036,13 @@ func (s *AutoGroupService) GetLogs(page, pageSize int, action string, userID *in
 
 // RevertUser reverts a user's group assignment
 func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
+	if err := ensureNewAPIDirectMutationSafe(); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": err.Error(),
+		}
+	}
+
 	cm := cache.Get()
 	rdb := cm.RedisClient()
 	ctx := context.Background()
@@ -1003,9 +1093,9 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 	// Check current user group
 	var userSQL string
 	if s.db.IsPG {
-		userSQL = fmt.Sprintf("SELECT id, %s as user_group FROM users WHERE id = $1 AND deleted_at IS NULL", groupCol)
+		userSQL = fmt.Sprintf("SELECT id, role, %s as user_group FROM users WHERE id = $1 AND deleted_at IS NULL", groupCol)
 	} else {
-		userSQL = fmt.Sprintf("SELECT id, %s as user_group FROM users WHERE id = ? AND deleted_at IS NULL", groupCol)
+		userSQL = fmt.Sprintf("SELECT id, role, %s as user_group FROM users WHERE id = ? AND deleted_at IS NULL", groupCol)
 	}
 
 	userRow, err := s.db.QueryOne(userSQL, userIDVal)
@@ -1015,11 +1105,14 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 			"message": "用户不存在",
 		}
 	}
-
-	currentGroup := toString(userRow["user_group"])
-	if currentGroup == "" {
-		currentGroup = "default"
+	if toInt64(userRow["role"]) == 100 {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("操作已阻止：root 用户 %d 受保护", userIDVal),
+		}
 	}
+
+	currentGroup := normalizeAutoGroupName(toString(userRow["user_group"]))
 
 	if currentGroup != newGroup {
 		return map[string]interface{}{
@@ -1028,19 +1121,38 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	// Revert the group
-	var updateSQL string
-	if s.db.IsPG {
-		updateSQL = fmt.Sprintf("UPDATE users SET %s = $1 WHERE id = $2", groupCol)
-	} else {
-		updateSQL = fmt.Sprintf("UPDATE users SET %s = ? WHERE id = ?", groupCol)
-	}
-
-	_, err = s.db.Execute(updateSQL, oldGroup, userIDVal)
+	// Revert only if the current group still matches the state captured in the log.
+	affected, err := s.updateUserGroupIfCurrent(userIDVal, oldGroup, newGroup)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
 			"message": fmt.Sprintf("恢复用户分组失败: %v", err),
+		}
+	}
+	if affected == 0 {
+		current, checkErr := s.db.QueryOne(userSQL, userIDVal)
+		if checkErr != nil || current == nil {
+			return map[string]interface{}{
+				"success": false,
+				"message": "用户状态已变化，分组未恢复",
+			}
+		}
+		if toInt64(current["role"]) == 100 {
+			return map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("操作已阻止：root 用户 %d 受保护", userIDVal),
+			}
+		}
+		checkGroup := normalizeAutoGroupName(toString(current["user_group"]))
+		if checkGroup != newGroup {
+			return map[string]interface{}{
+				"success": false,
+				"message": "用户状态已并发变化，分组未恢复",
+			}
+		}
+		return map[string]interface{}{
+			"success": false,
+			"message": "用户分组未恢复，请重试",
 		}
 	}
 

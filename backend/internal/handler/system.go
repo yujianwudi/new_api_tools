@@ -2,10 +2,10 @@ package handler
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/logger"
 )
 
 // RegisterSystemRoutes registers /api/system endpoints
@@ -16,7 +16,6 @@ func RegisterSystemRoutes(r *gin.RouterGroup) {
 		g.POST("/scale/refresh", RefreshSystemScale)
 		g.GET("/warmup-status", GetWarmupStatus)
 		g.GET("/indexes", GetIndexStatus)
-		g.POST("/indexes/ensure", EnsureIndexes)
 	}
 }
 
@@ -65,51 +64,38 @@ func GetWarmupStatus(c *gin.Context) {
 
 // GET /api/system/indexes
 func GetIndexStatus(c *gin.Context) {
-	db := database.Get()
-
-	// Check existing indexes
-	var indexes []struct {
-		IndexName string `db:"indexname"`
-	}
-
-	var indexResults []gin.H
-	total := 0
+	indexResults := make([]gin.H, 0, len(database.RecommendedIndexes))
 	existing := 0
 
-	if db.IsPG {
-		db.DB.Select(&indexes, "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")
-	}
+	for _, idx := range database.RecommendedIndexes {
+		db := database.Get()
+		source := "main"
+		if idx.Table == "logs" {
+			db = database.GetLog()
+			source = "log"
+		}
 
-	// Build response matching Python format
-	recommendedIndexes := []string{
-		"idx_users_status",
-		"idx_tokens_user_status",
-		"idx_logs_created_type_user",
-		"idx_logs_model_created",
-		"idx_logs_token_created",
-		"idx_logs_channel_created",
-		"idx_redemptions_key",
-		"idx_redemptions_status",
-		"idx_top_ups_user",
-		"idx_top_ups_status",
-	}
-
-	existingSet := make(map[string]bool)
-	for _, idx := range indexes {
-		existingSet[idx.IndexName] = true
-	}
-
-	for _, name := range recommendedIndexes {
-		total++
-		exists := existingSet[name]
+		exists, err := db.IndexExists(idx.Name, idx.Table)
+		if err != nil {
+			logger.L.Warn("检查索引状态失败 "+idx.Name+": "+err.Error(), logger.CatDatabase)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"success": false,
+				"message": "检查索引状态失败",
+			})
+			return
+		}
 		if exists {
 			existing++
 		}
 		indexResults = append(indexResults, gin.H{
-			"name":   name,
-			"exists": exists,
+			"name":    idx.Name,
+			"table":   idx.Table,
+			"columns": idx.Columns,
+			"source":  source,
+			"exists":  exists,
 		})
 	}
+	total := len(database.RecommendedIndexes)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -119,21 +105,6 @@ func GetIndexStatus(c *gin.Context) {
 			"existing":  existing,
 			"missing":   total - existing,
 			"all_ready": existing == total,
-		},
-	})
-}
-
-// POST /api/system/indexes/ensure
-func EnsureIndexes(c *gin.Context) {
-	db := database.Get()
-
-	// Run index creation
-	db.EnsureIndexes(true, 500*time.Millisecond)
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"message": "Index creation completed",
 		},
 	})
 }

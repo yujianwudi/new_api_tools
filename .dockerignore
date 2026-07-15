@@ -1,0 +1,31 @@
+# Version control and local tooling
+.git/
+.github/
+.idea/
+.vscode/
+
+# Secrets and runtime state
+.env
+.env.*
+!.env.example
+data/
+**/data/
+*.log
+
+# Dependency and build output
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+backend/tmp/
+backend/vendor/
+
+# Local/temporary artifacts
+*.exe
+*.test
+*.out
+*.swp
+*.swo
+.deps/

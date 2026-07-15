@@ -23,13 +23,40 @@ func installIPMonitoringSchema(t *testing.T) {
 			username TEXT DEFAULT '',
 			model_name TEXT
 		)`,
-		`CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)`,
+		`CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			username TEXT,
+			role INTEGER NOT NULL DEFAULT 1,
+			setting TEXT,
+			deleted_at INTEGER
+		)`,
 		`CREATE TABLE tokens (id INTEGER PRIMARY KEY, name TEXT)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("create schema: %v", err)
 		}
+	}
+}
+
+func TestIPStatsExcludeProtectedRootUsers(t *testing.T) {
+	installIPMonitoringSchema(t)
+	db := NewIPMonitoringService().db.DB
+	if _, err := db.Exec(`INSERT INTO users (id, username, role, setting) VALUES
+		(1, 'alice', 1, '{"record_ip_log":true}'),
+		(2, 'root', 100, NULL)`); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := NewIPMonitoringService().GetIPStats()
+	if err != nil {
+		t.Fatalf("GetIPStats: %v", err)
+	}
+	if got := toInt64(stats["total_users"]); got != 1 {
+		t.Fatalf("total_users = %d, want non-root count 1", got)
+	}
+	if got := toInt64(stats["disabled_count"]); got != 0 {
+		t.Fatalf("disabled_count = %d, protected root must not trigger enforcement", got)
 	}
 }
 

@@ -38,18 +38,6 @@ func main() {
 	}
 	defer database.Close()
 
-	// Ensure indexes (background, with delay to reduce load)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logger.L.Error(fmt.Sprintf("索引创建 goroutine panic: %v", r))
-			}
-		}()
-		time.Sleep(2 * time.Second)
-		db := database.Get()
-		db.EnsureIndexes(true, 500*time.Millisecond)
-	}()
-
 	// ========== 4. Initialize Redis cache ==========
 	if cfg.RedisConnString != "" {
 		_, err := cache.Init(cfg.RedisConnString)
@@ -64,6 +52,15 @@ func main() {
 	// ========== 5. Setup Gin router ==========
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	trustedProxyCIDRs, trustedProxyConfigValid := handler.TrustedProxyCIDRsForGin(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if !trustedProxyConfigValid {
+		logger.L.Warn("TRUSTED_PROXY_CIDRS 配置无效，Gin 客户端 IP 解析已禁用代理信任")
+		trustedProxyCIDRs = nil
+	}
+	if err := r.SetTrustedProxies(trustedProxyCIDRs); err != nil {
+		logger.L.Warn("Gin 可信代理配置失败，已禁用代理信任: " + err.Error())
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	// Global middleware
 	r.Use(middleware.ErrorHandlerMiddleware())  // Panic recovery

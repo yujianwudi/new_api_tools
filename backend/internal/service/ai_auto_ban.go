@@ -2,9 +2,10 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,6 +14,13 @@ import (
 
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/security"
+)
+
+const (
+	maxAIModelsResponseBytes = 4 << 20
+	maxAIModelTestBytes      = 1 << 20
+	maxAIModelsReturned      = 5000
 )
 
 // AIAutoBanService handles AI-assisted automatic user banning
@@ -43,43 +51,66 @@ var defaultAIBanConfig = map[string]interface{}{
 
 // GetConfig returns AI auto ban configuration with computed fields
 func (s *AIAutoBanService) GetConfig() map[string]interface{} {
-	cm := cache.Get()
-	var config map[string]interface{}
-	found, _ := cm.GetJSON("ai_ban:config", &config)
-	if !found {
-		config = make(map[string]interface{})
-		for k, v := range defaultAIBanConfig {
-			config[k] = v
-		}
+	stored := s.getStoredConfig()
+	config := make(map[string]interface{}, len(stored)+2)
+	for key, value := range stored {
+		config[key] = value
 	}
 
-	// Compute has_api_key and masked_api_key (matching Python backend behavior)
-	apiKey, _ := config["api_key"].(string)
+	// The stored credential is write-only. API responses only expose whether a
+	// key exists and a non-reversible display mask.
+	apiKey, _ := stored["api_key"].(string)
+	delete(config, "api_key")
 	config["has_api_key"] = apiKey != ""
-
-	maskedKey := ""
-	if apiKey != "" {
-		if len(apiKey) > 8 {
-			maskedKey = apiKey[:4] + strings.Repeat("*", len(apiKey)-8) + apiKey[len(apiKey)-4:]
-		} else {
-			maskedKey = strings.Repeat("*", len(apiKey))
-		}
-	}
-	config["masked_api_key"] = maskedKey
-
+	config["masked_api_key"] = maskAPIKey(apiKey)
 	return config
 }
 
-// SaveConfig saves AI auto ban configuration
-func (s *AIAutoBanService) SaveConfig(updates map[string]interface{}) error {
+func (s *AIAutoBanService) getStoredConfig() map[string]interface{} {
 	cm := cache.Get()
-	// Read raw config from Redis (not via GetConfig which adds computed fields)
 	var config map[string]interface{}
 	found, _ := cm.GetJSON("ai_ban:config", &config)
 	if !found {
 		config = make(map[string]interface{})
-		for k, v := range defaultAIBanConfig {
+	}
+	for k, v := range defaultAIBanConfig {
+		if _, exists := config[k]; !exists {
 			config[k] = v
+		}
+	}
+	return config
+}
+
+func maskAPIKey(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	return "********"
+}
+
+// SaveConfig saves AI auto ban configuration
+func (s *AIAutoBanService) SaveConfig(ctx context.Context, updates map[string]interface{}) error {
+	cm := cache.Get()
+	config := s.getStoredConfig()
+
+	delete(updates, "has_api_key")
+	delete(updates, "masked_api_key")
+	if value, exists := updates["base_url"]; exists {
+		baseURL, ok := value.(string)
+		if !ok {
+			return errors.New("AI Base URL must be a string")
+		}
+		baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		if baseURL != "" {
+			if err := security.ValidateHTTPSURL(ctx, baseURL); err != nil {
+				return fmt.Errorf("unsafe AI Base URL: %w", err)
+			}
+		}
+		updates["base_url"] = baseURL
+	}
+	if value, exists := updates["api_key"]; exists {
+		if _, ok := value.(string); !ok {
+			return errors.New("API Key must be a string")
 		}
 	}
 
@@ -88,12 +119,7 @@ func (s *AIAutoBanService) SaveConfig(updates map[string]interface{}) error {
 		config[k] = v
 	}
 
-	// Strip computed fields before saving (they are re-computed in GetConfig)
-	delete(config, "has_api_key")
-	delete(config, "masked_api_key")
-
-	cm.Set("ai_ban:config", config, 0)
-	return nil
+	return cm.Set("ai_ban:config", config, 0)
 }
 
 // ResetAPIHealth resets the API health status
@@ -272,13 +298,19 @@ func (s *AIAutoBanService) RunScan(window string, limit int) map[string]interfac
 }
 
 // TestConnection tests the configured API connection (placeholder)
-func (s *AIAutoBanService) TestConnection() map[string]interface{} {
-	config := s.GetConfig()
+func (s *AIAutoBanService) TestConnection(ctx context.Context) map[string]interface{} {
+	config := s.getStoredConfig()
 	baseURL, _ := config["base_url"].(string)
 	if baseURL == "" {
 		return map[string]interface{}{
 			"success": false,
 			"message": "未配置 API Base URL",
+		}
+	}
+	if err := security.ValidateHTTPSURL(ctx, baseURL); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("API Base URL 不安全: %s", err.Error()),
 		}
 	}
 	return map[string]interface{}{
@@ -297,13 +329,20 @@ func getEndpointURL(baseURL, endpoint string) string {
 }
 
 // FetchModels fetches available models from OpenAI-compatible /v1/models API with caching
-func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool) map[string]interface{} {
-	config := s.GetConfig()
+func (s *AIAutoBanService) FetchModels(ctx context.Context, baseURL, apiKey string, forceRefresh bool) map[string]interface{} {
+	config := s.getStoredConfig()
 
 	if baseURL == "" {
 		baseURL, _ = config["base_url"].(string)
 	}
 	base := strings.TrimRight(baseURL, "/")
+	if err := security.ValidateHTTPSURL(ctx, base); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("API Base URL 不安全: %s", err.Error()),
+			"models":  []interface{}{},
+		}
+	}
 
 	if apiKey == "" {
 		apiKey, _ = config["api_key"].(string)
@@ -340,7 +379,7 @@ func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool
 
 	// Call external API
 	url := getEndpointURL(base, "/models")
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -351,7 +390,7 @@ func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := security.NewHTTPSClient(15 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		msg := "连接失败，请检查 API 地址"
@@ -374,7 +413,7 @@ func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool
 		}
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := security.ReadLimitedBody(resp.Body, maxAIModelsResponseBytes)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -407,6 +446,9 @@ func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool
 				"owned_by": m.OwnedBy,
 				"created":  m.Created,
 			})
+			if len(models) >= maxAIModelsReturned {
+				break
+			}
 		}
 	}
 
@@ -428,13 +470,19 @@ func (s *AIAutoBanService) FetchModels(baseURL, apiKey string, forceRefresh bool
 }
 
 // TestModel tests if a specific model is available by sending a chat completion request
-func (s *AIAutoBanService) TestModel(baseURL, apiKey, model string) map[string]interface{} {
-	config := s.GetConfig()
+func (s *AIAutoBanService) TestModel(ctx context.Context, baseURL, apiKey, model string) map[string]interface{} {
+	config := s.getStoredConfig()
 
 	if baseURL == "" {
 		baseURL, _ = config["base_url"].(string)
 	}
 	base := strings.TrimRight(baseURL, "/")
+	if err := security.ValidateHTTPSURL(ctx, base); err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("API Base URL 不安全: %s", err.Error()),
+		}
+	}
 
 	if apiKey == "" {
 		apiKey, _ = config["api_key"].(string)
@@ -465,7 +513,7 @@ func (s *AIAutoBanService) TestModel(baseURL, apiKey, model string) map[string]i
 	}
 
 	url := getEndpointURL(base, "/chat/completions")
-	req, err := http.NewRequest("POST", url, bytes.NewReader(payloadBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -475,7 +523,7 @@ func (s *AIAutoBanService) TestModel(baseURL, apiKey, model string) map[string]i
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := security.NewHTTPSClient(30 * time.Second)
 	startTime := time.Now()
 	resp, err := client.Do(req)
 	elapsed := time.Since(startTime)
@@ -492,7 +540,7 @@ func (s *AIAutoBanService) TestModel(baseURL, apiKey, model string) map[string]i
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := security.ReadLimitedBody(resp.Body, maxAIModelTestBytes)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,

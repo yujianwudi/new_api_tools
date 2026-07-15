@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="Docs" src="https://img.shields.io/badge/docs-%E4%B8%AD%E6%96%87-E05243?style=for-the-badge" />
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.25.6-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.5-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img alt="Gin" src="https://img.shields.io/badge/Gin-1.11-008ECF?style=for-the-badge" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" />
   <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646CFF?style=for-the-badge&logo=vite&logoColor=white" />
@@ -26,13 +26,15 @@
 |---|---|
 | 项目定位 | NewAPI 的增强管理层，用于可视化、审计、风控和后台运维 |
 | 上游项目 | [QuantumNous/new-api](https://github.com/QuantumNous/new-api) |
+| 本项目来源 | 基于 [james-6-23/new_api_tools](https://github.com/james-6-23/new_api_tools) 持续优化 |
+| 路线图 | [P0–P4 产品与技术路线](./docs/ROADMAP.md) |
 | 运行方式 | 独立容器 / 独立进程，连接 NewAPI 现有数据库 |
 | 默认端口 | `1145` |
-| 后端栈 | Go `1.25.6`、Gin `1.11`、sqlx、Redis、SQLite 辅助缓存 |
+| 后端栈 | Go `1.26.5`、Gin `1.11`、sqlx、Redis、SQLite 辅助缓存 |
 | 前端栈 | React `19`、Vite `8`、TypeScript、Tailwind CSS、ECharts |
 | 数据库 | 生产优先 PostgreSQL / MySQL，查询字段以导出的真实 schema 为准 |
 | 部署入口 | `install.sh` 一键部署，或 `docker-compose.yml` 手动部署 |
-| 镜像 | `ghcr.io/james-6-23/new_api_tools:latest` |
+| 镜像 | `ghcr.io/yujianwudi/new_api_tools:latest` |
 
 ## 能力速览
 
@@ -62,7 +64,7 @@
 如果 NewAPI 已部署在 Linux 服务器上，可以使用一键脚本自动检测环境并部署：
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/main/install.sh)
 ```
 
 脚本会自动定位 NewAPI 安装目录、读取数据库配置、生成必要密钥、设置管理员密码、配置 Docker 网络并启动服务。部署完成后访问：
@@ -76,7 +78,7 @@ http://your-server-ip:1145
 适用于熟悉 Docker 的用户或非标准环境：
 
 ```bash
-git clone https://github.com/james-6-23/new_api_tools.git
+git clone https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 vim .env
@@ -91,15 +93,25 @@ docker-compose up -d
 
 ```bash
 # 一键脚本已涵盖日志库；重新运行即可让已部署实例补上日志库连接
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/main/install.sh)
 ```
 
 > 单独修复 / 不想整体重部署时，也可只跑日志库脚本：
 > ```bash
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh)         # 检测并配置
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
+> bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/main/setup-log-db.sh)         # 检测并配置
+> bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
 > ```
 > 即使日志库一时连不上，后端也只会**降级为读主库**（日志暂时为空），不会崩溃。
+
+### NewAPI Redis 与写操作安全边界
+
+NewAPI 开启 Redis 后，会优先从缓存读取用户与 Token 鉴权状态。此时本工具若直接修改数据库，封禁、删除、禁用 Token、调整分组或开启 IP 记录可能不会立即生效。部署脚本会读取 NewAPI 容器的 `REDIS_CONN_STRING`：只有该变量**明确存在且为空**时才写入 `NEWAPI_REDIS_DISABLED=true`；变量缺失、读取失败或值非空时均保持 `false`，并阻止相关直接写库操作。Redis 开启时请通过 NewAPI 官方管理 API 完成这些变更。
+
+永久删除额外受 `ALLOW_UNSAFE_HARD_DELETE=false` 保护。NewAPI 官方删除流程还会清理二次验证、Passkey、OAuth 绑定等认证记录，本工具的兼容数据库路径无法跨版本保证完整性，因此默认禁止单用户硬删除、批量硬删除和永久清理。仅在明确接受孤儿认证记录风险、且确认 NewAPI Redis 已关闭时，才可同时设置 `ALLOW_UNSAFE_HARD_DELETE=true` 和 `NEWAPI_REDIS_DISABLED=true`。
+
+### 可信代理与登录限流
+
+后端默认不信任客户端提供的 `X-Forwarded-For`。只有请求的直接 TCP 对端命中 `TRUSTED_PROXY_CIDRS` 时，才会从右向左剥离可信代理并确定客户端 IP。合并镜像默认只信任 loopback（`127.0.0.1/32,::1/128`），可防止公网直连时伪造 XFF 绕过登录和公开接口限流。若宿主机还有一层 Nginx/Caddy，请把**内层 Nginx 实际看到的外层代理地址**以精确 `/32` 或 `/128` 追加到列表；不要信任整个 `172.16.0.0/12` 等私网段。外层 Nginx 应继续使用 `proxy_set_header X-Forwarded-For $remote_addr;` 覆盖客户端原始头。
 
 ## 配置说明
 
@@ -125,6 +137,9 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 | `DB_MAX_IDLE_CONNS` | 数据库最大空闲连接数 | `15` |
 | `NEWAPI_NETWORK` | NewAPI 所在 Docker 网络 | `new-api_default` |
 | `NEWAPI_BASEURL` | NewAPI 内部地址，用于需要回调上游的功能 | 可选 |
+| `NEWAPI_REDIS_DISABLED` | NewAPI 是否已明确关闭 Redis；仅 `true` 时允许直接修改用户/Token/分组/IP 设置。部署脚本自动检测，未知状态按 `false` 处理 | `false` |
+| `ALLOW_UNSAFE_HARD_DELETE` | 是否启用不完整的直接数据库永久删除兼容路径；还要求 `NEWAPI_REDIS_DISABLED=true`，优先使用 NewAPI 管理 API | `false` |
+| `TRUSTED_PROXY_CIDRS` | 允许后端解析其 XFF 的精确代理 IP/CIDR；外层反代需追加实际来源地址，禁止宽泛私网段 | `127.0.0.1/32,::1/128` |
 | `REDIS_PASSWORD` | 内置 Redis 密码 | 留空或自定义 |
 | `TIMEZONE` | 服务时区 | `Asia/Shanghai` |
 | `LOG_LEVEL` | 日志级别 | `info` |
@@ -172,7 +187,7 @@ npm run dev
 | 兑换码 | `GET /api/redemptions`、`POST /api/redemptions/generate` |
 | 风控 | `GET /api/risk/*`、`GET /api/ip/*`、`POST /api/ai-ban/*` |
 | 联合广播 | `GET /api/abuse-broadcast/*`、`POST /api/abuse-broadcast/*` |
-| 模型状态 | `GET /api/model-status/*`、`GET /api/embed/model-status/*` |
+| 模型状态 | `GET /api/model-status/*`、`GET /api/embed/model-status/*`、`POST /api/embed/model-status/status/multiple` |
 | 用户与令牌 | `GET /api/users`、`GET /api/tokens`、`GET /api/auto-group/*` |
 | 存储与系统 | `GET /api/storage/*`、`GET /api/system/*` |
 
@@ -196,4 +211,4 @@ MIT License
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=james-6-23/new_api_tools&type=Date)](https://star-history.com/#james-6-23/new_api_tools&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=yujianwudi/new_api_tools&type=Date)](https://star-history.com/#yujianwudi/new_api_tools&Date)

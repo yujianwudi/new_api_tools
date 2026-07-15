@@ -42,6 +42,7 @@ interface TokenStatistics {
   active: number
   disabled: number
   expired: number
+  exhausted: number
 }
 
 interface PaginatedResponse {
@@ -52,7 +53,31 @@ interface PaginatedResponse {
   total_pages: number
 }
 
-type StatusFilter = '' | 'active' | 'disabled' | 'expired'
+type StatusFilter = '' | 'active' | 'disabled' | 'expired' | 'exhausted'
+type EffectiveTokenStatus = Exclude<StatusFilter, ''> | 'unknown'
+
+function getEffectiveTokenStatus(record: TokenRecord): EffectiveTokenStatus {
+  if (record.status === 2) return 'disabled'
+  if (record.status === 3) return 'expired'
+  if (record.status === 4) return 'exhausted'
+  if (record.status !== 1) return 'unknown'
+  if (record.expired_time > 0 && record.expired_time * 1000 <= Date.now()) return 'expired'
+  if (!record.unlimited_quota && record.remain_quota <= 0) return 'exhausted'
+  return 'active'
+}
+
+const tokenStatusMeta = {
+  active: { label: '启用', variant: 'success' },
+  disabled: { label: '禁用', variant: 'secondary' },
+  expired: { label: '已过期', variant: 'destructive' },
+  exhausted: { label: '已耗尽', variant: 'warning' },
+  unknown: { label: '未知', variant: 'outline' },
+} as const
+
+function TokenStatusBadge({ record }: { record: TokenRecord }) {
+  const meta = tokenStatusMeta[getEffectiveTokenStatus(record)]
+  return <Badge variant={meta.variant}>{meta.label}</Badge>
+}
 
 export function Tokens() {
   const { showToast } = useToast()
@@ -148,17 +173,7 @@ export function Tokens() {
 
   const isTokenExpired = (expiredTime: number) => {
     if (!expiredTime || expiredTime <= 0) return false
-    return expiredTime * 1000 < Date.now()
-  }
-
-  const getStatusBadge = (record: TokenRecord) => {
-    if (isTokenExpired(record.expired_time)) {
-      return <Badge variant="destructive">已过期</Badge>
-    }
-    if (record.status === 1) {
-      return <Badge variant="success">启用</Badge>
-    }
-    return <Badge variant="secondary">禁用</Badge>
+    return expiredTime * 1000 <= Date.now()
   }
 
   return (
@@ -178,7 +193,7 @@ export function Tokens() {
       </div>
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           title="总令牌"
           value={statsLoading ? '-' : `${statistics?.total || 0}`}
@@ -202,6 +217,14 @@ export function Tokens() {
           color="red"
           className="border-l-4 border-l-red-500"
           onClick={() => setStatusFilter('disabled')}
+        />
+        <StatCard
+          title="已耗尽"
+          value={statsLoading ? '-' : `${statistics?.exhausted || 0}`}
+          icon={AlertCircle}
+          color="orange"
+          className="border-l-4 border-l-orange-500"
+          onClick={() => setStatusFilter('exhausted')}
         />
         <StatCard
           title="已过期"
@@ -268,6 +291,7 @@ export function Tokens() {
                 <option value="">全部状态</option>
                 <option value="active">启用</option>
                 <option value="disabled">禁用</option>
+                <option value="exhausted">已耗尽</option>
                 <option value="expired">已过期</option>
               </Select>
             </div>
@@ -319,7 +343,7 @@ export function Tokens() {
                       <div className="text-sm font-medium truncate" title={t.name}>{t.name || '-'} <span className="text-[11px] text-muted-foreground font-mono">#{t.id}</span></div>
                       <code className="block mt-1 text-[11px] font-mono bg-muted px-1.5 py-0.5 rounded truncate">{t.key}</code>
                     </div>
-                    {getStatusBadge(t)}
+                    <TokenStatusBadge record={t} />
                   </div>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
                     <div className="text-muted-foreground">所属：
@@ -397,7 +421,7 @@ export function Tokens() {
                           <span className="text-sm text-muted-foreground">-</span>
                         )}
                       </TableCell>
-                      <TableCell>{getStatusBadge(t)}</TableCell>
+                      <TableCell><TokenStatusBadge record={t} /></TableCell>
                       <TableCell>
                         {t.group ? (
                           <span

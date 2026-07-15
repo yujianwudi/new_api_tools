@@ -7,9 +7,15 @@
 *.out
 .git
 .gitignore
+.env
+.env.*
 .vscode
 .idea
 *.md
 !README.md
 vendor/
 tmp/
+node_modules/
+dist/
+data/
+coverage/

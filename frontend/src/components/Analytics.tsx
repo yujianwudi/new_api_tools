@@ -93,7 +93,8 @@ export function Analytics() {
 
   const [refreshInterval, setRefreshInterval] = useState(() => {
     const saved = localStorage.getItem(REFRESH_INTERVAL_KEY)
-    return saved ? parseInt(saved, 10) : DEFAULT_REFRESH_INTERVAL
+    const parsed = saved !== null ? parseInt(saved, 10) : DEFAULT_REFRESH_INTERVAL
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REFRESH_INTERVAL
   })
   const refreshIntervalRef = useRef(refreshInterval)
 
@@ -128,7 +129,8 @@ export function Analytics() {
   // 从 localStorage 恢复倒计时，或使用默认值
   const [countdown, setCountdown] = useState(() => {
     const saved = sessionStorage.getItem(COUNTDOWN_STORAGE_KEY)
-    return saved ? parseInt(saved, 10) : DEFAULT_REFRESH_INTERVAL
+    const parsed = saved !== null ? parseInt(saved, 10) : refreshInterval
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : refreshInterval
   })
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -146,7 +148,7 @@ export function Analytics() {
         const response = await fetch(`${apiUrl}/api/system/scale`, { headers: getAuthHeaders() })
         const res = await response.json()
         if (res.success && res.data?.settings) {
-          const interval = res.data.settings.frontend_refresh_interval || DEFAULT_REFRESH_INTERVAL
+          const interval = res.data.settings.frontend_refresh_interval ?? DEFAULT_REFRESH_INTERVAL
 
           // 只有在用户没有手动设置过时，才使用系统推荐值
           const saved = localStorage.getItem(REFRESH_INTERVAL_KEY)
@@ -174,12 +176,12 @@ export function Analytics() {
     setRefreshInterval(val)
     setCountdown(val)
     refreshIntervalRef.current = val
+    localStorage.setItem(REFRESH_INTERVAL_KEY, val.toString())
     if (val > 0) {
-      localStorage.setItem(REFRESH_INTERVAL_KEY, val.toString())
       const label = val >= 60 ? `${val / 60}分钟` : `${val}秒`
       showToast('success', `日志分析自动刷新已设置为 ${label}`)
     } else {
-      localStorage.removeItem(REFRESH_INTERVAL_KEY)
+      sessionStorage.removeItem(COUNTDOWN_STORAGE_KEY)
       showToast('info', '日志分析自动刷新已关闭')
     }
   }, [showToast])
@@ -207,10 +209,16 @@ export function Analytics() {
 
   // 保存倒计时到 sessionStorage
   useEffect(() => {
+    if (refreshInterval <= 0) {
+      sessionStorage.removeItem(COUNTDOWN_STORAGE_KEY)
+      return
+    }
     if (countdown > 0) {
       sessionStorage.setItem(COUNTDOWN_STORAGE_KEY, countdown.toString())
+    } else {
+      sessionStorage.removeItem(COUNTDOWN_STORAGE_KEY)
     }
-  }, [countdown])
+  }, [countdown, refreshInterval])
 
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean
@@ -302,6 +310,11 @@ export function Analytics() {
     if (loading || !syncStatus) return
     // 未刷新页面时不执行
     if (!isPageRefresh) return
+    // 用户关闭自动刷新后，浏览器重载也不应触发自动处理。
+    if (refreshIntervalRef.current <= 0) {
+      setIsPageRefresh(false)
+      return
+    }
     // 未初始化时不执行
     if (syncStatus.needs_initial_sync || syncStatus.is_initializing) {
       setIsPageRefresh(false)
@@ -333,6 +346,12 @@ export function Analytics() {
 
   // Auto refresh with countdown - only when initialized (synced)
   useEffect(() => {
+    if (refreshInterval <= 0) {
+      setCountdown(0)
+      countdownRef.current = null
+      return
+    }
+
     // Don't auto-refresh while batch processing or loading
     if (batchProcessing || loading) return
 
@@ -370,6 +389,9 @@ export function Analytics() {
 
     countdownRef.current = setInterval(() => {
       setCountdown(prev => {
+        if (refreshIntervalRef.current <= 0) {
+          return 0
+        }
         if (prev <= 1) {
           doAutoRefresh()
           return refreshIntervalRef.current
@@ -381,6 +403,7 @@ export function Analytics() {
     return () => {
       if (countdownRef.current) {
         clearInterval(countdownRef.current)
+        countdownRef.current = null
       }
     }
     // 只依赖关键状态变化，不依赖 syncStatus 的具体值

@@ -53,7 +53,7 @@ func (s *IPMonitoringService) GetIPStats() (map[string]interface{}, error) {
 					ELSE 0
 				END) as enabled_count
 			FROM users
-			WHERE deleted_at IS NULL`
+			WHERE deleted_at IS NULL AND role != 100`
 	} else {
 		userSQL = `
 			SELECT
@@ -64,7 +64,7 @@ func (s *IPMonitoringService) GetIPStats() (map[string]interface{}, error) {
 					ELSE 0
 				END) as enabled_count
 			FROM users
-			WHERE deleted_at IS NULL`
+			WHERE deleted_at IS NULL AND role != 100`
 	}
 
 	row, err := s.db.QueryOneWithTimeout(ipMonitoringQueryTimeout, userSQL)
@@ -518,6 +518,10 @@ func (s *IPMonitoringService) GetUserIPs(userID int64, window string) (map[strin
 
 // EnableAllIPRecording enables IP recording for all users by updating the setting JSON field
 func (s *IPMonitoringService) EnableAllIPRecording() (map[string]interface{}, error) {
+	if err := ensureNewAPIDirectMutationSafe(); err != nil {
+		return nil, err
+	}
+
 	var updateSQL string
 	if s.db.IsPG {
 		updateSQL = `
@@ -526,7 +530,7 @@ func (s *IPMonitoringService) EnableAllIPRecording() (map[string]interface{}, er
 					WHEN setting IS NULL OR setting = '' THEN '{"record_ip_log":true}'::jsonb::text
 					ELSE (setting::jsonb || '{"record_ip_log":true}'::jsonb)::text
 				END
-			WHERE deleted_at IS NULL
+			WHERE deleted_at IS NULL AND role != 100
 			AND (setting IS NULL OR setting = '' OR setting::jsonb->>'record_ip_log' IS NULL OR setting::jsonb->>'record_ip_log' != 'true')`
 	} else {
 		updateSQL = `
@@ -535,7 +539,7 @@ func (s *IPMonitoringService) EnableAllIPRecording() (map[string]interface{}, er
 					WHEN setting IS NULL OR setting = '' THEN '{"record_ip_log":true}'
 					ELSE JSON_SET(setting, '$.record_ip_log', true)
 				END
-			WHERE deleted_at IS NULL
+			WHERE deleted_at IS NULL AND role != 100
 			AND (setting IS NULL OR setting = '' OR JSON_EXTRACT(setting, '$.record_ip_log') IS NULL OR JSON_EXTRACT(setting, '$.record_ip_log') != true)`
 	}
 

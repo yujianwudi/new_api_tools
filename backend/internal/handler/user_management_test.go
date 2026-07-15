@@ -72,3 +72,24 @@ func TestPurgeSoftDeletedRequiresConfirmTextBeforeService(t *testing.T) {
 		t.Fatalf("expected confirmation error, got %s", w.Body.String())
 	}
 }
+
+func TestPurgeSoftDeletedRequiresPreviewSnapshotBeforeService(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/users/soft-deleted/purge",
+		strings.NewReader(`{"dry_run":false,"confirm_text":"彻底删除"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	PurgeSoftDeletedUsers(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "SNAPSHOT_REQUIRED") {
+		t.Fatalf("expected snapshot error, got %s", w.Body.String())
+	}
+}

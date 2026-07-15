@@ -156,7 +156,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 |--------|------|-------------|
 | **基础配置** | | |
 | `FRONTEND_PORT` | 服务访问端口 | `1145` |
-| `ADMIN_PASSWORD` | 管理后台登录密码 | `123456` |
+| `ADMIN_PASSWORD` | 管理后台登录密码 | 必填；部署脚本会生成高强度随机密码 |
 | `API_KEY` | 后端 API 密钥（可选） | - |
 | `JWT_SECRET` | JWT 签名密钥 | `random_string` |
 | `JWT_EXPIRE_HOURS` | JWT 过期时间（小时） | `24` |
@@ -178,7 +178,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 ## 🛠️ 技术栈
 
 - **前端：** React, TypeScript, Vite, Tailwind CSS, Shadcn UI, Recharts/ECharts.
-- **后端：** Python (FastAPI/Flask), PostgreSQL.
+- **后端：** Go (Gin), sqlx, PostgreSQL / MySQL.
 - **部署：** 支持 Docker 一键部署。
 
 ---

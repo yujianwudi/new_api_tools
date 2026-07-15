@@ -42,12 +42,13 @@ func ValidateToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		// Verify signing method
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		// Accept exactly HS256. Accepting the whole HMAC family would also allow
+		// HS384/HS512 tokens despite the configured algorithm being HS256.
+		if token.Method != jwt.SigningMethodHS256 || token.Header["alg"] != jwt.SigningMethodHS256.Alg() {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(cfg.JWTSecretKey), nil
-	})
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)

@@ -353,6 +353,57 @@ func TestGetTopUpProviderHealth_PaymentProviderColumnOptional(t *testing.T) {
 	}
 }
 
+func TestTopUpAggregateQueriesPropagateDatabaseErrors(t *testing.T) {
+	clearTopUpAnalyticsCache(t)
+	t.Cleanup(func() { clearTopUpAnalyticsCache(t) })
+	installSQLiteForTests(t)
+
+	now := time.Now().Unix()
+	if _, err := topUpTrendsMonthly(now-31*86400, now); err == nil {
+		t.Fatal("monthly trends should fail when the top_ups table is unavailable")
+	}
+	if _, err := GetTopUpFinancialSummary(2); err == nil {
+		t.Fatal("financial summary should fail instead of skipping failed months")
+	}
+	if _, err := GetTopUpRealtimeStats(); err == nil {
+		t.Fatal("realtime stats should propagate aggregate query failures")
+	}
+
+	var cached []TopUpFinancialSummary
+	if found, _ := cache.Get().GetJSON("topup:financial:2", &cached); found {
+		t.Fatal("failed financial summaries must not be cached")
+	}
+}
+
+func TestTopUpFunnelPropagatesAverageCompletionQueryError(t *testing.T) {
+	clearTopUpAnalyticsCache(t)
+	t.Cleanup(func() { clearTopUpAnalyticsCache(t) })
+
+	db := installSQLiteForTests(t)
+	db.MustExec(`
+		CREATE TABLE top_ups (
+			id INTEGER PRIMARY KEY,
+			money REAL,
+			payment_method TEXT,
+			create_time INTEGER,
+			status TEXT
+		);
+	`)
+
+	_, err := GetTopUpFunnel(30)
+	if err == nil {
+		t.Fatal("funnel should fail when the average completion query fails")
+	}
+	if !strings.Contains(err.Error(), "average completion") {
+		t.Fatalf("unexpected funnel error: %v", err)
+	}
+
+	var cached TopUpFunnelData
+	if found, _ := cache.Get().GetJSON("topup:funnel:30", &cached); found {
+		t.Fatal("partially computed funnel data must not be cached")
+	}
+}
+
 func seedTopUpAnalyticsTables(t *testing.T) {
 	t.Helper()
 	clearTopUpAnalyticsCache(t)

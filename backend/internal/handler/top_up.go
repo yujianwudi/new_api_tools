@@ -50,9 +50,28 @@ func ListTopUps(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 
+	params, err := parseTopUpFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", err.Error(), ""))
+		return
+	}
+	params.Page = page
+	params.PageSize = pageSize
+
+	result, err := service.ListTopUpRecords(params)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    result,
+	})
+}
+
+func parseTopUpFilters(c *gin.Context) (service.ListTopUpParams, error) {
 	params := service.ListTopUpParams{
-		Page:            page,
-		PageSize:        pageSize,
 		Status:          c.Query("status"),
 		PaymentMethod:   c.Query("payment_method"),
 		PaymentProvider: c.Query("payment_provider"),
@@ -65,29 +84,29 @@ func ListTopUps(c *gin.Context) {
 	// Parse optional user_id
 	if userIDStr := c.Query("user_id"); userIDStr != "" {
 		uid, err := strconv.ParseInt(userIDStr, 10, 64)
-		if err == nil {
-			params.UserID = &uid
+		if err != nil || uid <= 0 {
+			return params, errors.New("invalid user_id")
 		}
+		params.UserID = &uid
 	}
 
 	// Parse optional inviter_id (用于邀请返利统计行展开)
 	if inviterIDStr := c.Query("inviter_id"); inviterIDStr != "" {
 		iid, err := strconv.ParseInt(inviterIDStr, 10, 64)
-		if err == nil {
-			params.InviterID = &iid
+		if err != nil || iid <= 0 {
+			return params, errors.New("invalid inviter_id")
 		}
+		params.InviterID = &iid
 	}
 
-	result, err := service.ListTopUpRecords(params)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
-		return
-	}
+	return params, nil
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    result,
-	})
+func optionalTopUpFilterID(id *int64) interface{} {
+	if id == nil {
+		return nil
+	}
+	return *id
 }
 
 // GET /api/top-ups/statistics
@@ -169,19 +188,10 @@ func ExportTopUps(c *gin.Context) {
 	}
 	defer exportInFlight.Delete(lockKey)
 
-	params := service.ListTopUpParams{
-		Status:          c.Query("status"),
-		PaymentMethod:   c.Query("payment_method"),
-		PaymentProvider: c.Query("payment_provider"),
-		TradeNo:         c.Query("trade_no"),
-		Username:        c.Query("username"),
-		StartDate:       c.Query("start_date"),
-		EndDate:         c.Query("end_date"),
-	}
-	if userIDStr := c.Query("user_id"); userIDStr != "" {
-		if uid, err := strconv.ParseInt(userIDStr, 10, 64); err == nil {
-			params.UserID = &uid
-		}
+	params, err := parseTopUpFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", err.Error(), ""))
+		return
 	}
 
 	total, err := service.CountTopUps(params)
@@ -208,9 +218,10 @@ func ExportTopUps(c *gin.Context) {
 	subject, _ := c.Get("user_sub")
 	method, _ := c.Get("auth_method")
 	log.Printf(
-		"audit top_ups_export user=%v auth=%v rows=%d filters={status:%q payment:%q provider:%q trade_no:%q username:%q user_id:%v start:%q end:%q} ip=%s",
+		"audit top_ups_export user=%v auth=%v rows=%d filters={status:%q payment:%q provider:%q trade_no:%q username:%q user_id:%v inviter_id:%v start:%q end:%q} ip=%s",
 		subject, method, total,
-		params.Status, params.PaymentMethod, params.PaymentProvider, params.TradeNo, params.Username, params.UserID,
+		params.Status, params.PaymentMethod, params.PaymentProvider, params.TradeNo, params.Username,
+		optionalTopUpFilterID(params.UserID), optionalTopUpFilterID(params.InviterID),
 		params.StartDate, params.EndDate, c.ClientIP(),
 	)
 

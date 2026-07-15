@@ -4,11 +4,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/rs/zerolog/log"
 )
 
@@ -43,15 +46,30 @@ type Config struct {
 	RedisConnString string `json:"redis_conn_string"`
 
 	// Authentication
-	APIKey         string        `json:"api_key"`
-	AdminPassword  string        `json:"admin_password"`
-	JWTSecretKey   string        `json:"jwt_secret_key"`
-	JWTAlgorithm   string        `json:"jwt_algorithm"`
-	JWTExpireHours time.Duration `json:"jwt_expire_hours"`
+	APIKey             string        `json:"api_key"`
+	AdminPassword      string        `json:"admin_password"`
+	JWTSecretKey       string        `json:"jwt_secret_key"`
+	JWTAlgorithm       string        `json:"jwt_algorithm"`
+	JWTExpireHours     time.Duration `json:"jwt_expire_hours"`
+	LoginMaxAttempts   int           `json:"login_max_attempts"`
+	LoginAttemptWindow time.Duration `json:"login_attempt_window"`
+	LoginBackoffBase   time.Duration `json:"login_backoff_base"`
+	LoginBackoffMax    time.Duration `json:"login_backoff_max"`
+
+	// Browser access. Empty origins means same-origin only (no CORS headers).
+	CORSAllowedOrigins   []string `json:"cors_allowed_origins"`
+	CORSAllowCredentials bool     `json:"cors_allow_credentials"`
+
+	// Public model status embed resource limits.
+	PublicModelMaxBatch          int   `json:"public_model_max_batch"`
+	PublicModelMaxBodyBytes      int64 `json:"public_model_max_body_bytes"`
+	PublicModelRequestsPerMinute int   `json:"public_model_requests_per_minute"`
 
 	// NewAPI
-	NewAPIBaseURL string `json:"newapi_base_url"`
-	NewAPIKey     string `json:"newapi_api_key"`
+	NewAPIBaseURL         string `json:"newapi_base_url"`
+	NewAPIRedisDisabled   bool   `json:"newapi_redis_disabled"`
+	AllowUnsafeHardDelete bool   `json:"allow_unsafe_hard_delete"`
+	NewAPIKey             string `json:"newapi_api_key"`
 
 	// Logging
 	LogFile  string `json:"log_file"`
@@ -87,15 +105,30 @@ func Load() *Config {
 		RedisConnString: getEnvStr("REDIS_CONN_STRING", ""),
 
 		// Authentication
-		APIKey:         getEnvStr("API_KEY", ""),
-		AdminPassword:  getEnvStr("ADMIN_PASSWORD", ""),
-		JWTSecretKey:   getEnvStrMulti([]string{"JWT_SECRET_KEY", "JWT_SECRET"}, ""),
-		JWTAlgorithm:   "HS256",
-		JWTExpireHours: time.Duration(getEnvInt("JWT_EXPIRE_HOURS", 24)) * time.Hour,
+		APIKey:             getEnvStr("API_KEY", ""),
+		AdminPassword:      getEnvStr("ADMIN_PASSWORD", ""),
+		JWTSecretKey:       getEnvStrMulti([]string{"JWT_SECRET_KEY", "JWT_SECRET"}, ""),
+		JWTAlgorithm:       "HS256",
+		JWTExpireHours:     time.Duration(getEnvInt("JWT_EXPIRE_HOURS", 24)) * time.Hour,
+		LoginMaxAttempts:   getEnvInt("LOGIN_MAX_ATTEMPTS", 8),
+		LoginAttemptWindow: time.Duration(getEnvInt("LOGIN_ATTEMPT_WINDOW_SECONDS", 900)) * time.Second,
+		LoginBackoffBase:   time.Duration(getEnvInt("LOGIN_BACKOFF_BASE_MS", 500)) * time.Millisecond,
+		LoginBackoffMax:    time.Duration(getEnvInt("LOGIN_BACKOFF_MAX_SECONDS", 30)) * time.Second,
+
+		// CORS is disabled by default. Configure exact trusted origins explicitly.
+		CORSAllowedOrigins:   getEnvCSV("CORS_ALLOWED_ORIGINS"),
+		CORSAllowCredentials: getEnvBool("CORS_ALLOW_CREDENTIALS", false),
+
+		// Public model-status embed limits.
+		PublicModelMaxBatch:          getEnvInt("PUBLIC_MODEL_MAX_BATCH", 50),
+		PublicModelMaxBodyBytes:      int64(getEnvInt("PUBLIC_MODEL_MAX_BODY_BYTES", 16*1024)),
+		PublicModelRequestsPerMinute: getEnvInt("PUBLIC_MODEL_REQUESTS_PER_MINUTE", 30),
 
 		// NewAPI
-		NewAPIBaseURL: getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
-		NewAPIKey:     getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
+		NewAPIBaseURL:         getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
+		NewAPIRedisDisabled:   getEnvBool("NEWAPI_REDIS_DISABLED", false),
+		AllowUnsafeHardDelete: getEnvBool("ALLOW_UNSAFE_HARD_DELETE", false),
+		NewAPIKey:             getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
 
 		// Logging
 		LogFile:  getEnvStr("LOG_FILE", ""),
@@ -132,6 +165,28 @@ func Load() *Config {
 	if cfg.JWTSecretKey == "" {
 		cfg.JWTSecretKey = generateRandomSecret(32)
 		log.Warn().Msg("JWT_SECRET_KEY 未配置，已自动生成随机密钥（重启后 token 将失效，建议显式配置）")
+	}
+
+	if cfg.LoginMaxAttempts < 1 {
+		cfg.LoginMaxAttempts = 8
+	}
+	if cfg.LoginAttemptWindow <= 0 {
+		cfg.LoginAttemptWindow = 15 * time.Minute
+	}
+	if cfg.LoginBackoffBase <= 0 {
+		cfg.LoginBackoffBase = 500 * time.Millisecond
+	}
+	if cfg.LoginBackoffMax < cfg.LoginBackoffBase {
+		cfg.LoginBackoffMax = 30 * time.Second
+	}
+	if cfg.PublicModelMaxBatch < 1 || cfg.PublicModelMaxBatch > 200 {
+		cfg.PublicModelMaxBatch = 50
+	}
+	if cfg.PublicModelMaxBodyBytes < 1024 || cfg.PublicModelMaxBodyBytes > 1<<20 {
+		cfg.PublicModelMaxBodyBytes = 16 * 1024
+	}
+	if cfg.PublicModelRequestsPerMinute < 1 || cfg.PublicModelRequestsPerMinute > 600 {
+		cfg.PublicModelRequestsPerMinute = 30
 	}
 
 	// Set timezone
@@ -201,6 +256,12 @@ func Get() *Config {
 	return cfg
 }
 
+// GetOptional returns the loaded configuration, or nil in isolated unit tests
+// that only install a database manager.
+func GetOptional() *Config {
+	return cfg
+}
+
 // detectEngine determines the database engine from DSN format
 func detectEngine(dsn string) DatabaseEngine {
 	if dsn == "" {
@@ -233,14 +294,7 @@ func detectEngine(dsn string) DatabaseEngine {
 
 // DSN returns a driver-compatible DSN string
 func (c *Config) DSN() string {
-	dsn := c.SQLDSN
-
-	// Strip protocol prefix if present
-	if strings.HasPrefix(dsn, "mysql://") {
-		dsn = strings.TrimPrefix(dsn, "mysql://")
-	}
-
-	return dsn
+	return normalizeMySQLURLDSN(c.SQLDSN)
 }
 
 // DriverName returns the database driver name for sqlx
@@ -266,10 +320,39 @@ func (c *Config) LogDSN() string {
 	if dsn == "" {
 		return c.DSN()
 	}
-	if strings.HasPrefix(dsn, "mysql://") {
-		dsn = strings.TrimPrefix(dsn, "mysql://")
+	return normalizeMySQLURLDSN(dsn)
+}
+
+func normalizeMySQLURLDSN(dsn string) string {
+	if !strings.HasPrefix(strings.ToLower(dsn), "mysql://") {
+		return dsn
 	}
-	return dsn
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Hostname() == "" || parsed.Fragment != "" {
+		return dsn
+	}
+	dbName, err := url.PathUnescape(strings.TrimPrefix(parsed.EscapedPath(), "/"))
+	if err != nil || dbName == "" || strings.Contains(dbName, "/") {
+		return dsn
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "3306"
+	}
+
+	config := mysqlDriver.NewConfig()
+	if parsed.User != nil {
+		config.User = parsed.User.Username()
+		config.Passwd, _ = parsed.User.Password()
+	}
+	config.Net = "tcp"
+	config.Addr = net.JoinHostPort(parsed.Hostname(), port)
+	config.DBName = dbName
+	normalized := config.FormatDSN()
+	if parsed.RawQuery != "" {
+		normalized += "?" + parsed.RawQuery
+	}
+	return normalized
 }
 
 // LogDriverName returns the database driver name for the log database.
@@ -315,6 +398,28 @@ func getEnvBool(key string, defaultVal bool) bool {
 		}
 	}
 	return defaultVal
+}
+
+func getEnvCSV(key string) []string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, exists := seen[part]; exists {
+			continue
+		}
+		seen[part] = struct{}{}
+		result = append(result, part)
+	}
+	return result
 }
 
 // getEnvStrMulti tries multiple env var keys in order, returns first found or default

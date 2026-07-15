@@ -52,8 +52,9 @@ func (s *LogAnalyticsService) GetAnalyticsState() map[string]interface{} {
 // GetUserRequestRanking returns top users by request count
 func (s *LogAnalyticsService) GetUserRequestRanking(limit int) ([]map[string]interface{}, error) {
 	cm := cache.Get()
+	cacheKey := fmt.Sprintf("analytics:user_request_ranking:%d", limit)
 	var cached []map[string]interface{}
-	found, _ := cm.GetJSON("analytics:user_request_ranking", &cached)
+	found, _ := cm.GetJSON(cacheKey, &cached)
 	if found && len(cached) > 0 {
 		if limit > 0 && limit < len(cached) {
 			return cached[:limit], nil
@@ -63,9 +64,11 @@ func (s *LogAnalyticsService) GetUserRequestRanking(limit int) ([]map[string]int
 
 	var rows []map[string]interface{}
 	var err error
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
 
 	if IsQuotaDataAvailable() {
-		// Fast path: aggregate from quota_data
+		// Fast path: aggregate the same 30-day successful-request window as
+		// the logs fallback. Coverage is validated by IsQuotaDataAvailable.
 		query := s.db.RebindQuery(`
 			SELECT q.user_id,
 				COALESCE(u.username, '') as username,
@@ -73,21 +76,20 @@ func (s *LogAnalyticsService) GetUserRequestRanking(limit int) ([]map[string]int
 				COALESCE(SUM(q.quota), 0) as quota_used
 			FROM quota_data q
 			LEFT JOIN users u ON q.user_id = u.id
-			WHERE q.user_id > 0
+			WHERE q.user_id > 0 AND q.created_at >= ?
 			GROUP BY q.user_id, u.username
 			ORDER BY request_count DESC
 			LIMIT ?`)
-		rows, err = s.db.QueryWithTimeout(30*time.Second, query, limit)
+		rows, err = s.db.QueryWithTimeout(30*time.Second, query, thirtyDaysAgo, limit)
 	} else {
-		// Fallback: scan logs with 30-day filter
-		thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
+		// Fallback: count successful client requests in the same 30-day window.
 		query := s.logDB.RebindQuery(`
 			SELECT l.user_id,
 				COALESCE(l.username, '') as username,
 				COUNT(*) as request_count,
 				COALESCE(SUM(l.quota), 0) as quota_used
 			FROM logs l
-			WHERE l.type IN (2, 5) AND l.user_id > 0 AND l.created_at >= ?
+			WHERE l.type = 2 AND l.user_id > 0 AND l.created_at >= ?
 			GROUP BY l.user_id, l.username
 			ORDER BY request_count DESC
 			LIMIT ?`)
@@ -97,15 +99,16 @@ func (s *LogAnalyticsService) GetUserRequestRanking(limit int) ([]map[string]int
 		return nil, err
 	}
 
-	cm.Set("analytics:user_request_ranking", rows, 5*time.Minute)
+	cm.Set(cacheKey, rows, 5*time.Minute)
 	return rows, nil
 }
 
 // GetUserQuotaRanking returns top users by quota consumption
 func (s *LogAnalyticsService) GetUserQuotaRanking(limit int) ([]map[string]interface{}, error) {
 	cm := cache.Get()
+	cacheKey := fmt.Sprintf("analytics:user_quota_ranking:%d", limit)
 	var cached []map[string]interface{}
-	found, _ := cm.GetJSON("analytics:user_quota_ranking", &cached)
+	found, _ := cm.GetJSON(cacheKey, &cached)
 	if found && len(cached) > 0 {
 		if limit > 0 && limit < len(cached) {
 			return cached[:limit], nil
@@ -115,6 +118,7 @@ func (s *LogAnalyticsService) GetUserQuotaRanking(limit int) ([]map[string]inter
 
 	var rows []map[string]interface{}
 	var err error
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
 
 	if IsQuotaDataAvailable() {
 		query := s.db.RebindQuery(`
@@ -124,20 +128,19 @@ func (s *LogAnalyticsService) GetUserQuotaRanking(limit int) ([]map[string]inter
 				COALESCE(SUM(q.quota), 0) as quota_used
 			FROM quota_data q
 			LEFT JOIN users u ON q.user_id = u.id
-			WHERE q.user_id > 0
+			WHERE q.user_id > 0 AND q.created_at >= ?
 			GROUP BY q.user_id, u.username
 			ORDER BY quota_used DESC
 			LIMIT ?`)
-		rows, err = s.db.QueryWithTimeout(30*time.Second, query, limit)
+		rows, err = s.db.QueryWithTimeout(30*time.Second, query, thirtyDaysAgo, limit)
 	} else {
-		thirtyDaysAgo := time.Now().AddDate(0, 0, -30).Unix()
 		query := s.logDB.RebindQuery(`
 			SELECT l.user_id,
 				COALESCE(l.username, '') as username,
 				COUNT(*) as request_count,
 				COALESCE(SUM(l.quota), 0) as quota_used
 			FROM logs l
-			WHERE l.type IN (2, 5) AND l.user_id > 0 AND l.created_at >= ?
+			WHERE l.type = 2 AND l.user_id > 0 AND l.created_at >= ?
 			GROUP BY l.user_id, l.username
 			ORDER BY quota_used DESC
 			LIMIT ?`)
@@ -147,15 +150,16 @@ func (s *LogAnalyticsService) GetUserQuotaRanking(limit int) ([]map[string]inter
 		return nil, err
 	}
 
-	cm.Set("analytics:user_quota_ranking", rows, 5*time.Minute)
+	cm.Set(cacheKey, rows, 5*time.Minute)
 	return rows, nil
 }
 
 // GetModelStatistics returns model usage statistics with success_rate and empty_rate
 func (s *LogAnalyticsService) GetModelStatistics(limit int) ([]map[string]interface{}, error) {
 	cm := cache.Get()
+	cacheKey := fmt.Sprintf("analytics:model_statistics:%d", limit)
 	var cached []map[string]interface{}
-	found, _ := cm.GetJSON("analytics:model_statistics", &cached)
+	found, _ := cm.GetJSON(cacheKey, &cached)
 	if found && len(cached) > 0 {
 		if limit > 0 && limit < len(cached) {
 			return cached[:limit], nil
@@ -200,7 +204,7 @@ func (s *LogAnalyticsService) GetModelStatistics(limit int) ([]map[string]interf
 		row["empty_rate"] = math.Round(emptyRate*100) / 100
 	}
 
-	cm.Set("analytics:model_statistics", rows, 5*time.Minute)
+	cm.Set(cacheKey, rows, 5*time.Minute)
 	return rows, nil
 }
 
@@ -336,9 +340,9 @@ func (s *LogAnalyticsService) CheckDataConsistency(autoReset bool) (map[string]i
 func (s *LogAnalyticsService) clearAllCaches() {
 	cm := cache.Get()
 	cm.Delete("analytics:state")
-	cm.Delete("analytics:user_request_ranking")
-	cm.Delete("analytics:user_quota_ranking")
-	cm.Delete("analytics:model_statistics")
+	_, _ = cm.DeleteByPrefix("analytics:user_request_ranking:")
+	_, _ = cm.DeleteByPrefix("analytics:user_quota_ranking:")
+	_, _ = cm.DeleteByPrefix("analytics:model_statistics:")
 	cm.Delete(analyticsStatePrefix)
 }
 

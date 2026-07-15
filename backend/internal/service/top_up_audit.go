@@ -50,7 +50,7 @@ type TopUpAuditSummary struct {
 	Pending30m             int64 `json:"pending_30m"`
 	Pending2h              int64 `json:"pending_2h"`
 	Pending24h             int64 `json:"pending_24h"`
-	SuccessMissingComplete int64 `json:"success_missing_complete"`
+	SuccessMissingComplete int64 `json:"success_missing_complete"` // Deprecated: kept as zero for compatibility; NewAPI Epay success may omit complete_time.
 	CompleteBeforeCreate   int64 `json:"complete_before_create"`
 	InvalidMoney           int64 `json:"invalid_money"`
 	InvalidAmount          int64 `json:"invalid_amount"`

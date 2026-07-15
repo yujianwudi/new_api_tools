@@ -8,6 +8,7 @@
 services:
   newapi-tools:
     networks:
+      - default
       - log-db-network
 
 networks:

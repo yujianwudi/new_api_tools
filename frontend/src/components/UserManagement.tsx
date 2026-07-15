@@ -291,7 +291,7 @@ export function UserManagement() {
       hardDelete: true,
       requireConfirmText: true,
       confirmText: HARD_DELETE_CONFIRM_TEXT,
-      onConfirm: () => executePurgeSoftDeleted(),
+      onConfirm: () => undefined,
     })
 
     try {
@@ -304,6 +304,7 @@ export function UserManagement() {
       if (data.success && data.data) {
         const count = data.data.count ?? data.data.affected_count ?? data.data.affected ?? 0
         const usernames = Array.isArray(data.data.users) ? data.data.users : []
+        const snapshotId = typeof data.data.snapshot_id === 'string' ? data.data.snapshot_id : ''
         if (count === 0) {
           setConfirmDialog(prev => ({ ...prev, isOpen: false }))
           showToast('info', '没有需要清理的软删除用户')
@@ -311,9 +312,10 @@ export function UserManagement() {
         }
         setConfirmDialog(prev => ({
           ...prev,
-          message: `确定要彻底清理 ${count} 个已软删除的用户吗？\n\n⚠️ 这些用户之前已被软删除，此操作将永久移除他们及所有关联数据，不可恢复！`,
+          message: `确定要永久清理 ${count} 个已软删除的用户吗？\n\n⚠️ 这是默认禁用的兼容写库路径，只会清理本工具已覆盖的用户和令牌数据，可能遗留 2FA、Passkey、OAuth 绑定等认证记录。请优先在 NewAPI 后台完成永久删除。`,
           details: { count, users: usernames },
           loading: false,
+          onConfirm: () => executePurgeSoftDeleted(snapshotId),
         }))
       } else {
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -327,14 +329,14 @@ export function UserManagement() {
   }
 
   // 执行清理软删除用户
-  const executePurgeSoftDeleted = async () => {
+  const executePurgeSoftDeleted = async (snapshotId: string) => {
     setConfirmDialog(prev => ({ ...prev, isOpen: false }))
     setPurgingSoftDeleted(true)
     try {
       const response = await fetch(`${apiUrl}/api/users/soft-deleted/purge`, {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify({ dry_run: false, confirm_text: HARD_DELETE_CONFIRM_TEXT }),
+        body: JSON.stringify({ dry_run: false, confirm_text: HARD_DELETE_CONFIRM_TEXT, snapshot_id: snapshotId }),
       })
       const data = await response.json()
       if (data.success) {
@@ -506,13 +508,20 @@ export function UserManagement() {
         }
         // 更新弹窗内容
         const warningText = hardDelete
-          ? `⚠️ 彻底删除将永久移除用户及所有关联数据（令牌、配额、任务等），此操作不可恢复！`
+          ? `⚠️ 兼容硬删除默认禁用，只会清理已覆盖的用户和令牌数据，可能遗留 2FA、Passkey、OAuth 绑定等认证记录。请优先使用 NewAPI 后台删除。`
           : `此操作为注销（软删除），数据可通过数据库恢复。`
+        const snapshotId = typeof data.data.snapshot_id === 'string' ? data.data.snapshot_id : ''
+        if (!snapshotId) {
+          setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+          showToast('error', '预览未返回安全快照，请重试')
+          return
+        }
         setConfirmDialog(prev => ({
           ...prev,
           message: `确定要${actionLabel} ${count} 个${levelLabel}的用户吗？\n\n${warningText}`,
           details: { count, users: usernames },
           loading: false,
+          onConfirm: () => executeBatchDelete(level, hardDelete, snapshotId),
         }))
       } else {
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -525,7 +534,7 @@ export function UserManagement() {
     }
   }
 
-  const executeBatchDelete = async (level: string, hardDelete: boolean = false) => {
+  const executeBatchDelete = async (level: string, hardDelete: boolean = false, snapshotId = '') => {
     setConfirmDialog(prev => ({ ...prev, isOpen: false }))
     const setLoading = level === 'very_inactive' ? setDeletingVeryInactive : setDeletingNever
     setLoading(true)
@@ -537,6 +546,7 @@ export function UserManagement() {
           activity_level: level,
           dry_run: false,
           hard_delete: hardDelete,
+          snapshot_id: snapshotId,
           confirm_text: hardDelete ? HARD_DELETE_CONFIRM_TEXT : SOFT_DELETE_CONFIRM_TEXT,
         }),
       })
@@ -774,7 +784,7 @@ export function UserManagement() {
                 </div>
                 <div>
                   <h3 className="font-medium text-orange-800 dark:text-orange-200">批量注销不活跃用户</h3>
-                  <p className="text-sm text-orange-600 dark:text-orange-400">注销：数据保留可恢复 | 彻底删除：永久移除不可恢复</p>
+                  <p className="text-sm text-orange-600 dark:text-orange-400">注销：数据保留可恢复 | 兼容硬删除：默认禁用，优先使用 NewAPI 后台</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -808,8 +818,8 @@ export function UserManagement() {
                     <AlertTriangle className="h-5 w-5 text-red-600 dark:text-red-400" />
                   </div>
                   <div>
-                    <h3 className="font-medium text-red-800 dark:text-red-200">彻底删除（危险操作）</h3>
-                    <p className="text-sm text-red-600 dark:text-red-400">永久删除用户及所有关联数据，包括令牌、配额、任务等</p>
+                    <h3 className="font-medium text-red-800 dark:text-red-200">兼容硬删除（默认禁用）</h3>
+                    <p className="text-sm text-red-600 dark:text-red-400">仅清理已覆盖的用户与令牌数据，可能遗留认证绑定；请优先使用 NewAPI 后台</p>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -1213,8 +1223,8 @@ export function UserManagement() {
                     className="mt-1"
                   />
                   <div>
-                    <div className="font-medium text-red-600 dark:text-red-400">彻底删除</div>
-                    <div className="text-sm text-muted-foreground">永久删除用户及所有关联数据（令牌、配额等），不可恢复！</div>
+                    <div className="font-medium text-red-600 dark:text-red-400">兼容硬删除（默认禁用）</div>
+                    <div className="text-sm text-muted-foreground">只清理已覆盖的用户与令牌数据，可能遗留 2FA、Passkey、OAuth 绑定；请优先使用 NewAPI 后台。</div>
                   </div>
                 </label>
               </div>

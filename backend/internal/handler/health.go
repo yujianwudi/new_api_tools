@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/models"
 )
 
@@ -29,12 +30,13 @@ func DatabaseHealthCheck(c *gin.Context) {
 	db := database.Get()
 
 	if err := db.Ping(); err != nil {
+		logger.L.DBError("Database health check failed: " + err.Error())
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"success": false,
 			"status":  "disconnected",
 			"error": gin.H{
 				"code":    "DB_CONNECTION_FAILED",
-				"message": err.Error(),
+				"message": "Database connection unavailable",
 			},
 		})
 		return

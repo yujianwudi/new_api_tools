@@ -10,7 +10,7 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: 构建前端
-FROM node:20-alpine AS frontend-builder
+FROM node:22-alpine3.23 AS frontend-builder
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -19,7 +19,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: 构建 Go 后端
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS backend-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23 AS backend-builder
 ARG TARGETARCH
 WORKDIR /build
 RUN apk add --no-cache git ca-certificates tzdata
@@ -39,13 +39,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     ./cmd/server
 
 # Stage 3: 最终镜像 (Nginx + Go binary)
-FROM alpine:3.19
+FROM alpine:3.23.5
 WORKDIR /app
 
 # 安装 Nginx 和运行时依赖
 RUN apk add --no-cache \
     nginx \
     supervisor \
+    su-exec \
     curl \
     ca-certificates \
     tzdata
@@ -53,8 +54,13 @@ RUN apk add --no-cache \
 # 复制 Go 二进制
 COPY --from=backend-builder /build/server /app/server
 
-# 创建数据目录
-RUN mkdir -p /app/data/geoip && chmod 755 /app/data
+# 创建低权限运行用户和数据目录。Supervisor 仅负责启动，Nginx/Go 进程均降权运行。
+RUN addgroup -S -g 10001 appgroup && \
+    adduser -S -D -H -u 10001 -G appgroup -s /sbin/nologin appuser && \
+    mkdir -p /app/data/geoip /run/nginx && \
+    chown -R appuser:appgroup /app && \
+    chown -R nginx:nginx /run/nginx /var/lib/nginx /var/log/nginx && \
+    chmod 755 /app/data
 
 # 预下载 GeoIP 数据库（多镜像源，任一成功即可；失败不阻塞构建，运行时会自动重试）
 # 注意: docker-compose 挂载 ./data:/app/data 时，此预下载文件会被覆盖
@@ -70,6 +76,8 @@ RUN curl -sL --connect-timeout 30 --max-time 120 \
     "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb" \
     || echo "[GeoIP] Build-time download failed, will auto-download at runtime"
 
+RUN chown -R appuser:appgroup /app/data
+
 # 复制前端构建产物
 COPY --from=frontend-builder /app/dist /usr/share/nginx/html
 
@@ -83,15 +91,16 @@ RUN sed -i 's|http://backend:8000|http://127.0.0.1:8000|g' /etc/nginx/http.d/def
 RUN mkdir -p /etc/supervisor.d && \
     echo -e '[supervisord]\nnodaemon=true\nuser=root\n\n\
 [program:nginx]\ncommand=/usr/sbin/nginx -g "daemon off;"\nautostart=true\nautorestart=true\n\
+user=nginx\n\
 stdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\n\
 stderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\n\n\
-[program:backend]\ncommand=/app/server\ndirectory=/app\nautostart=true\nautorestart=true\n\
+[program:backend]\ncommand=/bin/sh -c "chown -R appuser:appgroup /app/data && exec su-exec appuser /app/server"\ndirectory=/app\nautostart=true\nautorestart=true\n\
 stdout_logfile=/dev/stdout\nstdout_logfile_maxbytes=0\n\
 stderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\n' > /etc/supervisord.conf
 
-EXPOSE 80
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost/api/health || exit 1
+    CMD curl --fail --silent --show-error http://localhost:8080/api/health || exit 1
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

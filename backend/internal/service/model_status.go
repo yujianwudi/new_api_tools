@@ -14,7 +14,7 @@ import (
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
 	DefaultTimeWindow    = "24h"
-	AvailableThemes = []string{
+	AvailableThemes      = []string{
 		"daylight", "obsidian", "minimal", "neon", "forest", "ocean", "terminal",
 		"cupertino", "material", "openai", "anthropic", "vercel", "linear",
 		"stripe", "github", "discord", "tesla",
@@ -48,7 +48,7 @@ var timeWindowConfigs = map[string]timeWindowConfig{
 // getStatusColor determines status color based on success rate (matches Python backend)
 func getStatusColor(successRate float64, totalRequests int64) string {
 	if totalRequests == 0 {
-		return "green" // No requests = no issues
+		return "unknown"
 	}
 	if successRate >= 95 {
 		return "green"
@@ -145,7 +145,10 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		startTime, slotSeconds,
 		startTime, slotSeconds))
 
-	rows, _ := s.logDB.Query(slotQuery, modelName, startTime, now)
+	rows, err := s.logDB.Query(slotQuery, modelName, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("query model status slots: %w", err)
+	}
 
 	// Initialize all slots with zeros
 	type slotInfo struct {
@@ -194,7 +197,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			slotEmpty = si.empty
 		}
 
-		slotRate := float64(100)
+		slotRate := float64(0)
 		if slotTotal > 0 {
 			slotRate = float64(slotSuccess) / float64(slotTotal) * 100
 		}
@@ -217,7 +220,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		totalEmpty += slotEmpty
 	}
 
-	overallRate := float64(100)
+	overallRate := float64(0)
 	if totalReqs > 0 {
 		overallRate = float64(totalSuccess) / float64(totalReqs) * 100
 	}
@@ -245,7 +248,7 @@ func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window
 	for _, name := range modelNames {
 		status, err := s.GetModelStatus(name, window)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("query model %q status: %w", name, err)
 		}
 		results = append(results, status)
 	}

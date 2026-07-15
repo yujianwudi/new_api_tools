@@ -137,6 +137,7 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 		DryRun        bool   `json:"dry_run"`
 		HardDelete    bool   `json:"hard_delete"`
 		ConfirmText   string `json:"confirm_text"`
+		SnapshotID    string `json:"snapshot_id"`
 	}
 	req.ActivityLevel = "very_inactive"
 	req.DryRun = true
@@ -157,7 +158,7 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 	}
 
 	svc := service.NewUserManagementService()
-	result, err := svc.BatchDeleteInactiveUsers(req.ActivityLevel, req.DryRun, req.HardDelete)
+	result, err := svc.BatchDeleteInactiveUsers(req.ActivityLevel, req.DryRun, req.HardDelete, req.SnapshotID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
 		return
@@ -182,11 +183,20 @@ func PurgeSoftDeletedUsers(c *gin.Context) {
 	var req struct {
 		DryRun      bool   `json:"dry_run"`
 		ConfirmText string `json:"confirm_text"`
+		SnapshotID  string `json:"snapshot_id"`
 	}
 	req.DryRun = true
 	c.ShouldBindJSON(&req)
 
 	if !req.DryRun && !requireDeleteConfirmText(c, req.ConfirmText, confirmTextHardDelete) {
+		return
+	}
+	if !req.DryRun && strings.TrimSpace(req.SnapshotID) == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResp(
+			"SNAPSHOT_REQUIRED",
+			"永久清理前必须重新预览并提交一次性快照",
+			"",
+		))
 		return
 	}
 
@@ -205,7 +215,7 @@ func PurgeSoftDeletedUsers(c *gin.Context) {
 		return
 	}
 
-	affected, err := svc.PurgeSoftDeleted(req.DryRun)
+	affected, err := svc.PurgeSoftDeleted(req.SnapshotID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
 		return
