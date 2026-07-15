@@ -262,22 +262,22 @@ export function RealtimeRanking() {
   const IP_REFRESH_KEY = 'risk_ip_refresh_interval'
   const [refreshInterval, setRefreshInterval] = useState(() => {
     const saved = localStorage.getItem(LEADERBOARD_REFRESH_KEY)
-    return saved ? parseInt(saved, 10) : 60
+    return saved !== null ? parseInt(saved, 10) : 60
   })
   const [countdown, setCountdown] = useState(() => {
     const saved = localStorage.getItem(LEADERBOARD_REFRESH_KEY)
-    return saved ? parseInt(saved, 10) : 60
+    return saved !== null ? parseInt(saved, 10) : 60
   })
   const [systemScale, setSystemScale] = useState<string>('')  // 系统规模
 
   // IP 监控刷新间隔
   const [ipRefreshInterval, setIpRefreshInterval] = useState(() => {
     const saved = localStorage.getItem(IP_REFRESH_KEY)
-    return saved ? parseInt(saved, 10) : 60
+    return saved !== null ? parseInt(saved, 10) : 60
   })
   const [ipCountdown, setIpCountdown] = useState(() => {
     const saved = localStorage.getItem(IP_REFRESH_KEY)
-    return saved ? parseInt(saved, 10) : 60
+    return saved !== null ? parseInt(saved, 10) : 60
   })
 
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -358,8 +358,7 @@ export function RealtimeRanking() {
     displayName?: string
     reason: string
     disableTokens: boolean
-    enableTokens: boolean
-  }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true, enableTokens: false })
+  }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true })
 
   // AI 自动封禁状态
   const [aiConfig, setAiConfig] = useState<{
@@ -533,11 +532,11 @@ export function RealtimeRanking() {
         const savedLeaderboard = localStorage.getItem(LEADERBOARD_REFRESH_KEY)
         const savedIp = localStorage.getItem(IP_REFRESH_KEY)
 
-        if (!savedLeaderboard) {
+        if (savedLeaderboard === null) {
           setRefreshInterval(interval)
           setCountdown(interval)
         }
-        if (!savedIp) {
+        if (savedIp === null) {
           setIpRefreshInterval(interval)
           setIpCountdown(interval)
         }
@@ -558,12 +557,11 @@ export function RealtimeRanking() {
   const handleRefreshIntervalChange = useCallback((val: number) => {
     setRefreshInterval(val)
     setCountdown(val)
+    localStorage.setItem(LEADERBOARD_REFRESH_KEY, val.toString())
     if (val > 0) {
-      localStorage.setItem(LEADERBOARD_REFRESH_KEY, val.toString())
       const label = val >= 60 ? `${val / 60}分钟` : `${val}秒`
       showToast('success', `排行榜自动刷新已设置为 ${label}`)
     } else {
-      localStorage.removeItem(LEADERBOARD_REFRESH_KEY)
       showToast('info', '排行榜自动刷新已关闭')
     }
   }, [showToast])
@@ -571,12 +569,11 @@ export function RealtimeRanking() {
   const handleIpRefreshIntervalChange = useCallback((val: number) => {
     setIpRefreshInterval(val)
     setIpCountdown(val)
+    localStorage.setItem(IP_REFRESH_KEY, val.toString())
     if (val > 0) {
-      localStorage.setItem(IP_REFRESH_KEY, val.toString())
       const label = val >= 60 ? `${val / 60}分钟` : `${val}秒`
       showToast('success', `IP监控自动刷新已设置为 ${label}`)
     } else {
-      localStorage.removeItem(IP_REFRESH_KEY)
       showToast('info', 'IP监控自动刷新已关闭')
     }
   }, [showToast])
@@ -2049,7 +2046,6 @@ export function RealtimeRanking() {
                                         displayName: user.display_name || undefined,
                                         reason: '',
                                         disableTokens: false,
-                                        enableTokens: true,
                                       })
                                     }}
                                   >
@@ -3548,7 +3544,6 @@ export function RealtimeRanking() {
                           username: aiAssessResult.username,
                           reason: `[AI建议] ${aiAssessResult.assessment.reason}`,
                           disableTokens: true,
-                          enableTokens: false,
                         })
                       }}
                     >
@@ -4286,18 +4281,22 @@ export function RealtimeRanking() {
               </Select>
             </div>
 
-            <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
-              <input
-                type="checkbox"
-                checked={banConfirmDialog.type === 'ban' ? banConfirmDialog.disableTokens : banConfirmDialog.enableTokens}
-                onChange={(e) => banConfirmDialog.type === 'ban'
-                  ? setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))
-                  : setBanConfirmDialog(prev => ({ ...prev, enableTokens: e.target.checked }))
-                }
-                className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-              />
-              {banConfirmDialog.type === 'ban' ? '同时禁用该用户所有令牌' : '同时启用该用户所有令牌'}
-            </label>
+            {banConfirmDialog.type === 'ban' ? (
+              <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
+                <input
+                  type="checkbox"
+                  checked={banConfirmDialog.disableTokens}
+                  onChange={(e) => setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))}
+                  className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+                />
+                同时禁用该用户所有令牌
+              </label>
+            ) : (
+              <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+                <span>解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。</span>
+              </div>
+            )}
           </div>
 
           <DialogFooter className="gap-2 sm:gap-0 mt-2">
@@ -4364,7 +4363,6 @@ export function RealtimeRanking() {
                       headers: getAuthHeaders(),
                       body: JSON.stringify({
                         reason: banConfirmDialog.reason || null,
-                        enable_tokens: banConfirmDialog.enableTokens,
                         context: {
                           source: 'risk_center',
                         },

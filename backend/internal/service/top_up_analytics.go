@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -340,13 +341,17 @@ func topUpTrendsMonthly(startTs, endTs int64) ([]TopUpTrendPoint, error) {
 
 		if queryStart <= queryEnd {
 			row, err := db.QueryOneWithTimeout(10*time.Second, query, queryStart, queryEnd)
-			if err == nil && row != nil {
-				point.Count = toInt64(row["total_count"])
-				point.Money = toFloat64(row["total_money"])
-				point.Amount = toInt64(row["total_amount"])
-				point.SuccessCount = toInt64(row["success_count"])
-				point.SuccessMoney = toFloat64(row["success_money"])
+			if err != nil {
+				return nil, fmt.Errorf("top-up monthly trend query for %s failed: %w", point.Date, err)
 			}
+			if row == nil {
+				return nil, fmt.Errorf("top-up monthly trend query for %s returned no row", point.Date)
+			}
+			point.Count = toInt64(row["total_count"])
+			point.Money = toFloat64(row["total_money"])
+			point.Amount = toInt64(row["total_amount"])
+			point.SuccessCount = toInt64(row["success_count"])
+			point.SuccessMoney = toFloat64(row["success_money"])
 		}
 
 		result = append(result, point)
@@ -390,7 +395,10 @@ func GetTopUpFinancialSummary(months int) ([]TopUpFinancialSummary, error) {
 
 		row, err := db.QueryOneWithTimeout(10*time.Second, query, startTs, endTs)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("top-up financial summary query for %s failed: %w", monthStart.Format("2006-01"), err)
+		}
+		if row == nil {
+			return nil, fmt.Errorf("top-up financial summary query for %s returned no row", monthStart.Format("2006-01"))
 		}
 
 		totalCount := toInt64(row["total_count"])
@@ -608,32 +616,33 @@ func GetTopUpRealtimeStats() (*TopUpRealtimeStats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("realtime stats query failed: %w", err)
 	}
+	if row == nil {
+		return nil, errors.New("realtime stats query returned no row")
+	}
 
 	stats := &TopUpRealtimeStats{}
-	if row != nil {
-		stats.TodayMoney = math.Round(toFloat64(row["today_money"])*100) / 100
-		stats.TodayCount = toInt64(row["today_count"])
-		stats.YesterdayMoney = math.Round(toFloat64(row["yesterday_money"])*100) / 100
-		stats.YesterdayCount = toInt64(row["yesterday_count"])
-		stats.WeekMoney = math.Round(toFloat64(row["week_money"])*100) / 100
-		stats.WeekCount = toInt64(row["week_count"])
-		stats.LastWeekMoney = math.Round(toFloat64(row["last_week_money"])*100) / 100
-		stats.LastWeekCount = toInt64(row["last_week_count"])
-		stats.MonthMoney = math.Round(toFloat64(row["month_money"])*100) / 100
-		stats.MonthCount = toInt64(row["month_count"])
-		stats.LastMonthMoney = math.Round(toFloat64(row["last_month_money"])*100) / 100
-		stats.LastMonthCount = toInt64(row["last_month_count"])
+	stats.TodayMoney = math.Round(toFloat64(row["today_money"])*100) / 100
+	stats.TodayCount = toInt64(row["today_count"])
+	stats.YesterdayMoney = math.Round(toFloat64(row["yesterday_money"])*100) / 100
+	stats.YesterdayCount = toInt64(row["yesterday_count"])
+	stats.WeekMoney = math.Round(toFloat64(row["week_money"])*100) / 100
+	stats.WeekCount = toInt64(row["week_count"])
+	stats.LastWeekMoney = math.Round(toFloat64(row["last_week_money"])*100) / 100
+	stats.LastWeekCount = toInt64(row["last_week_count"])
+	stats.MonthMoney = math.Round(toFloat64(row["month_money"])*100) / 100
+	stats.MonthCount = toInt64(row["month_count"])
+	stats.LastMonthMoney = math.Round(toFloat64(row["last_month_money"])*100) / 100
+	stats.LastMonthCount = toInt64(row["last_month_count"])
 
-		// Calculate growth rates
-		if stats.YesterdayMoney > 0 {
-			stats.DayGrowth = math.Round((stats.TodayMoney-stats.YesterdayMoney)/stats.YesterdayMoney*10000) / 100
-		}
-		if stats.LastWeekMoney > 0 {
-			stats.WeekGrowth = math.Round((stats.WeekMoney-stats.LastWeekMoney)/stats.LastWeekMoney*10000) / 100
-		}
-		if stats.LastMonthMoney > 0 {
-			stats.MonthGrowth = math.Round((stats.MonthMoney-stats.LastMonthMoney)/stats.LastMonthMoney*10000) / 100
-		}
+	// Calculate growth rates
+	if stats.YesterdayMoney > 0 {
+		stats.DayGrowth = math.Round((stats.TodayMoney-stats.YesterdayMoney)/stats.YesterdayMoney*10000) / 100
+	}
+	if stats.LastWeekMoney > 0 {
+		stats.WeekGrowth = math.Round((stats.WeekMoney-stats.LastWeekMoney)/stats.LastWeekMoney*10000) / 100
+	}
+	if stats.LastMonthMoney > 0 {
+		stats.MonthGrowth = math.Round((stats.MonthMoney-stats.LastMonthMoney)/stats.LastMonthMoney*10000) / 100
 	}
 
 	cm.Set(cacheKey, stats, 2*time.Minute)
@@ -859,11 +868,14 @@ func GetTopUpFunnel(days int) (*TopUpFunnelData, error) {
 			AND complete_time >= create_time`,
 		avgCastExpr, successStatusCondition()))
 
-	avgRow, _ := db.QueryOneWithTimeout(10*time.Second, avgQuery, startTime)
-	avgSecs := float64(0)
-	if avgRow != nil {
-		avgSecs = math.Round(toFloat64(avgRow["avg_secs"])*100) / 100
+	avgRow, err := db.QueryOneWithTimeout(10*time.Second, avgQuery, startTime)
+	if err != nil {
+		return nil, fmt.Errorf("funnel average completion query failed: %w", err)
 	}
+	if avgRow == nil {
+		return nil, errors.New("funnel average completion query returned no row")
+	}
+	avgSecs := math.Round(toFloat64(avgRow["avg_secs"])*100) / 100
 
 	result := &TopUpFunnelData{
 		StatusBreakdown:   finalStatus,

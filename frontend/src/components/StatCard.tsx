@@ -36,13 +36,28 @@ export function StatCard({ title, value, subValue, icon: Icon, color, variant = 
   const theme = colorMap[color] || colorMap.blue
 
   // If onClick is provided, we want to treat this card as a button or interactive element
-  const interactiveClass = onClick ? "cursor-pointer active:scale-95 transition-transform" : ""
+  const interactiveClass = onClick
+    ? "cursor-pointer active:scale-95 transition-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+    : ""
+  const interactiveProps = onClick
+    ? {
+        role: 'button' as const,
+        tabIndex: 0,
+        onClick,
+        onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onClick()
+          }
+        },
+      }
+    : {}
 
   if (variant === 'compact') {
     return (
       <Card
         className={cn("glass-card overflow-hidden hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 group border-l-4", theme.border, interactiveClass, className)}
-        onClick={onClick}
+        {...interactiveProps}
       >
         <CardContent className="p-4 flex items-center justify-between relative overflow-hidden">
           <div className={cn("absolute -right-4 -top-4 w-16 h-16 rounded-full opacity-10 group-hover:opacity-20 transition-opacity duration-300 blur-xl", theme.bg.split(' ')[0])} />
@@ -61,7 +76,7 @@ export function StatCard({ title, value, subValue, icon: Icon, color, variant = 
   return (
     <Card
       className={cn("glass-card overflow-hidden hover:shadow-lg hover:-translate-y-1 transition-all duration-300 group", interactiveClass, className)}
-      onClick={onClick}
+      {...interactiveProps}
     >
       <CardContent className="p-5 relative overflow-hidden">
         <div className={cn("absolute -right-6 -top-6 w-24 h-24 rounded-full opacity-10 group-hover:opacity-20 transition-opacity duration-300 blur-2xl", theme.bg.split(' ')[0])} />

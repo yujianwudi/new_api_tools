@@ -7,8 +7,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NewAPI 兑换码生成器</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
         :root {
             --primary: #6366f1;
             --primary-hover: #4f46e5;
@@ -32,7 +30,7 @@
         }
 
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             background-color: var(--bg-color);
             color: var(--text-main);
             min-height: 100vh;
@@ -285,7 +283,7 @@
             box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
         }
         
-        input[type="number"] { font-family: 'JetBrains Mono', monospace; }
+        input[type="number"] { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
 
         input:hover {
             background: var(--surface-hover);
@@ -414,7 +412,7 @@
             font-weight: 500;
             cursor: pointer;
             transition: all 0.2s;
-            font-family: 'JetBrains Mono', sans-serif;
+            font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
         }
 
         .chip:hover {
@@ -539,7 +537,7 @@
             border-radius: 16px;
             padding: 20px;
             color: #a5b4fc; /* 代码高亮色 */
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
             font-size: 0.85rem;
             line-height: 1.7;
             resize: vertical;
@@ -576,7 +574,7 @@
         }
         
         .hint code {
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
             background: rgba(0, 0, 0, 0.3);
             padding: 2px 6px;
             border-radius: 4px;
@@ -678,7 +676,7 @@
             gap: 12px;
             font-size: 0.8rem;
             color: var(--text-muted);
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
             align-items: center;
         }
         
@@ -803,11 +801,11 @@
                         <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.778-7.778zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
                         </svg>
-                                            <input type="text" id="keyPrefix" placeholder="可选 (如 API)" oninput="handlePrefixInput(this)">
+                                            <input type="text" id="keyPrefix" maxlength="7" placeholder="可选 (如 api-)" oninput="handlePrefixInput(this)">
                                         </div>
                                         <div class="hint">
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
-                                            预览: <code id="keyPreview">API...</code> (32位唯一码)
+                                            预览: <code id="keyPreview">api-...</code> (32位唯一码)
                                         </div>                </div>
 
                 <!-- 数据库类型选择 -->
@@ -929,7 +927,7 @@
                                     <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <path d="M5 22h14"></path><path d="M5 2h14"></path><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"></path><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"></path>
                                     </svg>
-                                    <input type="number" id="expireDays" value="30" placeholder="有效天数">
+                                    <input type="number" id="expireDays" value="30" min="1" step="1" placeholder="有效天数">
                                 </div>
                                 <div class="chips">
                                     <div class="chip" onclick="setExpireDays(7)">7天</div>
@@ -1023,6 +1021,16 @@
     <script>
         let generatedKeys = [];
         const MAX_HISTORY = 20;
+        const GENERATED_KEY_LENGTH = 32;
+        const MIN_RANDOM_KEY_LENGTH = 25;
+        const MAX_KEY_PREFIX_LENGTH = GENERATED_KEY_LENGTH - MIN_RANDOM_KEY_LENGTH;
+        const KEY_RANDOM_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz';
+        const KEY_REJECTION_LIMIT = Math.floor(256 / KEY_RANDOM_ALPHABET.length) * KEY_RANDOM_ALPHABET.length;
+        const MAX_QUOTA_VALUE = 2147483647;
+        let redemptionHistory = [];
+        // v0.2.0 no longer persists bearer keys/SQL in localStorage. Remove
+        // legacy plaintext history left by earlier versions.
+        try { localStorage.removeItem('redemption_history'); } catch (_) {}
 
         // --- 视图切换逻辑 ---
         function switchMainView(viewName) {
@@ -1044,32 +1052,23 @@
         // --- 历史记录管理 ---
         const HistoryManager = {
             save: (record) => {
-                try {
-                    let history = JSON.parse(localStorage.getItem('redemption_history') || '[]');
-                    history.unshift(record);
-                    if (history.length > MAX_HISTORY) history.pop();
-                    localStorage.setItem('redemption_history', JSON.stringify(history));
-                    // 这里不需要立即 Render，因为如果在生成器视图，下次切换时会自动 Render
-                } catch (e) {
-                    console.error('Storage full or error', e);
-                    showToast('保存记录失败: 存储空间不足', 'error');
-                }
+                redemptionHistory.unshift(record);
+                if (redemptionHistory.length > MAX_HISTORY) redemptionHistory.pop();
+                // 敏感 Key/SQL 只保留在当前页面内存中，刷新或关闭页面即清除。
             },
             
             load: () => {
-                return JSON.parse(localStorage.getItem('redemption_history') || '[]');
+                return redemptionHistory;
             },
 
             clear: () => {
-                localStorage.removeItem('redemption_history');
+                redemptionHistory = [];
                 HistoryManager.render();
                 showToast('历史记录已清空');
             },
 
             delete: (id) => {
-                let history = HistoryManager.load();
-                history = history.filter(item => item.id !== id);
-                localStorage.setItem('redemption_history', JSON.stringify(history));
+                redemptionHistory = redemptionHistory.filter(item => item.id !== id);
                 HistoryManager.render();
                 showToast('记录已删除');
             },
@@ -1181,27 +1180,31 @@
         }
 
         // 核心生成逻辑
-        function generateRandomKey(prefix = '', targetLength = 32) {
-            const prefixLength = prefix.length;
-            const timestampLength = 8;
-            const counterLength = 4;
-            const randomLength = targetLength - prefixLength - timestampLength - counterLength;
+        function generateRandomKey(prefix = '') {
+            if (!/^[a-z0-9_-]*$/.test(prefix) || prefix.length > MAX_KEY_PREFIX_LENGTH) {
+                throw new Error(`Key 前缀只能包含小写字母、数字、_、-，且最多 ${MAX_KEY_PREFIX_LENGTH} 个字符`);
+            }
 
-            const actualRandomLength = Math.max(8, randomLength);
-            const randomBytes = new Uint8Array(Math.ceil(actualRandomLength / 2));
-            crypto.getRandomValues(randomBytes);
-            const randomPart = Array.from(randomBytes)
-                .map(b => b.toString(36).padStart(2, '0'))
-                .join('')
-                .substring(0, actualRandomLength);
+            const randomLength = GENERATED_KEY_LENGTH - prefix.length;
+            if (randomLength < MIN_RANDOM_KEY_LENGTH) {
+                throw new Error('Key 长度不足以容纳至少 128 位随机熵');
+            }
 
-            const timestamp = Date.now();
-            const timestampBase36 = timestamp.toString(36).padStart(timestampLength, '0').substring(0, timestampLength);
-            const perfCounter = Math.floor(performance.now() * 1000) % 1679616;
-            const counterBase36 = perfCounter.toString(36).padStart(counterLength, '0');
+            // Rejection sampling keeps every base36 symbol equally likely. The
+            // lowercase alphabet also preserves all entropy in case-insensitive databases.
+            let randomPart = '';
+            while (randomPart.length < randomLength) {
+                const remaining = randomLength - randomPart.length;
+                const randomBytes = new Uint8Array(Math.max(32, remaining * 2));
+                crypto.getRandomValues(randomBytes);
+                for (const byte of randomBytes) {
+                    if (byte >= KEY_REJECTION_LIMIT) continue;
+                    randomPart += KEY_RANDOM_ALPHABET[byte % KEY_RANDOM_ALPHABET.length];
+                    if (randomPart.length === randomLength) break;
+                }
+            }
 
-            const key = `${prefix}${randomPart}${timestampBase36}${counterBase36}`;
-            return key.substring(0, targetLength).padEnd(targetLength, '0');
+            return prefix + randomPart;
         }
 
         // --- 交互逻辑 ---
@@ -1254,22 +1257,93 @@
         }
 
         function handlePrefixInput(input) {
-            const maxLength = 20;
-            if (input.value.length > maxLength) {
-                input.value = input.value.slice(0, maxLength);
-                showToast('Key 前缀最多允许 20 个字符', 'error');
+            const sanitized = input.value.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+            if (sanitized !== input.value) {
+                input.value = sanitized;
+                showToast('Key 前缀已转换为小写，并移除不安全字符', 'error');
+            }
+            if (input.value.length > MAX_KEY_PREFIX_LENGTH) {
+                input.value = input.value.slice(0, MAX_KEY_PREFIX_LENGTH);
+                showToast(`Key 前缀最多允许 ${MAX_KEY_PREFIX_LENGTH} 个字符`, 'error');
             }
             updateKeyPreview();
         }
 
         function updateKeyPreview() {
             const prefix = document.getElementById('keyPrefix').value;
-            const preview = generateRandomKey(prefix, 32);
+            const preview = generateRandomKey(prefix);
             document.getElementById('keyPreview').textContent = preview.substring(0, prefix.length + 8) + '...';
         }
 
         function amountToQuota(amount) {
             return Math.round(amount * 500000);
+        }
+
+        function isValidQuotaAmount(amount) {
+            if (!Number.isFinite(amount) || amount < 0) return false;
+            const quota = amountToQuota(amount);
+            return Number.isSafeInteger(quota) && quota >= 0 && quota <= MAX_QUOTA_VALUE;
+        }
+
+        function isSafeUnixTimestamp(timestamp) {
+            const maxDateTimestampSeconds = Math.floor(8640000000000000 / 1000);
+            return Number.isSafeInteger(timestamp)
+                && timestamp > 0
+                && timestamp <= maxDateTimestampSeconds;
+        }
+
+        function parseExpirationDays(rawValue, nowMilliseconds = Date.now()) {
+            const normalizedValue = String(rawValue).trim();
+            const days = Number(normalizedValue);
+            if (normalizedValue === '' || !Number.isFinite(days) || !Number.isInteger(days) || days < 1) {
+                return null;
+            }
+
+            const nowSeconds = Math.floor(nowMilliseconds / 1000);
+            const durationSeconds = days * 24 * 60 * 60;
+            const timestamp = nowSeconds + durationSeconds;
+            return Number.isFinite(nowMilliseconds)
+                && Number.isSafeInteger(durationSeconds)
+                && isSafeUnixTimestamp(timestamp)
+                ? timestamp
+                : null;
+        }
+
+        function parseExpirationDate(rawValue) {
+            const normalizedValue = String(rawValue);
+            const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(normalizedValue);
+            if (!match) return null;
+
+            const [, rawYear, rawMonth, rawDay, rawHour, rawMinute] = match;
+            const year = Number(rawYear);
+            const month = Number(rawMonth);
+            const day = Number(rawDay);
+            const hour = Number(rawHour);
+            const minute = Number(rawMinute);
+            const parsedDate = new Date(normalizedValue);
+            const timestampMilliseconds = parsedDate.getTime();
+            if (!Number.isFinite(timestampMilliseconds)
+                || parsedDate.getFullYear() !== year
+                || parsedDate.getMonth() + 1 !== month
+                || parsedDate.getDate() !== day
+                || parsedDate.getHours() !== hour
+                || parsedDate.getMinutes() !== minute
+                || parsedDate.getSeconds() !== 0
+                || parsedDate.getMilliseconds() !== 0) {
+                return null;
+            }
+
+            const timestamp = Math.floor(timestampMilliseconds / 1000);
+            return isSafeUnixTimestamp(timestamp) ? timestamp : null;
+        }
+
+        function sqlTextLiteral(value, dbType) {
+            const hex = Array.from(new TextEncoder().encode(String(value)))
+                .map(byte => byte.toString(16).padStart(2, '0'))
+                .join('');
+            return dbType === 'mysql'
+                ? `CONVERT(X'${hex}' USING utf8mb4)`
+                : `convert_from(decode('${hex}', 'hex'), 'UTF8')`;
         }
 
         function showToast(msg, type = 'success') {
@@ -1305,14 +1379,14 @@
             
             // 验证逻辑前置
             const name = document.getElementById('name').value.trim();
-            const count = parseInt(document.getElementById('count').value);
+            const count = Number(document.getElementById('count').value);
             
              if (!name) {
                 showToast('请输入兑换码名称', 'error');
                 document.getElementById('name').focus();
                 return;
             }
-             if (count < 1 || count > 1000) {
+             if (!Number.isInteger(count) || count < 1 || count > 1000) {
                 showToast('生成数量必须在 1-1000 之间', 'error');
                 return;
             }
@@ -1333,16 +1407,25 @@
         function generateSQL() {
             const name = document.getElementById('name').value.trim();
             const keyPrefix = document.getElementById('keyPrefix').value.trim();
-            const count = parseInt(document.getElementById('count').value);
+            const count = Number(document.getElementById('count').value);
             const userId = 1;
             const mode = document.querySelector('input[name="quotaMode"]:checked').value;
             const expireMode = document.querySelector('input[name="expireMode"]:checked').value;
+
+            if (!name) {
+                showToast('请输入兑换码名称', 'error');
+                return;
+            }
+            if (!Number.isInteger(count) || count < 1 || count > 1000) {
+                showToast('生成数量必须在 1-1000 之间', 'error');
+                return;
+            }
             
             let minAmount, maxAmount, fixedQuota;
 
             if (mode === 'fixed') {
                 const fixedAmount = parseFloat(document.getElementById('fixedAmount').value);
-                if (isNaN(fixedAmount) || fixedAmount < 0) {
+                if (!isValidQuotaAmount(fixedAmount)) {
                     showToast('请输入有效的固定额度', 'error');
                     return;
                 }
@@ -1351,7 +1434,7 @@
                 minAmount = parseFloat(document.getElementById('minAmount').value);
                 maxAmount = parseFloat(document.getElementById('maxAmount').value);
 
-                if (isNaN(minAmount) || isNaN(maxAmount) || minAmount > maxAmount) {
+                if (!isValidQuotaAmount(minAmount) || !isValidQuotaAmount(maxAmount) || minAmount > maxAmount) {
                     showToast('请输入有效的额度区间', 'error');
                     return;
                 }
@@ -1360,22 +1443,28 @@
             // 过期时间逻辑
             let expireTime = 0;
             if (expireMode === 'days') {
-                const days = parseInt(document.getElementById('expireDays').value);
-                if (isNaN(days) || days < 1) {
+                const parsedExpireTime = parseExpirationDays(document.getElementById('expireDays').value);
+                if (parsedExpireTime === null) {
                     showToast('请输入有效的过期天数', 'error');
                     return;
                 }
-                expireTime = Math.floor(Date.now() / 1000) + (days * 24 * 60 * 60);
+                expireTime = parsedExpireTime;
             } else if (expireMode === 'date') {
                 const dateStr = document.getElementById('expireDate').value;
                 if (!dateStr) {
                     showToast('请选择过期日期', 'error');
                     return;
                 }
-                expireTime = Math.floor(new Date(dateStr).getTime() / 1000);
+                const parsedExpireTime = parseExpirationDate(dateStr);
+                if (parsedExpireTime === null) {
+                    showToast('请选择过期日期', 'error');
+                    return;
+                }
+                expireTime = parsedExpireTime;
             }
 
             const dbType = document.querySelector('input[name="dbType"]:checked').value;
+            const nameLiteral = sqlTextLiteral(name, dbType);
             let sql = '';
             const values = [];
             generatedKeys = [];
@@ -1383,8 +1472,9 @@
             if (dbType === 'mysql') {
                 sql = 'INSERT INTO redemptions (user_id, `key`, name, quota, created_time, redeemed_time, used_user_id, deleted_at, expired_time)\nVALUES\n';
                 for (let i = 0; i < count; i++) {
-                    const key = generateRandomKey(keyPrefix, 32);
+                    const key = generateRandomKey(keyPrefix);
                     generatedKeys.push(key);
+                    const keyLiteral = sqlTextLiteral(key, dbType);
                     
                     let quota = fixedQuota;
                     if (mode === 'random') {
@@ -1392,15 +1482,16 @@
                         quota = amountToQuota(randomVal);
                     }
                     
-                    values.push(`(${userId}, '${key}', '${name}', ${quota}, UNIX_TIMESTAMP(), 0, 0, NULL, ${expireTime})`);
+                    values.push(`(${userId}, ${keyLiteral}, ${nameLiteral}, ${quota}, UNIX_TIMESTAMP(), 0, 0, NULL, ${expireTime})`);
                 }
                 sql += values.join(',\n') + ';';
             } else {
                 // PostgreSQL
                 sql = 'INSERT INTO redemptions (user_id, key, name, quota, created_time, redeemed_time, used_user_id, deleted_at, expired_time)\nVALUES\n';
                 for (let i = 0; i < count; i++) {
-                    const key = generateRandomKey(keyPrefix, 32);
+                    const key = generateRandomKey(keyPrefix);
                     generatedKeys.push(key);
+                    const keyLiteral = sqlTextLiteral(key, dbType);
                     
                     let quota = fixedQuota;
                     if (mode === 'random') {
@@ -1408,7 +1499,7 @@
                         quota = amountToQuota(randomVal);
                     }
                     
-                    values.push(`(${userId}, '${key}', '${name}', ${quota}, EXTRACT(EPOCH FROM NOW())::INTEGER, 0, 0, NULL, ${expireTime})`);
+                    values.push(`(${userId}, ${keyLiteral}, ${nameLiteral}, ${quota}, EXTRACT(EPOCH FROM NOW())::INTEGER, 0, 0, NULL, ${expireTime})`);
                 }
                 sql += values.join(',\n') + ';';
             }
@@ -1477,11 +1568,7 @@
         
         // 初始化
         updateKeyPreview();
-        // 如果本地没有历史记录，初始化为空数组，避免报错
-        if(!localStorage.getItem('redemption_history')) {
-            localStorage.setItem('redemption_history', '[]');
-        }
     </script>
-<!-- Cloudflare Pages Analytics --><script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "c59e804bca0d4bd292f10ba70285456b"}'></script><!-- Cloudflare Pages Analytics --></body>
+</body>
 
 </html>

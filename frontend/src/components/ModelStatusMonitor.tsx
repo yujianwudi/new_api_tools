@@ -17,6 +17,8 @@ import {
   Ai360, Doubao, Wenxin, Meta, Coze, Cerebras, Kimi, NewAPI, ZAI, ModelScope
 } from '@lobehub/icons'
 
+type ModelHealthStatus = 'green' | 'yellow' | 'red' | 'unknown'
+
 interface SlotStatus {
   slot: number
   start_time: number
@@ -24,7 +26,7 @@ interface SlotStatus {
   total_requests: number
   success_count: number
   success_rate: number
-  status: 'green' | 'yellow' | 'red'
+  status: ModelHealthStatus
 }
 
 interface ModelStatus {
@@ -34,7 +36,7 @@ interface ModelStatus {
   total_requests: number
   success_count: number
   success_rate: number
-  current_status: 'green' | 'yellow' | 'red'
+  current_status: ModelHealthStatus
   slot_data: SlotStatus[]
 }
 
@@ -46,6 +48,7 @@ const STATUS_COLORS = {
   green: 'bg-green-500',
   yellow: 'bg-yellow-500',
   red: 'bg-red-500',
+  unknown: 'bg-gray-200 dark:bg-gray-700',
   empty: 'bg-gray-200 dark:bg-gray-700',  // No requests - neutral gray
 }
 
@@ -284,6 +287,7 @@ const STATUS_LABELS = {
   green: '正常',
   yellow: '警告',
   red: '异常',
+  unknown: '暂无数据',
 }
 
 // Time window options
@@ -364,7 +368,7 @@ const CUSTOM_ORDER_KEY = 'model_status_custom_order'
 type SortMode = 'default' | 'availability' | 'custom'
 
 // Status filter type
-type StatusFilter = 'all' | 'green' | 'yellow' | 'red'
+type StatusFilter = 'all' | ModelHealthStatus
 
 export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps) {
   const { token } = useAuth()
@@ -795,24 +799,27 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     })
   )
 
+  const visibleModelStatuses = useMemo(
+    () => modelStatuses.filter(m => m.total_requests > 0 || m.current_status === 'unknown'),
+    [modelStatuses]
+  )
+
   // Status counts for overview
   const statusCounts = useMemo(() => {
-    const counts = { green: 0, yellow: 0, red: 0 }
-    modelStatuses.forEach(m => {
+    const counts = { green: 0, yellow: 0, red: 0, unknown: 0 }
+    visibleModelStatuses.forEach(m => {
       counts[m.current_status]++
     })
     return counts
-  }, [modelStatuses])
+  }, [visibleModelStatuses])
 
   // Group counts for custom group filter tabs
   const groupCounts = useMemo(() => {
     const counts: Record<string, number> = { all: 0 }
     customGroups.forEach(g => { counts[g.id] = 0 })
     tokenGroups.forEach(g => { counts[`token:${g.group_name}`] = 0 })
-    // Count only models that are actually displayed (with requests > 0)
-    const visibleModels = modelStatuses.filter(m => m.total_requests > 0)
-    counts.all = visibleModels.length
-    visibleModels.forEach(m => {
+    counts.all = visibleModelStatuses.length
+    visibleModelStatuses.forEach(m => {
       customGroups.forEach(g => {
         if (modelMatchesGroup(m.model_name, g)) {
           counts[g.id] = (counts[g.id] || 0) + 1
@@ -825,14 +832,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       })
     })
     return counts
-  }, [modelStatuses, customGroups, tokenGroups])
+  }, [visibleModelStatuses, customGroups, tokenGroups])
 
   // Average success rate
   const avgSuccessRate = useMemo(() => {
-    const active = modelStatuses.filter(m => m.total_requests > 0)
-    if (active.length === 0) return 0
-    return +(active.reduce((sum, m) => sum + m.success_rate, 0) / active.length).toFixed(1)
-  }, [modelStatuses])
+    const measured = visibleModelStatuses.filter(m => m.total_requests > 0 && m.current_status !== 'unknown')
+    if (measured.length === 0) return null
+    return +(measured.reduce((sum, m) => sum + m.success_rate, 0) / measured.length).toFixed(1)
+  }, [visibleModelStatuses])
 
   // Handle group filter change
   const handleGroupFilterChange = useCallback((gid: string) => {
@@ -877,20 +884,20 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   // Sorted model statuses based on sort mode
   const sortedModelStatuses = useMemo(() => {
-    if (modelStatuses.length === 0) return []
+    if (visibleModelStatuses.length === 0) return []
 
     let result: ModelStatus[]
     switch (sortMode) {
       case 'availability':
         // Sort by success rate descending
-        result = [...modelStatuses].sort((a, b) => b.success_rate - a.success_rate)
+        result = [...visibleModelStatuses].sort((a, b) => b.success_rate - a.success_rate)
         break
       case 'custom':
         if (customOrder.length === 0) {
-          result = modelStatuses
+          result = visibleModelStatuses
         } else {
           // Sort by custom order
-          result = [...modelStatuses].sort((a, b) => {
+          result = [...visibleModelStatuses].sort((a, b) => {
             const indexA = customOrder.indexOf(a.model_name)
             const indexB = customOrder.indexOf(b.model_name)
             // Models not in customOrder go to the end
@@ -902,11 +909,8 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         }
         break
       default:
-        result = modelStatuses
+        result = visibleModelStatuses
     }
-
-    // Hide models with 0 requests
-    result = result.filter(m => m.total_requests > 0)
 
     // Apply group filter
     if (groupFilter !== 'all') {
@@ -932,7 +936,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }
 
     return result
-  }, [modelStatuses, sortMode, customOrder, statusFilter, groupFilter, customGroups, tokenGroups])
+  }, [visibleModelStatuses, sortMode, customOrder, statusFilter, groupFilter, customGroups, tokenGroups])
 
   // Handle drag end for reordering
   const handleDragEnd = (event: DragEndEvent) => {
@@ -1073,12 +1077,22 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       <span className="text-muted-foreground/40">·</span>
                       <span>总请求 <span className="font-semibold text-foreground tabular-nums">{modelStatuses.reduce((sum, m) => sum + m.total_requests, 0).toLocaleString()}</span></span>
                       <span className="text-muted-foreground/40">·</span>
-                      <span>平均成功率 <span className={cn("font-semibold tabular-nums", avgSuccessRate >= 95 ? 'text-green-600' : avgSuccessRate >= 80 ? 'text-yellow-600' : 'text-red-600')}>{avgSuccessRate}%</span></span>
+                      <span>平均成功率 <span className={cn(
+                        "font-semibold tabular-nums",
+                        avgSuccessRate === null
+                          ? 'text-muted-foreground'
+                          : avgSuccessRate >= 95
+                            ? 'text-green-600'
+                            : avgSuccessRate >= 80
+                              ? 'text-yellow-600'
+                              : 'text-red-600'
+                      )}>{avgSuccessRate === null ? '—' : `${avgSuccessRate}%`}</span></span>
                       <span className="text-muted-foreground/40">·</span>
                       <span className="flex items-center gap-1.5">
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500" /><span className="font-medium text-green-600 tabular-nums">{statusCounts.green}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-yellow-500" /><span className="font-medium text-yellow-600 tabular-nums">{statusCounts.yellow}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" /><span className="font-medium text-red-600 tabular-nums">{statusCounts.red}</span></span>
+                        <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-400" /><span className="font-medium text-muted-foreground tabular-nums">{statusCounts.unknown}</span></span>
                       </span>
                     </>
                   )}
@@ -1547,10 +1561,11 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
           <div className="flex items-center gap-2">
             <Filter className="h-4 w-4 text-muted-foreground" />
             {[
-              { value: 'all' as StatusFilter, label: '全部', count: modelStatuses.length },
+              { value: 'all' as StatusFilter, label: '全部', count: visibleModelStatuses.length },
               { value: 'green' as StatusFilter, label: '正常', count: statusCounts.green, color: 'text-green-600' },
               { value: 'yellow' as StatusFilter, label: '警告', count: statusCounts.yellow, color: 'text-yellow-600' },
               { value: 'red' as StatusFilter, label: '异常', count: statusCounts.red, color: 'text-red-600' },
+              { value: 'unknown' as StatusFilter, label: '暂无数据', count: statusCounts.unknown, color: 'text-muted-foreground' },
             ].map(tab => (
               <button
                 key={tab.value}
@@ -1579,7 +1594,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       {showGroupManager && (
         <GroupManagerModal
           groups={customGroups}
-          allModels={modelStatuses.filter(m => m.total_requests > 0).map(m => m.model_name)}
+          allModels={visibleModelStatuses.map(m => m.model_name)}
           onSave={(groups) => {
             saveCustomGroups(groups)
             // Reset filter if the active group was deleted
@@ -2316,7 +2331,8 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
   const timeLabels = getTimeLabels()
 
   // Success rate color based on status
-  const rateColorClass = model.current_status === 'green' ? 'text-green-600 dark:text-green-400'
+  const rateColorClass = model.current_status === 'unknown' ? 'text-muted-foreground'
+    : model.current_status === 'green' ? 'text-green-600 dark:text-green-400'
     : model.current_status === 'yellow' ? 'text-yellow-600 dark:text-yellow-400'
       : 'text-red-600 dark:text-red-400'
 
@@ -2348,13 +2364,13 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
             {model.model_name}
           </span>
           <Badge
-            variant={model.current_status === 'green' ? 'success' : model.current_status === 'yellow' ? 'warning' : 'destructive'}
+            variant={model.current_status === 'unknown' ? 'outline' : model.current_status === 'green' ? 'success' : model.current_status === 'yellow' ? 'warning' : 'destructive'}
             className="text-[10px] px-1.5 py-0 h-5 flex-shrink-0"
           >
             {STATUS_LABELS[model.current_status]}
           </Badge>
           <div className="ml-auto text-xs text-muted-foreground flex-shrink-0 tabular-nums">
-            <span className={cn("font-semibold", rateColorClass)}>{model.success_rate}%</span>
+            <span className={cn("font-semibold", rateColorClass)}>{model.current_status === 'unknown' ? '—' : `${model.success_rate}%`}</span>
             <span className="mx-1 text-muted-foreground/40">·</span>
             <span>{model.total_requests.toLocaleString()}</span>
           </div>
@@ -2424,10 +2440,17 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
                   <span>成功率:</span>
                   <span className={cn(
                     "font-medium",
-                    hoveredSlot.status === 'green' ? 'text-green-600' :
-                      hoveredSlot.status === 'yellow' ? 'text-yellow-600' : 'text-red-600'
+                    hoveredSlot.total_requests === 0 || hoveredSlot.status === 'unknown'
+                      ? 'text-muted-foreground'
+                      : hoveredSlot.status === 'green'
+                        ? 'text-green-600'
+                        : hoveredSlot.status === 'yellow'
+                          ? 'text-yellow-600'
+                          : 'text-red-600'
                   )}>
-                    {hoveredSlot.success_rate}%
+                    {hoveredSlot.total_requests === 0 || hoveredSlot.status === 'unknown'
+                      ? '—'
+                      : `${hoveredSlot.success_rate}%`}
                   </span>
                 </div>
               </div>

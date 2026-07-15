@@ -46,14 +46,15 @@ func GetAIBanConfig(c *gin.Context) {
 
 // POST /api/ai-ban/config
 func SaveAIBanConfig(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var req map[string]interface{}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 	svc := service.NewAIAutoBanService()
-	if err := svc.SaveConfig(req); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("SAVE_ERROR", err.Error(), ""))
+	if err := svc.SaveConfig(c.Request.Context(), req); err != nil {
+		respondHandlerError(c, http.StatusBadRequest, "SAVE_ERROR", "Unable to save AI auto-ban configuration", "AI auto-ban configuration save", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -97,7 +98,7 @@ func GetAvailableGroupsForBan(c *gin.Context) {
 	svc := service.NewAIAutoBanService()
 	data, err := svc.GetAvailableGroups(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "AI auto-ban available groups query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -109,7 +110,7 @@ func GetAvailableModelsForExclude(c *gin.Context) {
 	svc := service.NewAIAutoBanService()
 	data, err := svc.GetAvailableModelsForExclude(days)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "AI auto-ban available models query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -127,7 +128,7 @@ func GetSuspiciousUsers(c *gin.Context) {
 	svc := service.NewAIAutoBanService()
 	data, err := svc.GetSuspiciousUsers(window, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "AI auto-ban suspicious users query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -140,7 +141,7 @@ func ManualAssess(c *gin.Context) {
 		Window string `json:"window"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	if req.Window == "" {
@@ -168,7 +169,7 @@ func RunAIBanScan(c *gin.Context) {
 // POST /api/ai-ban/test-connection
 func TestAIConnection(c *gin.Context) {
 	svc := service.NewAIAutoBanService()
-	data := svc.TestConnection()
+	data := svc.TestConnection(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
@@ -185,7 +186,7 @@ func AddToAIBanWhitelist(c *gin.Context) {
 		UserID int64 `json:"user_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewAIAutoBanService()
@@ -199,7 +200,7 @@ func RemoveFromAIBanWhitelist(c *gin.Context) {
 		UserID int64 `json:"user_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
 	svc := service.NewAIAutoBanService()
@@ -217,7 +218,7 @@ func SearchUserForAIWhitelist(c *gin.Context) {
 	svc := service.NewAIAutoBanService()
 	data, err := svc.SearchUserForWhitelist(q)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "AI auto-ban whitelist user search", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -225,26 +226,34 @@ func SearchUserForAIWhitelist(c *gin.Context) {
 
 // POST /api/ai-ban/models or /api/ai-ban/fetch-models
 func FetchAIModels(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
 	var req struct {
 		BaseURL      string `json:"base_url"`
 		APIKey       string `json:"api_key"`
 		ForceRefresh bool   `json:"force_refresh"`
 	}
-	c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
+	}
 	svc := service.NewAIAutoBanService()
-	result := svc.FetchModels(req.BaseURL, req.APIKey, req.ForceRefresh)
+	result := svc.FetchModels(c.Request.Context(), req.BaseURL, req.APIKey, req.ForceRefresh)
 	c.JSON(http.StatusOK, result)
 }
 
 // POST /api/ai-ban/test-model
 func TestAIModel(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
 	var req struct {
 		BaseURL string `json:"base_url"`
 		APIKey  string `json:"api_key"`
 		Model   string `json:"model"`
 	}
-	c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
+	}
 	svc := service.NewAIAutoBanService()
-	result := svc.TestModel(req.BaseURL, req.APIKey, req.Model)
+	result := svc.TestModel(c.Request.Context(), req.BaseURL, req.APIKey, req.Model)
 	c.JSON(http.StatusOK, result)
 }

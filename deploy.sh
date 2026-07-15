@@ -21,6 +21,9 @@ ENV_FILE="${SCRIPT_DIR}/.env"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 COMPOSE_HOST_FILE="${SCRIPT_DIR}/docker-compose.host.yml"
 COMPOSE_LOGDB_FILE="${SCRIPT_DIR}/docker-compose.logdb.yml"
+SOURCE_SQL_DSN=""
+NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
+REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 
 # 由 detect_environment() 设置：host 模式下需要追加 overlay compose 文件
 COMPOSE_FILES=("-f" "$COMPOSE_FILE")
@@ -38,22 +41,104 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
 
+validate_newapi_tools_image() {
+  local image="${1:-}"
+  [[ -n "$image" ]] || die "NEWAPI_TOOLS_IMAGE 不能为空"
+  (( ${#image} <= 512 )) || die "NEWAPI_TOOLS_IMAGE 过长"
+  [[ ! "$image" =~ [[:space:][:cntrl:]] ]] ||
+    die "NEWAPI_TOOLS_IMAGE 不能包含空白或控制字符"
+  [[ "$image" != -* ]] || die "NEWAPI_TOOLS_IMAGE 格式无效"
+}
+
+resolve_deploy_image() {
+  local image="$REQUESTED_NEWAPI_TOOLS_IMAGE"
+
+  if [[ -z "$image" ]] && command -v git >/dev/null 2>&1 &&
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local commit tag
+    commit="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)" ||
+      die "无法解析当前 Git commit"
+    tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+    if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+      image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${BASH_REMATCH[1]}"
+    else
+      image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
+    fi
+  fi
+
+  image="${image:-${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.2.0}"
+  validate_newapi_tools_image "$image"
+  NEWAPI_TOOLS_IMAGE="$image"
+  export NEWAPI_TOOLS_IMAGE
+  log_info "部署镜像: ${NEWAPI_TOOLS_IMAGE}"
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少必要命令: $1"
 }
 
-# 检测 docker compose 命令
+# 提取 docker compose v2 的语义版本号。
+get_docker_compose_v2_version() {
+  local output
+  output="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null || true)"
+  if [[ "$output" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+
+version_at_least() {
+  local current="$1" required="$2"
+  local current_major current_minor current_patch required_major required_minor required_patch
+  IFS=. read -r current_major current_minor current_patch <<< "$current"
+  IFS=. read -r required_major required_minor required_patch <<< "$required"
+
+  (( 10#$current_major > 10#$required_major )) ||
+    (( 10#$current_major == 10#$required_major && 10#$current_minor > 10#$required_minor )) ||
+    (( 10#$current_major == 10#$required_major && 10#$current_minor == 10#$required_minor && 10#$current_patch >= 10#$required_patch ))
+}
+
+# docker-compose.host.yml 使用 !reset，只有 Docker Compose v2.24+ 能正确解析。
+require_docker_compose_v224() {
+  local reason="${1:-当前 Compose 配置}"
+  if [[ "${DOCKER_COMPOSE:-}" != "docker compose" ]]; then
+    die "${reason} 依赖 !reset 语法，需要 Docker Compose v2.24+；检测到的是旧版 docker-compose，请安装/升级 Compose v2 插件"
+  fi
+
+  local version="${DOCKER_COMPOSE_V2_VERSION:-}"
+  [[ -n "$version" ]] || version="$(get_docker_compose_v2_version)"
+  [[ -n "$version" ]] || die "无法识别 Docker Compose v2 版本；${reason} 需要 v2.24+"
+  version_at_least "$version" "2.24.0" || die "Docker Compose v${version} 过旧；${reason} 依赖 !reset 语法，最低需要 v2.24.0"
+}
+
+configure_host_compose_files() {
+  [[ -f "$COMPOSE_HOST_FILE" ]] ||
+    die "host 模式需要 ${COMPOSE_HOST_FILE}，缺少该叠加层时无法安全移除基础 external network 配置"
+  require_docker_compose_v224 "host 网络叠加层 ${COMPOSE_HOST_FILE}"
+  COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
+}
+
+# 优先使用 docker compose v2；仅在没有 v2 时兼容旧 docker-compose。
 detect_docker_compose() {
-  if command -v docker-compose >/dev/null 2>&1; then
-    DOCKER_COMPOSE="docker-compose"
-  elif docker compose version >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
+    DOCKER_COMPOSE_V2_VERSION="$(get_docker_compose_v2_version)"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker-compose"
+    DOCKER_COMPOSE_V2_VERSION=""
+    log_warn "未检测到 Docker Compose v2，暂用旧版 docker-compose；host 网络部署需要 v2.24+"
   else
-    die "缺少 docker-compose 或 docker compose 命令"
+    die "缺少 Docker Compose；请安装 Docker Compose v2 插件（host 网络部署最低 v2.24）"
   fi
 }
 
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+dotenv_quote() {
+	local value="${1-}" escaped
+	[[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "环境变量值不能包含换行"
+	escaped="$(printf '%s' "$value" | sed "s/'/\\\\'/g")"
+	printf "'%s'" "$escaped"
+}
 
 # 生成 32 字符强密码（约 200 bits 熵）
 # 字符集：62 字母数字 + 14 个安全特殊符号 = 76 chars
@@ -83,52 +168,353 @@ first_csv() {
 # Docker 环境检测函数 (来自 newapi_detect.sh)
 #######################################
 
-extract_dsn_engine() {
-  local dsn="${1:-}"
-  if [[ -z "$dsn" ]]; then return 0; fi
-  if [[ "$dsn" =~ ^postgres(ql)?:// ]]; then
-    echo "postgres"
-  elif [[ "$dsn" =~ ^mysql:// ]]; then
-    echo "mysql"
+# DSN 解析只接受可以无歧义拆分的常见形式。所有错误都必须脱敏，禁止输出原始 DSN。
+dsn_parse_error() {
+  printf '无法安全解析数据库 DSN：%s（原始 DSN 已隐藏）\n' "$1" >&2
+  return 1
+}
+
+dsn_validate_port() {
+  local port="${1:-}"
+  [[ -z "$port" ]] && return 0
+  if [[ ! "$port" =~ ^[0-9]+$ || ${#port} -gt 5 ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+    dsn_parse_error "端口必须是 1-65535 的数字"
   fi
 }
 
-extract_dsn_host() {
-  local dsn="${1:-}"
-  if [[ -z "$dsn" ]]; then return 0; fi
-  local host
-  host="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@/]*@([^:/]+).*#\1#p')"
-  if [[ -n "$host" ]]; then echo "$host"; return 0; fi
-  host="$(echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:/]+).*#\1#p')"
-  echo "$host"
+dsn_validate_postgres_url_query() {
+  local query="${1:-}" parameter key normalized_key
+
+  [[ -n "$query" ]] || return 0
+  while :; do
+    parameter="${query%%&*}"
+    key="${parameter%%=*}"
+
+    # libpq URL-decodes query parameter names. Restrict names to its normal
+    # identifier form so percent-encoding cannot disguise a target override.
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+      dsn_parse_error "PostgreSQL URL query 含无效或编码后的键名"
+      return 1
+    }
+    normalized_key="${key,,}"
+    case "$normalized_key" in
+      host|hostaddr|port)
+        dsn_parse_error "PostgreSQL URL query 不能覆盖 host、hostaddr 或 port"
+        return 1
+        ;;
+    esac
+
+    [[ "$query" == *'&'* ]] || break
+    query="${query#*&}"
+  done
 }
 
-# 从 DSN URL 解析用户名 (postgresql://user:pass@host:port/db)
-extract_dsn_user() {
-  local dsn="${1:-}"
-  [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:@/]+)(:[^@/]*)?@.*#\1#p'
+dsn_url_component() {
+  local dsn="$1" component="$2"
+  local scheme rest authority path query="" userinfo="" hostport user="" password="" host="" port="" dbname
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* && "$dsn" != *[[:space:]]* ]] || {
+    dsn_parse_error "URL DSN 不能包含空白或换行"
+    return 1
+  }
+
+  scheme="${dsn%%://*}"
+  case "$scheme" in
+    postgres|postgresql|mysql) ;;
+    *) dsn_parse_error "不支持的 URL scheme"; return 1 ;;
+  esac
+
+  rest="${dsn#*://}"
+  [[ "$rest" == */* ]] || { dsn_parse_error "URL DSN 缺少 /dbname"; return 1; }
+  authority="${rest%%/*}"
+  path="${rest#*/}"
+  [[ -n "$authority" && -n "$path" && "$path" != *'#'* ]] || {
+    dsn_parse_error "URL DSN 的 authority 或 dbname 无效"
+    return 1
+  }
+
+  dbname="${path%%\?*}"
+  if [[ "$path" == *'?'* ]]; then
+    query="${path#*\?}"
+    if [[ "$scheme" == "postgres" || "$scheme" == "postgresql" ]]; then
+      dsn_validate_postgres_url_query "$query" || return 1
+    fi
+  fi
+  [[ -n "$dbname" && "$dbname" != */* ]] || {
+    dsn_parse_error "URL DSN 的 dbname 缺失或包含未转义的斜杠"
+    return 1
+  }
+
+  hostport="$authority"
+  if [[ "$authority" == *@* ]]; then
+    userinfo="${authority%@*}"
+    hostport="${authority##*@}"
+    [[ -n "$userinfo" ]] || { dsn_parse_error "URL DSN 的用户信息为空"; return 1; }
+    if [[ "$userinfo" == *:* ]]; then
+      user="${userinfo%%:*}"
+      password="${userinfo#*:}"
+    else
+      user="$userinfo"
+    fi
+    [[ -n "$user" ]] || { dsn_parse_error "URL DSN 的用户名为空"; return 1; }
+  fi
+
+  if [[ "$hostport" =~ ^\[([^][]+)\](:([0-9]+))?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+  elif [[ "$hostport" =~ ^([^:]+)(:([0-9]+))?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+  else
+    dsn_parse_error "URL DSN 的 host:port 无法无歧义解析"
+    return 1
+  fi
+  [[ -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "URL DSN 的 host 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) [[ "$scheme" == "mysql" ]] && printf 'mysql\n' || printf 'postgres\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 URL DSN 字段"; return 1 ;;
+  esac
 }
 
-# 从 DSN URL 解析密码
-extract_dsn_password() {
-  local dsn="${1:-}"
-  [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^:@/]+:([^@]*)@.*#\1#p'
+dsn_mysql_go_component() {
+  local dsn="$1" component="$2"
+  local user password address dbname host="" port=""
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* && "$dsn" != *[[:space:]]* ]] || {
+    dsn_parse_error "MySQL Go DSN 不能包含空白或换行"
+    return 1
+  }
+  if [[ "$dsn" =~ ^([^:/@]+):(.*)@tcp\(([^()]*)\)/([^?]+)(\?.*)?$ ]]; then
+    user="${BASH_REMATCH[1]}"
+    password="${BASH_REMATCH[2]}"
+    address="${BASH_REMATCH[3]}"
+    dbname="${BASH_REMATCH[4]}"
+  else
+    dsn_parse_error "MySQL Go DSN 必须形如 user:password@tcp(host:port)/dbname"
+    return 1
+  fi
+
+  if [[ "$address" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  elif [[ "$address" =~ ^([^:]+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    dsn_parse_error "MySQL Go DSN 的 tcp 地址必须是 host:port"
+    return 1
+  fi
+  [[ -n "$host" && "$host" != *[[:space:]@/]* && -n "$dbname" && "$dbname" != */* ]] || {
+    dsn_parse_error "MySQL Go DSN 的 host 或 dbname 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) printf 'mysql\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 MySQL Go DSN 字段"; return 1 ;;
+  esac
 }
 
-# 从 DSN URL 解析端口
-extract_dsn_port() {
-  local dsn="${1:-}"
-  [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^:/]+:([0-9]+).*#\1#p'
+dsn_postgres_keyword_component() {
+  local dsn="$1" component="$2"
+  local token key value normalized_key
+  local host="" port="" user="" password="" dbname=""
+  local seen_host=false seen_port=false seen_user=false seen_password=false seen_dbname=false
+  local -a tokens=()
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* ]] || {
+    dsn_parse_error "PostgreSQL keyword DSN 不能包含换行"
+    return 1
+  }
+  # libpq 的引号/反斜杠转义需要完整词法分析；这里宁可拒绝，也不能误拆凭证。
+  [[ "$dsn" != *"'"* && "$dsn" != *'"'* && "$dsn" != *'\'* ]] || {
+    dsn_parse_error "暂不支持带引号或反斜杠转义的 PostgreSQL keyword DSN"
+    return 1
+  }
+
+  read -r -a tokens <<< "$dsn"
+  (( ${#tokens[@]} > 0 )) || { dsn_parse_error "PostgreSQL keyword DSN 为空"; return 1; }
+  for token in "${tokens[@]}"; do
+    [[ "$token" == *=* ]] || {
+      dsn_parse_error "PostgreSQL keyword DSN 含无法归属的空白值"
+      return 1
+    }
+    key="${token%%=*}"
+    value="${token#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+      dsn_parse_error "PostgreSQL keyword DSN 含无效键名"
+      return 1
+    }
+    normalized_key="${key,,}"
+    case "$normalized_key" in
+      host)
+        [[ "$seen_host" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 host"; return 1; }
+        seen_host=true; host="$value"
+        ;;
+      hostaddr)
+        dsn_parse_error "PostgreSQL keyword DSN 不支持 hostaddr；它可能绕过 host 改写"
+        return 1
+        ;;
+      port)
+        [[ "$seen_port" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 port"; return 1; }
+        seen_port=true; port="$value"
+        ;;
+      user)
+        [[ "$seen_user" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 user"; return 1; }
+        seen_user=true; user="$value"
+        ;;
+      password)
+        [[ "$seen_password" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 password"; return 1; }
+        seen_password=true; password="$value"
+        ;;
+      dbname)
+        [[ "$seen_dbname" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 dbname"; return 1; }
+        seen_dbname=true; dbname="$value"
+        ;;
+    esac
+  done
+
+  [[ "$seen_host" == true && -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "PostgreSQL keyword DSN 缺少有效 host"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) printf 'postgres\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 PostgreSQL keyword DSN 字段"; return 1 ;;
+  esac
 }
 
-# 从 DSN URL 解析数据库名
-extract_dsn_dbname() {
+detect_dsn_format() {
   local dsn="${1:-}"
-  [[ -z "$dsn" ]] && return 0
-  echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^/]+/([^?]+).*#\1#p'
+  [[ -n "$dsn" ]] || return 0
+  if [[ "$dsn" =~ ^postgres(ql)?:// ]]; then
+    dsn_url_component "$dsn" validate || return 1
+    printf 'postgres_url\n'
+  elif [[ "$dsn" =~ ^mysql:// ]]; then
+    dsn_url_component "$dsn" validate || return 1
+    printf 'mysql_url\n'
+  elif [[ "$dsn" == *@tcp\(* ]]; then
+    dsn_mysql_go_component "$dsn" validate || return 1
+    printf 'mysql_go\n'
+  elif [[ "$dsn" == *=* ]]; then
+    dsn_postgres_keyword_component "$dsn" validate || return 1
+    printf 'postgres_keyword\n'
+  else
+    dsn_parse_error "仅支持 PostgreSQL/MySQL URL、MySQL Go DSN 和 PostgreSQL keyword DSN"
+  fi
+}
+
+extract_dsn_component() {
+  local dsn="${1:-}" component="$2" format
+  [[ -n "$dsn" ]] || return 0
+  format="$(detect_dsn_format "$dsn")" || return 1
+  case "$format" in
+    postgres_url|mysql_url) dsn_url_component "$dsn" "$component" ;;
+    mysql_go) dsn_mysql_go_component "$dsn" "$component" ;;
+    postgres_keyword) dsn_postgres_keyword_component "$dsn" "$component" ;;
+    *) dsn_parse_error "内部识别到了未知 DSN 格式"; return 1 ;;
+  esac
+}
+
+extract_dsn_engine() { extract_dsn_component "${1:-}" engine; }
+extract_dsn_host() { extract_dsn_component "${1:-}" host; }
+extract_dsn_user() { extract_dsn_component "${1:-}" user; }
+extract_dsn_password() { extract_dsn_component "${1:-}" password; }
+extract_dsn_port() { extract_dsn_component "${1:-}" port; }
+extract_dsn_dbname() { extract_dsn_component "${1:-}" dbname; }
+
+dsn_host_port() {
+  local host="$1" port="$2"
+  [[ -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "改写后的数据库 host 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]:%s' "$host" "$port"
+  else
+    printf '%s:%s' "$host" "$port"
+  fi
+}
+
+# Preserve the original DSN representation, escaping and connection options;
+# only the network host and port are replaced.
+rewrite_dsn_host_port() {
+  local dsn="$1" new_host="$2" new_port="$3" format address
+  format="$(detect_dsn_format "$dsn")" || return 1
+  address="$(dsn_host_port "$new_host" "$new_port")" || return 1
+
+  case "$format" in
+    postgres_url|mysql_url)
+      local scheme rest authority path userinfo_prefix=""
+      scheme="${dsn%%://*}"
+      rest="${dsn#*://}"
+      authority="${rest%%/*}"
+      path="${rest#*/}"
+      if [[ "$authority" == *@* ]]; then
+        userinfo_prefix="${authority%@*}@"
+      fi
+      printf '%s://%s%s/%s\n' "$scheme" "$userinfo_prefix" "$address" "$path"
+      ;;
+    mysql_go)
+      if [[ "$dsn" =~ ^(.+)@tcp\([^()]*\)/(.*)$ ]]; then
+        printf '%s@tcp(%s)/%s\n' "${BASH_REMATCH[1]}" "$address" "${BASH_REMATCH[2]}"
+      else
+        dsn_parse_error "MySQL Go DSN 无法安全改写地址"
+        return 1
+      fi
+      ;;
+    postgres_keyword)
+      local token key normalized_key seen_port=false i
+      local -a tokens=() rewritten=()
+      read -r -a tokens <<< "$dsn"
+      for token in "${tokens[@]}"; do
+        key="${token%%=*}"
+        normalized_key="${key,,}"
+        case "$normalized_key" in
+          host) rewritten+=("${key}=${new_host}") ;;
+          port) rewritten+=("${key}=${new_port}"); seen_port=true ;;
+          *) rewritten+=("$token") ;;
+        esac
+      done
+      [[ "$seen_port" == true ]] || rewritten+=("port=${new_port}")
+      printf '%s' "${rewritten[0]}"
+      for ((i = 1; i < ${#rewritten[@]}; i++)); do
+        printf ' %s' "${rewritten[$i]}"
+      done
+      printf '\n'
+      ;;
+    *)
+      dsn_parse_error "未知 DSN 格式"
+      return 1
+      ;;
+  esac
 }
 
 detect_newapi_container() {
@@ -154,7 +540,39 @@ docker_inspect_label() {
 
 docker_inspect_env_value() {
   local container="$1" var_name="$2"
-  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null | awk -F= -v k="$var_name" '$1==k{print $2; exit}'
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null |
+    awk -v k="$var_name" 'index($0, k "=")==1 {print substr($0, length(k)+2); exit}'
+}
+
+# Direct database mutations are only safe when NewAPI explicitly declares an
+# empty REDIS_CONN_STRING. A missing variable or an inspect failure is treated
+# as unknown and therefore remains fail-closed.
+detect_newapi_redis_mutation_safety() {
+  NEWAPI_REDIS_DISABLED=false
+
+  local env_lines redis_entry redis_value
+  if ! env_lines="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NEWAPI_CONTAINER" 2>/dev/null)"; then
+    log_warn "无法读取 NewAPI 容器环境变量；NEWAPI_REDIS_DISABLED=false"
+    log_warn "用户、Token、分组和 IP 记录等直接写库操作将被阻止，请改用 NewAPI 管理 API"
+    return 0
+  fi
+
+  redis_entry="$(printf '%s\n' "$env_lines" | awk -F= '$1=="REDIS_CONN_STRING"{print; exit}')"
+  if [[ -z "$redis_entry" ]]; then
+    log_warn "NewAPI 未显式声明 REDIS_CONN_STRING，Redis 状态未知；NEWAPI_REDIS_DISABLED=false"
+    log_warn "用户、Token、分组和 IP 记录等直接写库操作将被阻止，请改用 NewAPI 管理 API"
+    return 0
+  fi
+
+  redis_value="${redis_entry#*=}"
+  if [[ -z "$redis_value" ]]; then
+    NEWAPI_REDIS_DISABLED=true
+    log_success "NewAPI 明确配置 REDIS_CONN_STRING=（空），允许受保护的直接数据库写操作"
+    return 0
+  fi
+
+  log_warn "检测到 NewAPI 已配置 Redis；NEWAPI_REDIS_DISABLED=false"
+  log_warn "为避免缓存中的用户/Token 权限延迟失效，相关直接写库操作将被阻止，请改用 NewAPI 管理 API"
 }
 
 detect_networks_for_container() {
@@ -228,23 +646,40 @@ find_container_by_network_ip() {
 #       例如 127.0.0.1:5433->5432 时，同网络直连要用 5432 而不是 5433。
 # 排除默认 bridge / host / none：它们不支持按容器名做 DNS 解析。
 find_container_by_published_port() {
-  local target_port="${1:-}"
+  local requested_host="${1:-}" target_port="${2:-}"
   [[ -z "$target_port" ]] && return 0
-  local cid name net cport
+  local cid name net selected_net cport binding_port host_ip host_port candidate match=""
   while IFS= read -r cid; do
     [[ -z "$cid" ]] && continue
-    # docker port 输出形如 "5432/tcp -> 127.0.0.1:5432"；取宿主机端口==target 的那条的容器内端口
-    cport="$(docker port "$cid" 2>/dev/null | awk -F' -> ' -v p="$target_port" '
-      { n=split($2,h,":"); if (h[n]==p) { split($1,c,"/"); print c[1]; exit } }')"
+    cport=""
+    while IFS='|' read -r binding_port host_ip host_port; do
+      [[ "$host_port" == "$target_port" ]] || continue
+      case "$requested_host" in
+        127.0.0.1) [[ "$host_ip" == "127.0.0.1" ]] || continue ;;
+        ::1) [[ "$host_ip" == "::1" ]] || continue ;;
+        localhost) [[ "$host_ip" == "127.0.0.1" || "$host_ip" == "::1" ]] || continue ;;
+        *) continue ;;
+      esac
+      cport="${binding_port%/*}"
+      break
+    done < <(docker inspect -f '{{range $p,$bindings := .NetworkSettings.Ports}}{{range $bindings}}{{printf "%s|%s|%s\n" $p .HostIp .HostPort}}{{end}}{{end}}' "$cid" 2>/dev/null)
     [[ -z "$cport" ]] && continue
     name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
+    selected_net=""
     while IFS= read -r net; do
       [[ -z "$net" ]] && continue
       case "$net" in bridge|host|none) continue ;; esac
-      printf '%s\t%s\t%s\n' "$net" "$name" "$cport"
-      return 0
+      selected_net="$net"
+      break
     done < <(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$cid" 2>/dev/null)
+    [[ -n "$selected_net" ]] || continue
+    candidate="${selected_net}"$'\t'"${name}"$'\t'"${cport}"
+    if [[ -n "$match" && "$candidate" != "$match" ]]; then
+      return 0
+    fi
+    match="$candidate"
   done < <(docker ps -q)
+  [[ -n "$match" ]] && printf '%s\n' "$match"
   return 0
 }
 
@@ -260,6 +695,8 @@ detect_environment() {
     NEWAPI_CONTAINER="$(detect_newapi_container)" || die "找不到运行中的 NewAPI 容器（可设置环境变量 NEWAPI_CONTAINER=<容器名或ID> 手动指定）"
   fi
   log_success "找到 NewAPI 容器: $NEWAPI_CONTAINER"
+
+  detect_newapi_redis_mutation_safety
 
   # 获取 compose 项目信息
   local compose_project compose_files user_compose_file
@@ -330,20 +767,30 @@ detect_environment() {
   detected_dsn="$(docker_inspect_env_value "$NEWAPI_CONTAINER" 'SQL_DSN' || true)"
   [[ -z "$detected_dsn" ]] && detected_dsn="$(docker_inspect_env_value "$NEWAPI_CONTAINER" 'DATABASE_URL' || true)"
   [[ -z "$detected_dsn" ]] && detected_dsn="$(docker_inspect_env_value "$NEWAPI_CONTAINER" 'DB_DSN' || true)"
+  SOURCE_SQL_DSN="$detected_dsn"
 
-  DB_ENGINE="$(extract_dsn_engine "$detected_dsn" || true)"
-  DB_DNS="$(extract_dsn_host "$detected_dsn" || true)"
+  DB_ENGINE=""
+  DB_DNS=""
+  DB_PORT=""
+  if [[ -n "$detected_dsn" ]]; then
+    DB_ENGINE="$(extract_dsn_engine "$detected_dsn")" ||
+      die "NewAPI 数据库 DSN 不受支持或格式不安全；原始 DSN 已隐藏"
+    DB_DNS="$(extract_dsn_host "$detected_dsn")" ||
+      die "无法从 NewAPI 数据库 DSN 安全解析 host；原始 DSN 已隐藏"
+    DB_PORT="$(extract_dsn_port "$detected_dsn")" ||
+      die "无法从 NewAPI 数据库 DSN 安全解析端口；原始 DSN 已隐藏"
+  fi
 
   # ===== Host 模式：完全从 DSN 解析凭证，跳过数据库容器探测 =====
   if [[ "$USE_HOST_MODE" == "true" ]]; then
     [[ -n "$detected_dsn" ]] || die "host 模式下必须能从 NewAPI 容器读取 SQL_DSN，但未检测到"
-    [[ -n "$DB_ENGINE" ]] || die "无法从 DSN 识别数据库引擎: $detected_dsn"
+    [[ -n "$DB_ENGINE" ]] || die "无法从 DSN 识别数据库引擎；原始 DSN 已隐藏"
 
     # 先解析出完整凭证（下面判断"怎么连"时要用到端口）
-    DB_USER="$(extract_dsn_user "$detected_dsn")"
-    DB_PASSWORD="$(extract_dsn_password "$detected_dsn")"
-    DB_PORT="$(extract_dsn_port "$detected_dsn")"
-    DB_NAME="$(extract_dsn_dbname "$detected_dsn")"
+    DB_USER="$(extract_dsn_user "$detected_dsn")" || die "无法安全解析数据库用户名；原始 DSN 已隐藏"
+    DB_PASSWORD="$(extract_dsn_password "$detected_dsn")" || die "无法安全解析数据库密码；原始 DSN 已隐藏"
+    DB_PORT="$(extract_dsn_port "$detected_dsn")" || die "无法安全解析数据库端口；原始 DSN 已隐藏"
+    DB_NAME="$(extract_dsn_dbname "$detected_dsn")" || die "无法安全解析数据库名；原始 DSN 已隐藏"
 
     if [[ "$DB_ENGINE" == "postgres" ]]; then
       DB_PORT="${DB_PORT:-5432}"
@@ -366,7 +813,7 @@ detect_environment() {
     #  (c)  其它（外部 DB、真实 LAN IP、域名）→ 原样保留，靠 extra_hosts / 宿主路由可达。
     if [[ "$DB_DNS" == "127.0.0.1" || "$DB_DNS" == "localhost" || "$DB_DNS" == "::1" ]]; then
       local _hit _hit_net _hit_name _hit_port
-      _hit="$(find_container_by_published_port "$DB_PORT")"
+      _hit="$(find_container_by_published_port "$DB_DNS" "$DB_PORT")"
       _hit_net="$(printf '%s' "$_hit" | cut -f1)"
       _hit_name="$(printf '%s' "$_hit" | cut -f2)"
       _hit_port="$(printf '%s' "$_hit" | cut -f3)"
@@ -406,11 +853,7 @@ detect_environment() {
     if [[ "$USE_HOST_MODE" == "true" ]]; then
       # 情形 (a)/(c)：数据库走宿主机（host.docker.internal）或外部地址，
       # newapi-tools 无需任何 external 网络 → 加载 host overlay 去掉 newapi-network 依赖。
-      if [[ -f "$COMPOSE_HOST_FILE" ]]; then
-        COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
-      else
-        log_warn "未找到 $COMPOSE_HOST_FILE，host 模式可能启动失败"
-      fi
+      configure_host_compose_files
       log_success "检测到数据库 (host 模式): $DB_ENGINE @ $DB_DNS:$DB_PORT/$DB_NAME"
     else
       # 情形 (b)：数据库在另一条 bridge 网络上，newapi-tools 已改为挂进该网络（NEWAPI_NETWORK）。
@@ -510,14 +953,14 @@ detect_environment() {
 
   # 获取数据库凭证
   if [[ "$DB_ENGINE" == "postgres" ]]; then
-    DB_PORT="5432"
+    DB_PORT="${DB_PORT:-5432}"
     DB_USER="$(docker_inspect_env_value "$db_container" 'POSTGRES_USER' || true)"
     DB_NAME="$(docker_inspect_env_value "$db_container" 'POSTGRES_DB' || true)"
     DB_PASSWORD="$(docker_inspect_env_value "$db_container" 'POSTGRES_PASSWORD' || true)"
     DB_USER="${DB_USER:-postgres}"
     DB_NAME="${DB_NAME:-new-api}"
   elif [[ "$DB_ENGINE" == "mysql" ]]; then
-    DB_PORT="3306"
+    DB_PORT="${DB_PORT:-3306}"
     DB_USER="$(docker_inspect_env_value "$db_container" 'MYSQL_USER' || true)"
     DB_NAME="$(docker_inspect_env_value "$db_container" 'MYSQL_DATABASE' || true)"
     DB_PASSWORD="$(docker_inspect_env_value "$db_container" 'MYSQL_PASSWORD' || true)"
@@ -553,23 +996,21 @@ detect_log_database() {
   fi
   log_info "检测到 NewAPI 启用了日志分库（LOG_SQL_DSN），开始配置独立日志库连接..."
 
-  local engine host port user pass db
-  engine="$(extract_dsn_engine "$raw" || true)"
-  host="$(extract_dsn_host "$raw" || true)"
-  port="$(extract_dsn_port "$raw" || true)"
-  user="$(extract_dsn_user "$raw" || true)"
-  pass="$(extract_dsn_password "$raw" || true)"
-  db="$(extract_dsn_dbname "$raw" || true)"
-  [[ -n "$host" && -n "$db" ]] || { log_warn "无法解析 LOG_SQL_DSN（host/dbname 缺失），跳过日志库配置"; return 0; }
+  local engine host port db
+  engine="$(extract_dsn_engine "$raw")" || die "LOG_SQL_DSN 不受支持或格式不安全；原始 DSN 已隐藏"
+  host="$(extract_dsn_host "$raw")" || die "无法从 LOG_SQL_DSN 安全解析 host；原始 DSN 已隐藏"
+  port="$(extract_dsn_port "$raw")" || die "无法从 LOG_SQL_DSN 安全解析端口；原始 DSN 已隐藏"
+  db="$(extract_dsn_dbname "$raw")" || die "无法从 LOG_SQL_DSN 安全解析数据库名；原始 DSN 已隐藏"
+  [[ -n "$host" && -n "$db" ]] || die "LOG_SQL_DSN 缺少 host 或 dbname；原始 DSN 已隐藏"
   if [[ "$engine" == "mysql" ]]; then port="${port:-3306}"; else engine="postgres"; port="${port:-5432}"; fi
 
   # 与主库同款的连接方式改写
   if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]; then
     local _hit _net _name _port
-    _hit="$(find_container_by_published_port "$port")"
+    _hit="$(find_container_by_published_port "$host" "$port")"
     _net="$(printf '%s' "$_hit" | cut -f1)"; _name="$(printf '%s' "$_hit" | cut -f2)"; _port="$(printf '%s' "$_hit" | cut -f3)"
     if [[ -n "$_net" && -n "$_name" ]]; then
-      log_warn "日志库 127.0.0.1:${port} 实为容器 '${_name}'（端口仅发布在宿主机回环）"
+      log_warn "日志库 ${host}:${port} 实为容器 '${_name}'（端口仅发布在宿主机回环）"
       log_info "将把 newapi-tools 接入网络 '${_net}'，用容器名 '${_name}:${_port}' 直连"
       host="$_name"; port="$_port"; LOG_NETWORK="$_net"
     else
@@ -591,11 +1032,8 @@ detect_log_database() {
     log_info "日志库地址为主机名/外部地址，原样使用: ${host}"
   fi
 
-  if [[ "$engine" == "mysql" ]]; then
-    LOG_SQL_DSN_FINAL="${user}:${pass}@tcp(${host}:${port})/${db}?charset=utf8mb4&parseTime=True"
-  else
-    LOG_SQL_DSN_FINAL="host=${host} port=${port} user=${user} password=${pass} dbname=${db} sslmode=disable"
-  fi
+  LOG_SQL_DSN_FINAL="$(rewrite_dsn_host_port "$raw" "$host" "$port")" ||
+    die "无法安全改写 LOG_SQL_DSN 的数据库地址；原始 DSN 已隐藏"
 
   # 日志库网络与主库不同时，追加日志叠加层并接入网络（相同则工具已在该网络上）
   if [[ -n "$LOG_NETWORK" && "$LOG_NETWORK" != "${NEWAPI_NETWORK:-}" ]]; then
@@ -664,22 +1102,41 @@ interactive_config() {
   if [[ -z "${FRONTEND_BIND:-}" ]]; then
     echo ""
     echo -e "${YELLOW}前端端口暴露范围${NC}"
-    echo -e "  ${BLUE}1) 公网可达${NC}    任何 IP 都能 http://server-ip:${FRONTEND_PORT} 直接访问 ${BLUE}(默认，便于快速使用)${NC}"
-    echo -e "  ${GREEN}2) 仅本机${NC}      仅监听 127.0.0.1，需自行配宿主机 nginx 反代到 HTTPS 域名 ${GREEN}(更安全)${NC}"
+    echo -e "  ${GREEN}1) 仅本机${NC}      仅监听 127.0.0.1，需自行配宿主机 nginx / Caddy 反代到 HTTPS 域名 ${GREEN}(默认，推荐)${NC}"
+    echo -e "  ${YELLOW}2) 公网可达${NC}    显式监听 0.0.0.0；必须置于 HTTPS 反向代理、访问控制和防火墙之后"
     read -r -p "请选择 [1/2，回车默认 1]: " bind_choice
     case "$bind_choice" in
       2)
-        FRONTEND_BIND="127.0.0.1"
-        log_info "已选仅本机模式，部署完成后请配置宿主机 nginx 反代"
+        FRONTEND_BIND="0.0.0.0"
+        log_warn "已显式选择公网模式；请勿使用明文 HTTP，必须配置 HTTPS 反向代理和访问控制"
         ;;
       *)
-        FRONTEND_BIND="0.0.0.0"
-        log_info "已选公网模式，可直接通过 IP:${FRONTEND_PORT} 访问"
+        FRONTEND_BIND="127.0.0.1"
+        log_info "已选仅本机模式，部署完成后请配置宿主机 HTTPS 反向代理"
         ;;
     esac
   fi
 
+  # Go 仅在直接对端命中此精确列表时解析 X-Forwarded-For。
+  # 合并镜像的内层 Nginx 通过 loopback 访问后端。
+  TRUSTED_PROXY_CIDRS="${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}"
+
   echo ""
+}
+
+ensure_container_on_network() {
+	local container="$1" network="$2" label="$3"
+	[[ -n "$network" ]] || return 0
+	if container_is_on_network "$container" "$network"; then
+		return 0
+	fi
+	log_info "连接到${label}: $network"
+	if ! docker network connect "$network" "$container" 2>/dev/null &&
+		! container_is_on_network "$container" "$network"; then
+		die "无法连接到${label} '$network'，请检查网络是否存在以及 Docker 权限"
+	fi
+	container_is_on_network "$container" "$network" || die "连接${label} '$network' 后验证失败"
+	log_success "已连接到${label}: $network"
 }
 
 #######################################
@@ -690,11 +1147,16 @@ generate_env_file() {
 
   # 构建 SQL_DSN
   local sql_dsn=""
-  if [[ "$DB_ENGINE" == "postgres" ]]; then
+  if [[ -n "${SOURCE_SQL_DSN:-}" ]]; then
+    sql_dsn="$(rewrite_dsn_host_port "$SOURCE_SQL_DSN" "$DB_DNS" "$DB_PORT")" ||
+      die "无法安全改写 NewAPI 数据库 DSN；原始 DSN 已隐藏"
+  elif [[ "$DB_ENGINE" == "postgres" ]]; then
     sql_dsn="host=${DB_DNS} port=${DB_PORT} user=${DB_USER} password=${DB_PASSWORD} dbname=${DB_NAME} sslmode=disable"
   elif [[ "$DB_ENGINE" == "mysql" ]]; then
     sql_dsn="${DB_USER}:${DB_PASSWORD}@tcp(${DB_DNS}:${DB_PORT})/${DB_NAME}?charset=utf8mb4&parseTime=True"
   fi
+	local jwt_secret
+	jwt_secret="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)"
 
   # 给生成的 .env 标记网络模式，方便后续 status / 故障排查辨认
   local network_mode_tag="custom"
@@ -706,40 +1168,56 @@ generate_env_file() {
 # 由 deploy.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 网络部署模式: ${network_mode_tag}
 
+# 完整镜像引用（支持 tag 或 repo@sha256:digest）
+NEWAPI_TOOLS_IMAGE=$(dotenv_quote "$NEWAPI_TOOLS_IMAGE")
+
 # NewAPI 环境
 NEWAPI_CONTAINER=${NEWAPI_CONTAINER}
 NEWAPI_NETWORK=${NEWAPI_NETWORK}
+# 供 install.sh 在容器重建后恢复手动附加的网络
+NEWAPI_NETWORK_MODE=${network_mode_tag}
+NEWAPI_ORIGINAL_NETWORK=${ORIGINAL_NETWORK:-}
+# 仅当 NewAPI 容器明确配置 REDIS_CONN_STRING=（空）时为 true；未知或非空均为 false
+NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
+# 高风险兼容开关：默认禁止旁路批量判定/删除不活跃用户，请优先使用 NewAPI 管理 API
+ALLOW_UNSAFE_BATCH_DELETE=false
+# 高风险兼容开关：默认禁止不完整的直接数据库永久删除，请优先使用 NewAPI 管理 API
+ALLOW_UNSAFE_HARD_DELETE=false
+# 隐私敏感：默认不持续覆盖用户的 record_ip_log 设置
+ENFORCE_IP_RECORDING=false
 
 # 数据库配置 (Go 版本推荐 SQL_DSN)
-SQL_DSN=${sql_dsn}
+SQL_DSN=$(dotenv_quote "$sql_dsn")
 DB_ENGINE=${DB_ENGINE}
 DB_DNS=${DB_DNS}
 DB_PORT=${DB_PORT}
-DB_NAME=${DB_NAME}
-DB_USER=${DB_USER}
-DB_PASSWORD=${DB_PASSWORD}
+DB_NAME=$(dotenv_quote "$DB_NAME")
+DB_USER=$(dotenv_quote "$DB_USER")
+DB_PASSWORD=$(dotenv_quote "$DB_PASSWORD")
 
 # 日志分库 (NewAPI 启用 LOG_SQL_DSN 时自动检测；为空则日志查询回落主库)
-LOG_SQL_DSN=${LOG_SQL_DSN_FINAL:-}
+LOG_SQL_DSN=$(dotenv_quote "${LOG_SQL_DSN_FINAL:-}")
 # 日志库容器所在网络 (与主库不同时由 docker-compose.logdb.yml 叠加层接入)
 LOG_NETWORK=${LOG_NETWORK:-}
 
 # 认证配置
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-API_KEY=${API_KEY}
+ADMIN_PASSWORD=$(dotenv_quote "$ADMIN_PASSWORD")
+API_KEY=$(dotenv_quote "$API_KEY")
 
 # 服务配置
 FRONTEND_PORT=${FRONTEND_PORT}
 FRONTEND_BIND=${FRONTEND_BIND}
+# 外层反向代理存在时，请追加内层 Nginx 实际看到的代理 IP（精确 /32 或 /128）
+TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS}
 TIMEZONE=Asia/Shanghai
 LOG_LEVEL=info
 
 # JWT 配置
-JWT_SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)
+JWT_SECRET=$(dotenv_quote "$jwt_secret")
 JWT_EXPIRE_HOURS=24
 
 # Redis 配置
-REDIS_PASSWORD=
+REDIS_PASSWORD=''
 EOF
 
   chmod 600 "$ENV_FILE"
@@ -818,33 +1296,36 @@ start_services() {
   # 下载 GeoIP 数据库
   download_geoip_database
 
+  # 先拉取成功再停止旧容器，避免镜像不存在/网络失败造成不必要停机。
+  log_info "拉取部署镜像 ${NEWAPI_TOOLS_IMAGE}..."
+  if ! $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
+
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
     log_warn "发现已存在的服务容器，正在停止..."
     $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" down 2>/dev/null || true
   fi
 
-  # 拉取最新镜像
-  log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull
-
   # 启动服务
   $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" up -d
 
   # 将容器连接到 NewAPI 网络（用于访问数据库）
-  # 注意：docker-compose.yml 中也配置了网络，这里是双重保障
-  # bridge / host 模式下跳过：bridge 用 IPv4 地址；host 用 host.docker.internal
+  # 注意：docker-compose.yml 中也配置了网络，这里是双重保障。
+  # 默认 bridge 模式使用数据库容器的 bridge IPv4，因此必须额外接回原始 bridge。
   if [[ "$USE_HOST_MODE" == "true" ]]; then
     log_info "host 模式：跳过 docker network connect"
-  elif [[ "$USE_BRIDGE_MODE" != "true" && -n "$NEWAPI_NETWORK" ]]; then
-    log_info "连接到 NewAPI 网络: $NEWAPI_NETWORK"
-    docker network connect "$NEWAPI_NETWORK" newapi-tools 2>/dev/null || log_warn "网络已连接"
+  elif [[ "$USE_BRIDGE_MODE" == "true" ]]; then
+    local bridge_network="${ORIGINAL_NETWORK:-bridge}"
+    ensure_container_on_network "newapi-tools" "$bridge_network" "NewAPI 原始 bridge 网络"
+  elif [[ -n "$NEWAPI_NETWORK" ]]; then
+    ensure_container_on_network "newapi-tools" "$NEWAPI_NETWORK" "NewAPI 网络"
   fi
 
   # 日志库在另一条网络上时，把工具也接入（叠加层已配置，这里双重保障）
   if [[ -n "${LOG_NETWORK:-}" ]]; then
-    log_info "连接到日志库网络: $LOG_NETWORK"
-    docker network connect "$LOG_NETWORK" newapi-tools 2>/dev/null || log_warn "日志库网络已连接"
+    ensure_container_on_network "newapi-tools" "$LOG_NETWORK" "日志库网络"
   fi
 
   log_success "服务已启动!"
@@ -871,11 +1352,13 @@ start_services() {
        proxy_pass http://127.0.0.1:${FRONTEND_PORT};
        proxy_set_header Host \$host;
        proxy_set_header X-Real-IP \$remote_addr;
-       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+       # 覆盖客户端自带的 X-Forwarded-For，防止伪造限流身份。
+       proxy_set_header X-Forwarded-For \$remote_addr;
        proxy_set_header X-Forwarded-Proto \$scheme;
      }
    }
 NGINX
+    echo -e "${YELLOW}提示：若内层 Nginx 看到的外层代理来源不是 loopback，请把该精确 IP（/32 或 /128）追加到 .env 的 TRUSTED_PROXY_CIDRS。${NC}"
   else
     echo -e "前端访问地址: ${BLUE}http://${server_ip}:${FRONTEND_PORT}${NC}"
     echo -e "API 地址: ${BLUE}http://${server_ip}:${FRONTEND_PORT}/api${NC}"
@@ -957,8 +1440,10 @@ NewAPI Middleware Tool - 一键部署脚本
   NEWAPI_NETWORK     指定 Docker 网络名 (默认: 自动检测)
   ADMIN_PASSWORD     前端访问密码 (默认: 交互式输入)
   API_KEY            后端 API Key (默认: 交互式输入或自动生成)
+  NEWAPI_TOOLS_IMAGE 完整镜像 tag/digest (默认: 当前 Git tag/commit；无 Git 时为 0.2.0)
   FRONTEND_PORT      前端端口 (默认: 1145)
   FRONTEND_BIND      前端端口绑定网卡 0.0.0.0/127.0.0.1 (默认: 交互式选择)
+  TRUSTED_PROXY_CIDRS 允许解析其 XFF 的精确代理 IP/CIDR (默认: loopback)
 
 示例:
   # 基本部署
@@ -996,6 +1481,7 @@ main() {
       ;;
     "")
       # 正常部署流程
+      resolve_deploy_image
       echo ""
       echo -e "${BLUE}========================================${NC}"
       echo -e "${BLUE}  NewAPI Middleware Tool 部署脚本${NC}"
@@ -1015,4 +1501,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

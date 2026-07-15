@@ -4,7 +4,8 @@
  */
 
 const DB_NAME = 'newapi_middleware'
-const DB_VERSION = 1
+const DB_VERSION = 2
+const LEGACY_SENSITIVE_STORAGE_KEYS = ['generation_history', 'redemption_history'] as const
 
 // Store names
 const STORES = {
@@ -20,7 +21,8 @@ export interface GenerationRecord {
   name: string
   quota: number
   count: number
-  keys: string[]
+  quota_mode: 'fixed' | 'random'
+  expire_mode: 'never' | 'days' | 'date'
   expiresAt?: number
 }
 
@@ -37,28 +39,61 @@ export interface CacheEntry {
 }
 
 let db: IDBDatabase | null = null
+let dbOpenPromise: Promise<IDBDatabase> | null = null
 
 /**
  * Open and initialize the IndexedDB database.
  */
 async function openDatabase(): Promise<IDBDatabase> {
   if (db) return db
+  if (dbOpenPromise) return dbOpenPromise
 
-  return new Promise((resolve, reject) => {
+  dbOpenPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION)
+    let settled = false
 
     request.onerror = () => {
+      if (settled) return
+      settled = true
+      dbOpenPromise = null
       console.error('Failed to open IndexedDB:', request.error)
       reject(request.error)
     }
 
+    request.onblocked = () => {
+      if (settled) return
+      settled = true
+      dbOpenPromise = null
+      reject(new Error('IndexedDB security upgrade is blocked by another open tab'))
+    }
+
     request.onsuccess = () => {
-      db = request.result
-      resolve(db)
+      const database = request.result
+      if (settled) {
+        database.close()
+        return
+      }
+      settled = true
+      database.onversionchange = () => {
+        database.close()
+        if (db === database) {
+          db = null
+          dbOpenPromise = null
+        }
+      }
+      db = database
+      resolve(database)
     }
 
     request.onupgradeneeded = (event) => {
       const database = (event.target as IDBOpenDBRequest).result
+
+      // v1 stored complete redemption codes in plaintext. Recreate only this
+      // store so the security migration cannot accidentally retain old keys;
+      // preferences and non-sensitive cache entries remain intact.
+      if ((event as IDBVersionChangeEvent).oldVersion < 2 && database.objectStoreNames.contains(STORES.HISTORY)) {
+        database.deleteObjectStore(STORES.HISTORY)
+      }
 
       // Generation history store
       if (!database.objectStoreNames.contains(STORES.HISTORY)) {
@@ -79,6 +114,8 @@ async function openDatabase(): Promise<IDBDatabase> {
       }
     }
   })
+
+  return dbOpenPromise
 }
 
 /**
@@ -406,66 +443,15 @@ export async function clearAllCache(): Promise<void> {
   })
 }
 
-// ============================================
-// Migration from localStorage
-// ============================================
+function clearLegacySensitiveStorage(): void {
+  if (typeof localStorage === 'undefined') return
 
-interface LegacyHistoryEntry {
-  id: string
-  timestamp: number
-  name: string
-  quota: number
-  count: number
-  keys: string[]
-}
-
-/**
- * Migrate generation history from localStorage to IndexedDB.
- */
-export async function migrateFromLocalStorage(): Promise<number> {
-  const LEGACY_KEY = 'generation_history'
-  const legacyData = localStorage.getItem(LEGACY_KEY)
-
-  if (!legacyData) {
-    return 0
-  }
-
-  try {
-    const entries = JSON.parse(legacyData) as LegacyHistoryEntry[]
-    const database = await ensureDB()
-    let migratedCount = 0
-
-    for (const entry of entries) {
-      const record: GenerationRecord = {
-        id: entry.id || `gen_${entry.timestamp}_${Math.random().toString(36).substring(2, 9)}`,
-        timestamp: entry.timestamp,
-        name: entry.name,
-        quota: entry.quota,
-        count: entry.count,
-        keys: entry.keys,
-      }
-
-      await new Promise<void>((resolve, reject) => {
-        const transaction = database.transaction(STORES.HISTORY, 'readwrite')
-        const store = transaction.objectStore(STORES.HISTORY)
-        const request = store.put(record)
-
-        request.onsuccess = () => {
-          migratedCount++
-          resolve()
-        }
-        request.onerror = () => reject(request.error)
-      })
+  for (const key of LEGACY_SENSITIVE_STORAGE_KEYS) {
+    try {
+      localStorage.removeItem(key)
+    } catch (error) {
+      console.error(`Failed to remove legacy sensitive storage key ${key}:`, error)
     }
-
-    // Clear localStorage after successful migration
-    localStorage.removeItem(LEGACY_KEY)
-    console.log(`Migrated ${migratedCount} records from localStorage to IndexedDB`)
-
-    return migratedCount
-  } catch (error) {
-    console.error('Failed to migrate from localStorage:', error)
-    return 0
   }
 }
 
@@ -477,9 +463,12 @@ export async function migrateFromLocalStorage(): Promise<number> {
  * Initialize the IndexedDB service and run migrations.
  */
 export async function initializeStorage(): Promise<void> {
+  // Remove legacy plaintext before any asynchronous IndexedDB work. These
+  // values are intentionally discarded rather than migrated.
+  clearLegacySensitiveStorage()
+
   try {
     await openDatabase()
-    await migrateFromLocalStorage()
     await cleanupExpiredCache()
     console.log('IndexedDB storage initialized')
   } catch (error) {

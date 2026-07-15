@@ -38,7 +38,7 @@ func GetLeaderboards(c *gin.Context) {
 	svc := service.NewRiskMonitoringService()
 	data, err := svc.GetLeaderboards(windows, limit, sortBy)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "risk leaderboard query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -69,7 +69,7 @@ func GetUserRiskAnalysis(c *gin.Context) {
 	svc := service.NewRiskMonitoringService()
 	data, err := svc.GetUserAnalysis(userID, seconds, endTime)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user risk analysis query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -108,7 +108,7 @@ func GetTokenRotationUsers(c *gin.Context) {
 	svc := service.NewRiskMonitoringService()
 	data, err := svc.GetTokenRotationUsers(window, minTokens, maxReqPerToken, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "token rotation risk query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -122,7 +122,7 @@ func GetAffiliatedAccounts(c *gin.Context) {
 	svc := service.NewRiskMonitoringService()
 	data, err := svc.GetAffiliatedAccounts(minInvited, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "affiliated account risk query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -141,7 +141,7 @@ func GetSameIPRegistrations(c *gin.Context) {
 	svc := service.NewRiskMonitoringService()
 	data, err := svc.GetSameIPRegistrations(window, minUsers, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "same-IP registration risk query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

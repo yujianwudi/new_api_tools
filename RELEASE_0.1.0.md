@@ -1,5 +1,8 @@
 # NewAPI Middleware Tool v0.1.0 发行说明
 
+> [!WARNING]
+> 这是历史发行说明。v0.1.0 脚本曾内置众所周知的六位弱管理密码；该默认值不安全，现有部署必须立即改为高强度随机密码，并优先升级到最新版本。
+
 我们很高兴地宣布 **NewAPI Middleware Tool v0.1.0** 正式发布！该工具为 NewAPI 提供了一个全面的管理界面，具备高级分析、风控监控和高效的资源管理功能。
 
 ## 🌟 项目概述
@@ -156,7 +159,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 |--------|------|-------------|
 | **基础配置** | | |
 | `FRONTEND_PORT` | 服务访问端口 | `1145` |
-| `ADMIN_PASSWORD` | 管理后台登录密码 | `123456` |
+| `ADMIN_PASSWORD` | 管理后台登录密码 | 必须自行设置高强度随机密码；严禁继续使用 v0.1.0 的弱默认值 |
 | `API_KEY` | 后端 API 密钥（可选） | - |
 | `JWT_SECRET` | JWT 签名密钥 | `random_string` |
 | `JWT_EXPIRE_HOURS` | JWT 过期时间（小时） | `24` |

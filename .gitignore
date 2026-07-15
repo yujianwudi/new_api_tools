@@ -43,6 +43,7 @@ logs/
 
 # Environment
 .env
+.env.backup.*
 .env.local
 .env.*.local
 

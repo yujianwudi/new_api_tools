@@ -343,8 +343,9 @@ export function IPLookup() {
                             {idx === 0 ? (
                               <td className="py-2.5 px-4 align-top" rowSpan={group.tokens.length}>
                                 {/* 胶囊状可点击用户标签 - 与用户管理一致 */}
-                                <div
-                                  className="flex items-center gap-2 px-2 py-1 rounded-full bg-muted/50 hover:bg-primary/10 hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20 w-fit"
+                                <button
+                                  type="button"
+                                  className="flex items-center gap-2 px-2 py-1 rounded-full bg-muted/50 hover:bg-primary/10 hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20 w-fit focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
                                   onClick={() => openUserAnalysis(group.user_id, group.username)}
                                   title="查看用户分析"
                                 >
@@ -362,7 +363,7 @@ export function IPLookup() {
                                       )}
                                     </span>
                                   </div>
-                                </div>
+                                </button>
                               </td>
                             ) : null}
                             <td className="py-2.5 px-4">

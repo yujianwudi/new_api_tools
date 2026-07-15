@@ -38,18 +38,6 @@ func main() {
 	}
 	defer database.Close()
 
-	// Ensure indexes (background, with delay to reduce load)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logger.L.Error(fmt.Sprintf("索引创建 goroutine panic: %v", r))
-			}
-		}()
-		time.Sleep(2 * time.Second)
-		db := database.Get()
-		db.EnsureIndexes(true, 500*time.Millisecond)
-	}()
-
 	// ========== 4. Initialize Redis cache ==========
 	if cfg.RedisConnString != "" {
 		_, err := cache.Init(cfg.RedisConnString)
@@ -64,6 +52,15 @@ func main() {
 	// ========== 5. Setup Gin router ==========
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	trustedProxyCIDRs, trustedProxyConfigValid := handler.TrustedProxyCIDRsForGin(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if !trustedProxyConfigValid {
+		logger.L.Warn("TRUSTED_PROXY_CIDRS 配置无效，Gin 客户端 IP 解析已禁用代理信任")
+		trustedProxyCIDRs = nil
+	}
+	if err := r.SetTrustedProxies(trustedProxyCIDRs); err != nil {
+		logger.L.Warn("Gin 可信代理配置失败，已禁用代理信任: " + err.Error())
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	// Global middleware
 	r.Use(middleware.ErrorHandlerMiddleware())  // Panic recovery
@@ -115,9 +112,15 @@ func main() {
 
 	// ========== 7. Background tasks ==========
 
-	// IP recording enforcement: check every 10 minutes, enable if any user disabled it
+	// IP recording enforcement changes every user's privacy setting, so it is
+	// opt-in rather than an unconditional background write.
 	stopIPEnforce := make(chan struct{})
-	go backgroundEnforceIPRecording(stopIPEnforce)
+	if cfg.EnforceIPRecording {
+		logger.L.Warn("[IP记录] ENFORCE_IP_RECORDING=true，已启用每 10 分钟强制写入任务")
+		go backgroundEnforceIPRecording(stopIPEnforce)
+	} else {
+		logger.L.System("[IP记录] 自动强制开启已禁用；可在管理界面手动执行")
+	}
 
 	stopAbuseBroadcast := make(chan struct{})
 	go backgroundSyncAbuseBroadcast(stopAbuseBroadcast)
@@ -263,8 +266,9 @@ func backgroundSyncAbuseBroadcast(stop <-chan struct{}) {
 			return idleInterval, false
 		}
 		seconds := settings.PullIntervalSeconds
-		if seconds <= 0 {
-			seconds = 300
+		if seconds < service.MinAbuseBroadcastPullIntervalSeconds ||
+			seconds > service.MaxAbuseBroadcastPullIntervalSeconds {
+			seconds = service.DefaultAbuseBroadcastPullIntervalSeconds
 		}
 		return time.Duration(seconds) * time.Second, true
 	}

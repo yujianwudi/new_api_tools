@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertTriangle,
   Database,
@@ -123,6 +123,10 @@ type ApiEnvelope<T> = {
 
 type BroadcastView = 'inbox' | 'outgoing' | 'status'
 
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
+}
+
 const emptySettingsForm: SettingsForm = {
   enabled: false,
   hub_url: '',
@@ -147,6 +151,8 @@ export function AbuseBroadcast() {
   const [matchResult, setMatchResult] = useState<MatchResult | null>(null)
   const [matchLoading, setMatchLoading] = useState(false)
   const [matchError, setMatchError] = useState('')
+  const matchGenerationRef = useRef(0)
+  const matchAbortRef = useRef<AbortController | null>(null)
   const [analysisUser, setAnalysisUser] = useState<{ userId: number; username: string } | null>(null)
   const [settings, setSettings] = useState<BroadcastSettings | null>(null)
   const [settingsForm, setSettingsForm] = useState<SettingsForm>(emptySettingsForm)
@@ -246,6 +252,12 @@ export function AbuseBroadcast() {
     void refresh()
   }, [refresh])
 
+  useEffect(() => () => {
+    matchGenerationRef.current += 1
+    matchAbortRef.current?.abort()
+    matchAbortRef.current = null
+  }, [])
+
   useEffect(() => {
     const listener = () => setActiveView('inbox')
     window.addEventListener('abuse-broadcast-open-inbox', listener)
@@ -282,6 +294,14 @@ export function AbuseBroadcast() {
   }
 
   const openReportDetail = async (report: BroadcastReport) => {
+    matchAbortRef.current?.abort()
+    const controller = new AbortController()
+    matchAbortRef.current = controller
+    const generation = ++matchGenerationRef.current
+    const isCurrentRequest = () => (
+      generation === matchGenerationRef.current && !controller.signal.aborted
+    )
+
     const nextReport = { ...report, read_at: report.read_at || Math.floor(Date.now() / 1000) }
     setSelectedReport(nextReport)
     setMatchResult(null)
@@ -289,18 +309,42 @@ export function AbuseBroadcast() {
     setMatchLoading(true)
     try {
       if (!report.read_at) {
-        await readAPI(`/api/abuse-broadcast/reports/${encodeURIComponent(report.report_id)}/read`, { method: 'POST' })
+        await readAPI(`/api/abuse-broadcast/reports/${encodeURIComponent(report.report_id)}/read`, {
+          method: 'POST',
+        })
         setReports(prev => prev.map(item => item.report_id === report.report_id ? nextReport : item))
         window.dispatchEvent(new CustomEvent('abuse-broadcast-unread-changed'))
       }
-      const matches = await readAPI<MatchResult>(`/api/abuse-broadcast/reports/${encodeURIComponent(report.report_id)}/matches`)
-      setMatchResult(matches)
+      const matches = await readAPI<MatchResult>(
+        `/api/abuse-broadcast/reports/${encodeURIComponent(report.report_id)}/matches`,
+        { signal: controller.signal },
+      )
+      if (isCurrentRequest()) {
+        setMatchResult(matches)
+      }
     } catch (err) {
-      setMatchError(err instanceof Error ? err.message : '匹配失败')
+      if (isCurrentRequest() && !isAbortError(err)) {
+        setMatchError(err instanceof Error ? err.message : '匹配失败')
+      }
     } finally {
-      setMatchLoading(false)
+      if (generation === matchGenerationRef.current) {
+        setMatchLoading(false)
+        if (matchAbortRef.current === controller) {
+          matchAbortRef.current = null
+        }
+      }
     }
   }
+
+  const closeReportDetail = useCallback(() => {
+    matchGenerationRef.current += 1
+    matchAbortRef.current?.abort()
+    matchAbortRef.current = null
+    setSelectedReport(null)
+    setMatchResult(null)
+    setMatchError('')
+    setMatchLoading(false)
+  }, [])
 
   const unreadCount = useMemo(() => reports.filter(report => !report.read_at).length, [reports])
 
@@ -506,7 +550,7 @@ export function AbuseBroadcast() {
         matchResult={matchResult}
         loading={matchLoading}
         error={matchError}
-        onClose={() => setSelectedReport(null)}
+        onClose={closeReportDetail}
         onOpenUser={(user) => setAnalysisUser({ userId: user.user_id, username: user.username || `用户#${user.user_id}` })}
       />
 

@@ -24,6 +24,12 @@ var SkipPrefixes = []string{
 // Matches Python's verify_auth dependency
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Authenticated API responses can contain admin JWTs, redemption codes,
+		// user data, or other bearer secrets. Prevent private browser caches and
+		// intermediaries from retaining them, including the whitelisted login path.
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+
 		path := c.Request.URL.Path
 
 		// Skip authentication for health check endpoints

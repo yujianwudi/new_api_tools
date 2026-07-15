@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/logger"
+	"github.com/new-api-tools/backend/internal/security"
 )
 
 // LookupResult holds the result of a linux.do username lookup.
@@ -69,7 +69,8 @@ func NewLinuxDoLookupService() *LinuxDoLookupService {
 
 	if cfg := config.Get(); cfg != nil && cfg.LinuxDoProxyURL != "" {
 		options = append(options, tls_client.WithProxyUrl(cfg.LinuxDoProxyURL))
-		logger.L.Info(fmt.Sprintf("[LinuxDoLookup] 使用代理: %s", cfg.LinuxDoProxyURL))
+		// Proxy URLs commonly contain usernames/passwords. Never emit the URL.
+		logger.L.Info("[LinuxDoLookup] 代理已配置（凭据已隐藏）")
 	}
 
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
@@ -153,7 +154,7 @@ func (s *LinuxDoLookupService) LookupUsername(linuxDoID string) (*LookupResult, 
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := security.ReadLimitedBody(resp.Body, 2<<20)
 	if err != nil {
 		return nil, &LookupError{
 			ErrorType:  "network",

@@ -19,7 +19,10 @@ func installSQLiteForTests(t *testing.T) *sqlx.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	database.SetForTesting(&database.Manager{DB: db, IsPG: false})
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		database.SetForTesting(nil)
+		_ = db.Close()
+	})
 	return db
 }
 

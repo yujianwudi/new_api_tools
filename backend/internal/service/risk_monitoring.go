@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
-	"github.com/new-api-tools/backend/internal/logger"
 )
 
 // RiskMonitoringService handles risk detection queries
@@ -17,6 +15,8 @@ type RiskMonitoringService struct {
 	db    *database.Manager
 	logDB *database.Manager
 }
+
+const riskMonitoringQueryTimeout = 30 * time.Second
 
 // NewRiskMonitoringService creates a new RiskMonitoringService
 func NewRiskMonitoringService() *RiskMonitoringService {
@@ -26,9 +26,9 @@ func NewRiskMonitoringService() *RiskMonitoringService {
 // enrichUserInfo backfills username/display_name (preferring display_name) and
 // user_status onto log-derived leaderboard rows by querying the main users
 // table. Replaces an in-query JOIN so it works when logs live in a separate DB.
-func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) {
+func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) error {
 	if len(rows) == 0 {
-		return
+		return nil
 	}
 	ids := make([]interface{}, 0, len(rows))
 	seen := make(map[int64]bool)
@@ -40,7 +40,7 @@ func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) {
 		}
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 
 	ph := make([]string, len(ids))
@@ -48,9 +48,9 @@ func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) {
 		ph[i] = s.db.Placeholder(i + 1)
 	}
 	q := fmt.Sprintf("SELECT id, username, display_name, status FROM users WHERE id IN (%s) AND deleted_at IS NULL", strings.Join(ph, ","))
-	urows, err := s.db.Query(q, ids...)
+	urows, err := s.db.QueryWithTimeout(riskMonitoringQueryTimeout, q, ids...)
 	if err != nil {
-		return
+		return fmt.Errorf("risk leaderboard user enrichment failed: %w", err)
 	}
 	type uinfo struct {
 		name   string
@@ -78,6 +78,7 @@ func (s *RiskMonitoringService) enrichUserInfo(rows []map[string]interface{}) {
 		}
 		r["user_status"] = info.status
 	}
+	return nil
 }
 
 // GetLeaderboards returns usage leaderboards across multiple time windows
@@ -128,14 +129,15 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 			ORDER BY %s
 			LIMIT ?`, orderBy))
 
-		rows, err := s.logDB.Query(query, startTime, now, limit)
+		rows, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, query, startTime, now, limit)
 		if err != nil {
-			windowsData[window] = []map[string]interface{}{}
-			continue
+			return nil, fmt.Errorf("risk leaderboard query for %s failed: %w", window, err)
 		}
 
 		// Enrich with display_name / status from the main users table.
-		s.enrichUserInfo(rows)
+		if err := s.enrichUserInfo(rows); err != nil {
+			return nil, err
+		}
 
 		windowsData[window] = rows
 	}
@@ -162,8 +164,11 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	if s.db.IsPG {
 		groupCol = `"group"`
 	}
-	userRow, _ := s.db.QueryOne(s.db.RebindQuery(
+	userRow, err := s.db.QueryOneWithTimeout(riskMonitoringQueryTimeout, s.db.RebindQuery(
 		fmt.Sprintf("SELECT id, username, display_name, email, status, %s, remark, linux_do_id, request_count FROM users WHERE id = ? AND deleted_at IS NULL", groupCol)), userID)
+	if err != nil {
+		return nil, fmt.Errorf("risk user query failed: %w", err)
+	}
 
 	// Build user object
 	userInfo := map[string]interface{}{
@@ -171,7 +176,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		"username":     "",
 		"display_name": nil,
 		"email":        nil,
-		"status":       1,
+		"status":       nil,
 		"group":        nil,
 		"remark":       nil,
 		"linux_do_id":  nil,
@@ -203,7 +208,13 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		FROM logs
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND type IN (2, 5)`)
 
-	statsRow, _ := s.logDB.QueryOne(statsQuery, userID, startTime, now)
+	statsRow, err := s.logDB.QueryOneWithTimeout(riskMonitoringQueryTimeout, statsQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk summary query failed: %w", err)
+	}
+	if statsRow == nil {
+		return nil, fmt.Errorf("risk summary query returned no row for user %d", userID)
+	}
 
 	totalRequests := int64(0)
 	successRequests := int64(0)
@@ -217,19 +228,17 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	uniqueChannels := int64(0)
 	emptyCount := int64(0)
 
-	if statsRow != nil {
-		totalRequests = toInt64(statsRow["total_requests"])
-		successRequests = toInt64(statsRow["success_requests"])
-		failureRequests = toInt64(statsRow["failure_requests"])
-		quotaUsed = toInt64(statsRow["quota_used"])
-		promptTokens = toInt64(statsRow["prompt_tokens"])
-		completionTokens = toInt64(statsRow["completion_tokens"])
-		uniqueIPs = toInt64(statsRow["unique_ips"])
-		uniqueTokens = toInt64(statsRow["unique_tokens"])
-		uniqueModels = toInt64(statsRow["unique_models"])
-		uniqueChannels = toInt64(statsRow["unique_channels"])
-		emptyCount = toInt64(statsRow["empty_count"])
-	}
+	totalRequests = toInt64(statsRow["total_requests"])
+	successRequests = toInt64(statsRow["success_requests"])
+	failureRequests = toInt64(statsRow["failure_requests"])
+	quotaUsed = toInt64(statsRow["quota_used"])
+	promptTokens = toInt64(statsRow["prompt_tokens"])
+	completionTokens = toInt64(statsRow["completion_tokens"])
+	uniqueIPs = toInt64(statsRow["unique_ips"])
+	uniqueTokens = toInt64(statsRow["unique_tokens"])
+	uniqueModels = toInt64(statsRow["unique_models"])
+	uniqueChannels = toInt64(statsRow["unique_channels"])
+	emptyCount = toInt64(statsRow["empty_count"])
 
 	// Calculate rates
 	failureRate := 0.0
@@ -246,14 +255,18 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		SELECT COALESCE(AVG(use_time), 0) as avg_use_time
 		FROM logs
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND type = 2`)
-	avgRow, _ := s.logDB.QueryOne(avgUseTimeQuery, userID, startTime, now)
+	avgRow, err := s.logDB.QueryOneWithTimeout(riskMonitoringQueryTimeout, avgUseTimeQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk average use-time query failed: %w", err)
+	}
+	if avgRow == nil {
+		return nil, fmt.Errorf("risk average use-time query returned no row for user %d", userID)
+	}
 	avgUseTime := 0.0
-	if avgRow != nil {
-		if v, ok := avgRow["avg_use_time"].(float64); ok {
-			avgUseTime = v
-		} else {
-			avgUseTime = float64(toInt64(avgRow["avg_use_time"]))
-		}
+	if v, ok := avgRow["avg_use_time"].(float64); ok {
+		avgUseTime = v
+	} else {
+		avgUseTime = float64(toInt64(avgRow["avg_use_time"]))
 	}
 
 	// Summary
@@ -293,23 +306,14 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ?
 			AND type IN (2, 5) AND ip IS NOT NULL AND ip != ''
 		ORDER BY created_at ASC`)
-	ipSequence, _ := s.logDB.QueryWithTimeout(30*time.Second, ipSeqQuery, userID, startTime, now)
-	if ipSequence == nil {
-		ipSequence = []map[string]interface{}{}
+	ipSequence, err := s.logDB.QueryWithTimeout(30*time.Second, ipSeqQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk IP sequence query failed: %w", err)
 	}
 	ipSwitchAnalysis := analyzeIPSwitches(ipSequence)
 
 	// Risk flags
-	riskFlags := []string{}
-	if requestsPerMinute > 5.0 {
-		riskFlags = append(riskFlags, "HIGH_RPM")
-	}
-	if uniqueIPs > 10 {
-		riskFlags = append(riskFlags, "MANY_IPS")
-	}
-	if failureRate > 50.0 && totalRequests > 10 {
-		riskFlags = append(riskFlags, "HIGH_FAILURE_RATE")
-	}
+	riskFlags := usageRiskFlags(requestsPerMinute, uniqueIPs, failureRate, totalRequests)
 
 	// IP switch risk flags (matching Python logic)
 	avgIPDuration := toFloat64(ipSwitchAnalysis["avg_ip_duration"])
@@ -323,7 +327,10 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 
 	// Checkin anomaly detection
-	checkin := analyzeCheckins(s.db, userID, startTime, now)
+	checkin, err := analyzeCheckins(s.db, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk checkin analysis failed: %w", err)
+	}
 	var checkinAnalysisMap map[string]interface{}
 	if checkin != nil && checkin.CheckinCount > 0 {
 		requestsPerCheckin := float64(0)
@@ -367,9 +374,9 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		ORDER BY requests DESC
 		LIMIT 10`)
 
-	topModels, _ := s.logDB.Query(modelsQuery, userID, startTime, now)
-	if topModels == nil {
-		topModels = []map[string]interface{}{}
+	topModels, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, modelsQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk top-models query failed: %w", err)
 	}
 
 	// Top channels
@@ -383,9 +390,9 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		ORDER BY requests DESC
 		LIMIT 10`)
 
-	topChannels, _ := s.logDB.Query(channelsQuery, userID, startTime, now)
-	if topChannels == nil {
-		topChannels = []map[string]interface{}{}
+	topChannels, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, channelsQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk top-channels query failed: %w", err)
 	}
 
 	// Top IPs
@@ -397,9 +404,9 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		ORDER BY requests DESC
 		LIMIT 20`)
 
-	topIPs, _ := s.logDB.QueryWithTimeout(30*time.Second, ipsQuery, userID, startTime, now)
-	if topIPs == nil {
-		topIPs = []map[string]interface{}{}
+	topIPs, err := s.logDB.QueryWithTimeout(30*time.Second, ipsQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk top-IPs query failed: %w", err)
 	}
 
 	// Recent logs (token_name and channel_name are directly in logs table)
@@ -419,9 +426,9 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		ORDER BY id DESC
 		LIMIT 50`)
 
-	recentLogs, _ := s.logDB.Query(recentLogsQuery, userID, startTime, now)
-	if recentLogs == nil {
-		recentLogs = []map[string]interface{}{}
+	recentLogs, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, recentLogsQuery, userID, startTime, now)
+	if err != nil {
+		return nil, fmt.Errorf("risk recent-logs query failed: %w", err)
 	}
 
 	result := map[string]interface{}{
@@ -440,6 +447,20 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 
 	return result, nil
+}
+
+func usageRiskFlags(requestsPerMinute float64, uniqueIPs int64, failureRate float64, totalRequests int64) []string {
+	riskFlags := []string{}
+	if requestsPerMinute > 5.0 {
+		riskFlags = append(riskFlags, "HIGH_RPM")
+	}
+	if uniqueIPs > 10 {
+		riskFlags = append(riskFlags, "MANY_IPS")
+	}
+	if failureRate > 0.5 && totalRequests > 10 {
+		riskFlags = append(riskFlags, "HIGH_FAILURE_RATE")
+	}
+	return riskFlags
 }
 
 // GetTokenRotationUsers detects token rotation behavior
@@ -463,14 +484,14 @@ func (s *RiskMonitoringService) GetTokenRotationUsers(window string, minTokens, 
 			COUNT(DISTINCT l.token_id) as token_count,
 			COUNT(*) as total_requests
 		FROM logs l
-		WHERE l.created_at >= ? AND l.type IN (2, 5)
+		WHERE l.created_at >= ? AND l.type IN (2, 5) AND l.token_id > 0
 		GROUP BY l.user_id, l.username
 		HAVING COUNT(DISTINCT l.token_id) >= ?
 			AND (COUNT(*) * 1.0 / COUNT(DISTINCT l.token_id)) <= ?
 		ORDER BY token_count DESC
 		LIMIT ?`)
 
-	rows, err := s.logDB.Query(query, startTime, minTokens, maxReqPerToken, limit)
+	rows, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, query, startTime, minTokens, maxReqPerToken, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +533,7 @@ func (s *RiskMonitoringService) GetAffiliatedAccounts(minInvited, limit int) (ma
 		ORDER BY invited_count DESC
 		LIMIT ?`)
 
-	rows, err := s.db.Query(query, minInvited, limit)
+	rows, err := s.db.QueryWithTimeout(riskMonitoringQueryTimeout, query, minInvited, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -543,22 +564,29 @@ func (s *RiskMonitoringService) GetSameIPRegistrations(window string, minUsers, 
 		return cached, nil
 	}
 
-	// Find IPs with first requests from multiple users
+	// Find the first observed API IP for users whose first request falls in
+	// the selected window. Grouping by every historical (user_id, ip) pair
+	// over-counts ordinary IP changes as registrations.
 	query := s.logDB.RebindQuery(`
-		SELECT first_ip, COUNT(*) as user_count
-		FROM (
-			SELECT user_id, ip as first_ip
-			FROM logs
-			WHERE type IN (2, 5) AND ip IS NOT NULL AND ip != ''
-			AND created_at >= ?
-			GROUP BY user_id, ip
-		) sub
-		GROUP BY first_ip
+		SELECT first_log.ip as first_ip, COUNT(*) as user_count
+		FROM logs first_log
+		WHERE first_log.type IN (2, 5)
+			AND first_log.ip IS NOT NULL AND first_log.ip != ''
+			AND first_log.user_id > 0 AND first_log.created_at >= ?
+			AND NOT EXISTS (
+				SELECT 1 FROM logs earlier
+				WHERE earlier.user_id = first_log.user_id
+					AND earlier.type IN (2, 5)
+					AND earlier.ip IS NOT NULL AND earlier.ip != ''
+					AND (earlier.created_at < first_log.created_at
+						OR (earlier.created_at = first_log.created_at AND earlier.id < first_log.id))
+			)
+		GROUP BY first_log.ip
 		HAVING COUNT(*) >= ?
 		ORDER BY user_count DESC
 		LIMIT ?`)
 
-	rows, err := s.logDB.QueryWithTimeout(30*time.Second, query, startTime, minUsers, limit)
+	rows, err := s.logDB.QueryWithTimeout(riskMonitoringQueryTimeout, query, startTime, minUsers, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -587,11 +615,6 @@ func (s *RiskMonitoringService) ListBanRecords(page, pageSize int, action string
 
 // ========== Checkin Analysis ==========
 
-var (
-	checkinTableOnce   sync.Once
-	checkinTableExists bool
-)
-
 // checkinAnalysis holds checkin anomaly detection results
 type checkinAnalysis struct {
 	CheckinCount       int64   `json:"checkin_count"`
@@ -599,32 +622,31 @@ type checkinAnalysis struct {
 	RequestsPerCheckin float64 `json:"requests_per_checkin"`
 }
 
-// analyzeCheckins checks for checkin abuse patterns
-func analyzeCheckins(db *database.Manager, userID int64, startTime, endTime int64) *checkinAnalysis {
-	checkinTableOnce.Do(func() {
-		exists, err := db.TableExists("checkins")
-		if err != nil {
-			logger.L.Warn("检查 checkins 表失败: " + err.Error())
-			return
-		}
-		checkinTableExists = exists
-		if exists {
-			logger.L.System("checkins 表已检测到，启用签到分析")
-		}
-	})
+var checkinTableExistsCheck = func(db *database.Manager) (bool, error) {
+	return db.TableExists("checkins")
+}
 
-	if !checkinTableExists {
-		return nil
+// analyzeCheckins checks for checkin abuse patterns
+func analyzeCheckins(db *database.Manager, userID int64, startTime, endTime int64) (*checkinAnalysis, error) {
+	exists, err := checkinTableExistsCheck(db)
+	if err != nil {
+		return nil, fmt.Errorf("check checkins table: %w", err)
+	}
+	if !exists {
+		return nil, nil
 	}
 
-	row, err := db.QueryOne(db.RebindQuery(`
+	row, err := db.QueryOneWithTimeout(riskMonitoringQueryTimeout, db.RebindQuery(`
 		SELECT COUNT(*) as checkin_count,
-			COALESCE(SUM(quota), 0) as total_quota_awarded
+			COALESCE(SUM(quota_awarded), 0) as total_quota_awarded
 		FROM checkins
 		WHERE user_id = ? AND created_at >= ? AND created_at <= ?`),
 		userID, startTime, endTime)
-	if err != nil || row == nil {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("query checkins: %w", err)
+	}
+	if row == nil {
+		return nil, fmt.Errorf("query checkins returned no row for user %d", userID)
 	}
 
 	count := toInt64(row["checkin_count"])
@@ -633,7 +655,7 @@ func analyzeCheckins(db *database.Manager, userID int64, startTime, endTime int6
 	return &checkinAnalysis{
 		CheckinCount:      count,
 		TotalQuotaAwarded: quotaAwarded,
-	}
+	}, nil
 }
 
 // ========== IP Switch Analysis ==========

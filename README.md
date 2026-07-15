@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="Docs" src="https://img.shields.io/badge/docs-%E4%B8%AD%E6%96%87-E05243?style=for-the-badge" />
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.25.6-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.5-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img alt="Gin" src="https://img.shields.io/badge/Gin-1.11-008ECF?style=for-the-badge" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" />
   <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646CFF?style=for-the-badge&logo=vite&logoColor=white" />
@@ -26,13 +26,15 @@
 |---|---|
 | 项目定位 | NewAPI 的增强管理层，用于可视化、审计、风控和后台运维 |
 | 上游项目 | [QuantumNous/new-api](https://github.com/QuantumNous/new-api) |
+| 本项目来源 | 基于 [james-6-23/new_api_tools](https://github.com/james-6-23/new_api_tools) 持续优化 |
+| 路线图 | [P0–P4 产品与技术路线](./docs/ROADMAP.md) |
 | 运行方式 | 独立容器 / 独立进程，连接 NewAPI 现有数据库 |
 | 默认端口 | `1145` |
-| 后端栈 | Go `1.25.6`、Gin `1.11`、sqlx、Redis、SQLite 辅助缓存 |
+| 后端栈 | Go `1.26.5`、Gin `1.11`、sqlx、Redis、SQLite 辅助缓存 |
 | 前端栈 | React `19`、Vite `8`、TypeScript、Tailwind CSS、ECharts |
 | 数据库 | 生产优先 PostgreSQL / MySQL，查询字段以导出的真实 schema 为准 |
 | 部署入口 | `install.sh` 一键部署，或 `docker-compose.yml` 手动部署 |
-| 镜像 | `ghcr.io/james-6-23/new_api_tools:latest` |
+| 稳定镜像 | `ghcr.io/yujianwudi/new_api_tools:0.2.0`（`latest` 为可变的 `main` 构建） |
 
 ## 能力速览
 
@@ -62,26 +64,35 @@
 如果 NewAPI 已部署在 Linux 服务器上，可以使用一键脚本自动检测环境并部署：
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
+
+# 明确测试 main：安装器会把镜像锁到本次 checkout commit 的 7 位 SHA 标签
+NEWAPI_TOOLS_REF=main bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
 ```
 
-脚本会自动定位 NewAPI 安装目录、读取数据库配置、生成必要密钥、设置管理员密码、配置 Docker 网络并启动服务。部署完成后访问：
+该安装器默认把仓库和镜像固定到 `v0.2.0`，不会静默跟随后续 `main`。选择 `main` 时会解析当前完整 commit，并使用 CI 为该提交发布的 7 位 SHA 镜像标签；如果镜像尚未发布，拉取会失败且旧容器不会先被停止。其他自定义 `NEWAPI_TOOLS_REF` 必须同时显式提供完整的 `NEWAPI_TOOLS_IMAGE`（tag 或 `repo@sha256:digest`），避免代码与镜像悄然错配。升级旧安装时，脚本会把旧 `NEWAPI_TOOLS_VERSION` 迁移为完整镜像引用。
+
+脚本会自动定位 NewAPI 安装目录、读取数据库配置、生成必要密钥、设置管理员密码、配置 Docker 网络并启动服务。安全默认值 `FRONTEND_BIND=127.0.0.1` 只允许宿主机本地访问：
 
 ```text
-http://your-server-ip:1145
+http://127.0.0.1:1145
 ```
+
+生产环境请用宿主机 Nginx / Caddy 将 HTTPS 域名反向代理到该地址。只有在已经配置防火墙、HTTPS 和访问控制且明确需要直接暴露时，才将 `.env` 中的 `FRONTEND_BIND` 改为 `0.0.0.0`；此时才能通过 `http://your-server-ip:1145` 访问。
 
 ### 方式二：Docker Compose 手动部署
 
 适用于熟悉 Docker 的用户或非标准环境：
 
 ```bash
-git clone https://github.com/james-6-23/new_api_tools.git
+git clone --branch v0.2.0 --depth 1 https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 vim .env
-docker-compose up -d
+docker compose up -d
 ```
+
+推荐使用 Docker Compose v2。若 NewAPI 使用 `network_mode: host`，叠加配置依赖 `!reset` 语法，要求 Docker Compose `v2.24+`；一键脚本会自动检查版本。
 
 ### 日志分库（LOG_SQL_DSN）自动兼容
 
@@ -91,15 +102,37 @@ docker-compose up -d
 
 ```bash
 # 一键脚本已涵盖日志库；重新运行即可让已部署实例补上日志库连接
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
 ```
 
 > 单独修复 / 不想整体重部署时，也可只跑日志库脚本：
 > ```bash
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh)         # 检测并配置
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
+> bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/setup-log-db.sh)         # 检测并配置
+> bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/setup-log-db.sh) --print # 仅预览脱敏目标，不改动
 > ```
 > 即使日志库一时连不上，后端也只会**降级为读主库**（日志暂时为空），不会崩溃。
+
+### NewAPI Redis 与写操作安全边界
+
+NewAPI 开启 Redis 后，会优先从缓存读取用户与 Token 鉴权状态。此时本工具若直接修改数据库，封禁、删除、禁用 Token、调整分组或开启 IP 记录可能不会立即生效。部署脚本会读取 NewAPI 容器的 `REDIS_CONN_STRING`：只有该变量**明确存在且为空**时才写入 `NEWAPI_REDIS_DISABLED=true`；变量缺失、读取失败或值非空时均保持 `false`，并阻止相关直接写库操作。Redis 开启时请通过 NewAPI 官方管理 API 完成这些变更。
+
+按“不活跃”条件批量删除用户还受 `ALLOW_UNSAFE_BATCH_DELETE=false` 保护。旁路工具无法原子协调 NewAPI 的在途请求、异步 `request_count`、消费日志开关与日志保留期，因此不能仅凭一次日志查询证明用户可安全删除。默认请使用 NewAPI 官方管理 API；只有在已停止请求入口、排空全部在途请求、核验消费日志完整性并接受兼容风险后，才可临时同时设置 `ALLOW_UNSAFE_BATCH_DELETE=true` 和 `NEWAPI_REDIS_DISABLED=true`，操作完成后应立即恢复 `false`。破坏性预览快照只存于工具内置 Redis，并通过原子领取保证一次性；Redis 不可用时会失败关闭。
+
+永久删除额外受 `ALLOW_UNSAFE_HARD_DELETE=false` 保护。NewAPI 官方删除流程还会清理二次验证、Passkey、OAuth 绑定等认证记录，本工具的兼容数据库路径无法跨版本保证完整性，因此默认禁止单用户硬删除、批量硬删除和永久清理。仅在明确接受孤儿认证记录风险、且确认 NewAPI Redis 已关闭时，才可同时设置 `ALLOW_UNSAFE_HARD_DELETE=true` 和 `NEWAPI_REDIS_DISABLED=true`。
+
+解封用户不会自动恢复任何已禁用 Token。当前版本没有持久化“本次封禁具体关闭了哪些 Token”的可靠快照，批量恢复可能复活封禁前已因泄漏而停用的凭据；请在 NewAPI 管理端逐个复核后再启用。
+
+自动强制 IP 记录默认关闭。`ENFORCE_IP_RECORDING=true` 会每 10 分钟把所有普通用户的 `record_ip_log` 改为 `true`，属于持续的数据采集与批量写入行为。仅在完成隐私/合规评估、已告知用户并确认业务确有需要时开启；手动“全部开启 IP 记录”操作不受该后台开关影响，仍会经过写操作安全边界。
+
+### 管理会话与浏览器存储
+
+管理 JWT 只保存在当前标签页的 `sessionStorage`，启动和登出都会清除旧版本遗留在 `localStorage` 的管理 token。兑换码生成结果只在即时结果弹窗中显示、复制或下载；IndexedDB 仅保存不含兑换码明文的生成摘要，首次升级会删除旧版浏览器中的明文生成历史。
+
+当前 JWT 是无状态凭据，后端没有 denylist；客户端登出后，已经复制或泄漏的 JWT 在自身过期前仍可使用。生产环境应按运维便利与风险缩短 `JWT_EXPIRE_HOURS`（例如 `1`–`4` 小时）。怀疑 token 泄漏时应轮换 `JWT_SECRET` 并重启服务，这会使所有已签发 JWT 立即失效。
+
+### 可信代理与登录限流
+
+后端默认不信任客户端提供的 `X-Forwarded-For`。只有请求的直接 TCP 对端命中 `TRUSTED_PROXY_CIDRS` 时，才会从右向左剥离可信代理并确定客户端 IP。合并镜像默认只信任 loopback（`127.0.0.1/32,::1/128`），可防止公网直连时伪造 XFF 绕过登录和公开接口限流。若宿主机还有一层 Nginx/Caddy，请把**内层 Nginx 实际看到的外层代理地址**以精确 `/32` 或 `/128` 追加到列表；不要信任整个 `172.16.0.0/12` 等私网段。外层 Nginx 应继续使用 `proxy_set_header X-Forwarded-For $remote_addr;` 覆盖客户端原始头。
 
 ## 配置说明
 
@@ -107,12 +140,22 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 
 | 变量名 | 说明 | 示例/默认值 |
 |---|---|---|
+| `NEWAPI_TOOLS_IMAGE` | 完整部署镜像引用，支持稳定 tag、短 SHA tag 或 `repo@sha256:digest` | `ghcr.io/yujianwudi/new_api_tools:0.2.0` |
 | `FRONTEND_PORT` | 对外访问端口 | `1145` |
-| `FRONTEND_BIND` | 端口绑定网卡；生产反代时建议绑定本机 | `0.0.0.0` / `127.0.0.1` |
+| `FRONTEND_BIND` | 端口绑定网卡；默认仅本机可达，生产环境建议由 HTTPS 反代 | `127.0.0.1` |
 | `ADMIN_PASSWORD` | 管理后台登录密码 | 必填 |
 | `API_KEY` | 前后端内部 API Key | 部署脚本自动生成 |
 | `JWT_SECRET` | JWT 签名密钥 | 部署脚本自动生成 |
-| `JWT_EXPIRE_HOURS` | JWT 过期时间（小时） | `24` |
+| `JWT_EXPIRE_HOURS` | 无状态 JWT 过期时间（小时）；生产环境建议按风险缩短 | `24` |
+| `CORS_ALLOWED_ORIGINS` | 允许跨域的精确 Origin，逗号分隔；留空仅允许同源 | 留空 |
+| `CORS_ALLOW_CREDENTIALS` | 是否允许可信跨域请求携带凭据 | `false` |
+| `LOGIN_MAX_ATTEMPTS` | 登录统计窗口内允许的失败次数 | `8` |
+| `LOGIN_ATTEMPT_WINDOW_SECONDS` | 登录失败统计窗口（秒） | `900` |
+| `LOGIN_BACKOFF_BASE_MS` | 登录失败指数退避基础延迟（毫秒） | `500` |
+| `LOGIN_BACKOFF_MAX_SECONDS` | 登录失败最大退避时间（秒） | `30` |
+| `PUBLIC_MODEL_MAX_BATCH` | 公开模型状态接口单次最大模型数 | `50` |
+| `PUBLIC_MODEL_MAX_BODY_BYTES` | 公开模型状态接口最大请求体（字节） | `16384` |
+| `PUBLIC_MODEL_REQUESTS_PER_MINUTE` | 公开模型状态接口每客户端每分钟请求上限 | `30` |
 | `SQL_DSN` | 推荐的完整数据库连接串 | `host=... port=5432 user=...` |
 | `LOG_SQL_DSN` | 日志专用库连接串（NewAPI 用 `LOG_SQL_DSN` 分库时才需要；留空则日志查询回落主库）。建议用 `setup-log-db.sh` 自动生成 | 可选 |
 | `DB_ENGINE` | 兼容旧版分离配置的数据库类型 | `postgres` / `mysql` |
@@ -125,6 +168,11 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 | `DB_MAX_IDLE_CONNS` | 数据库最大空闲连接数 | `15` |
 | `NEWAPI_NETWORK` | NewAPI 所在 Docker 网络 | `new-api_default` |
 | `NEWAPI_BASEURL` | NewAPI 内部地址，用于需要回调上游的功能 | 可选 |
+| `NEWAPI_REDIS_DISABLED` | NewAPI 是否已明确关闭 Redis；仅 `true` 时允许直接修改用户/Token/分组/IP 设置。部署脚本自动检测，未知状态按 `false` 处理 | `false` |
+| `ALLOW_UNSAFE_BATCH_DELETE` | 是否允许旁路按日志/计数判定并批量删除不活跃用户；仅在已停流、排空请求并核验日志完整性后临时开启，还要求 `NEWAPI_REDIS_DISABLED=true` | `false` |
+| `ALLOW_UNSAFE_HARD_DELETE` | 是否启用不完整的直接数据库永久删除兼容路径；还要求 `NEWAPI_REDIS_DISABLED=true`，优先使用 NewAPI 管理 API | `false` |
+| `ENFORCE_IP_RECORDING` | 是否每 10 分钟强制所有普通用户开启 IP 记录；隐私敏感且还要求 Redis 安全前置条件 | `false` |
+| `TRUSTED_PROXY_CIDRS` | 允许后端解析其 XFF 的精确代理 IP/CIDR；外层反代需追加实际来源地址，禁止宽泛私网段 | `127.0.0.1/32,::1/128` |
 | `REDIS_PASSWORD` | 内置 Redis 密码 | 留空或自定义 |
 | `TIMEZONE` | 服务时区 | `Asia/Shanghai` |
 | `LOG_LEVEL` | 日志级别 | `info` |
@@ -172,8 +220,8 @@ npm run dev
 | 兑换码 | `GET /api/redemptions`、`POST /api/redemptions/generate` |
 | 风控 | `GET /api/risk/*`、`GET /api/ip/*`、`POST /api/ai-ban/*` |
 | 联合广播 | `GET /api/abuse-broadcast/*`、`POST /api/abuse-broadcast/*` |
-| 模型状态 | `GET /api/model-status/*`、`GET /api/embed/model-status/*` |
-| 用户与令牌 | `GET /api/users`、`GET /api/tokens`、`GET /api/auto-group/*` |
+| 模型状态 | `GET /api/model-status/*`、`GET /api/embed/model-status/*`、`POST /api/embed/model-status/status/multiple` |
+| 用户与令牌 | `GET /api/users`、`GET /api/tokens`、`POST /api/tokens/search`（完整 Token 精确查询）、`GET /api/auto-group/*` |
 | 存储与系统 | `GET /api/storage/*`、`GET /api/system/*` |
 
 ## 数据来源说明
@@ -192,8 +240,8 @@ pgsql_schema_export_20260505/
 
 ## License
 
-MIT License
+[MIT License](./LICENSE)。本仓库基于 [james-6-23/new_api_tools](https://github.com/james-6-23/new_api_tools)（原作者 james-6-23 / kyx236）持续优化，并保留 yujianwudi 的后续修改署名。
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=james-6-23/new_api_tools&type=Date)](https://star-history.com/#james-6-23/new_api_tools&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=yujianwudi/new_api_tools&type=Date)](https://star-history.com/#yujianwudi/new_api_tools&Date)

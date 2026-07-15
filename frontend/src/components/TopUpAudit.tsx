@@ -111,6 +111,7 @@ export function TopUpAudit({ active }: Props) {
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const initialLoadedRef = useRef(false)
+  const requestGenerationRef = useRef(0)
 
   const safeFetch = useCallback(async <T,>(path: string): Promise<T | null> => {
     try {
@@ -128,32 +129,65 @@ export function TopUpAudit({ active }: Props) {
   }, [apiUrl, headers])
 
   const fetchProviderHealth = useCallback(async () => {
-    const data = await safeFetch<ProviderHealth[]>(`/api/top-ups/analytics/provider-health?days=${days}`)
-    if (data) setProviderHealth(data)
+    return safeFetch<ProviderHealth[]>(`/api/top-ups/analytics/provider-health?days=${days}`)
   }, [safeFetch, days])
 
   const fetchAnomalies = useCallback(async () => {
-    const data = await safeFetch<AnomaliesResponse>(`/api/top-ups/analytics/anomalies?days=${days}&pending_hours=${pendingHours}&limit=50`)
-    if (data) setAnomalies(data)
+    return safeFetch<AnomaliesResponse>(`/api/top-ups/analytics/anomalies?days=${days}&pending_hours=${pendingHours}&limit=50`)
   }, [safeFetch, days, pendingHours])
 
   const fetchAll = useCallback(async (showDoneToast = false) => {
+    const generation = ++requestGenerationRef.current
     setRefreshing(true)
-    await Promise.all([fetchProviderHealth(), fetchAnomalies()])
+    const [nextProviderHealth, nextAnomalies] = await Promise.all([
+      fetchProviderHealth(),
+      fetchAnomalies(),
+    ])
+
+    if (generation !== requestGenerationRef.current) {
+      return { isCurrent: false, complete: false }
+    }
+
+    const complete = nextProviderHealth !== null && nextAnomalies !== null
+    if (nextProviderHealth !== null) setProviderHealth(nextProviderHealth)
+    if (nextAnomalies !== null) setAnomalies(nextAnomalies)
+    if (complete) initialLoadedRef.current = true
     setRefreshing(false)
-    if (showDoneToast) showToast('success', '审计数据已刷新')
+    if (complete) {
+      if (showDoneToast) {
+        showToast('success', '审计数据已刷新')
+      }
+    } else if (nextProviderHealth === null && nextAnomalies === null) {
+      showToast('error', '审计数据刷新失败，请稍后重试')
+    } else {
+      showToast('info', '审计数据仅部分刷新成功，失败部分已保留原数据')
+    }
+    return { isCurrent: true, complete }
   }, [fetchProviderHealth, fetchAnomalies, showToast])
 
-  useEffect(() => {
-    if (!active || initialLoadedRef.current) return
-    initialLoadedRef.current = true
-    setLoading(true)
-    fetchAll().finally(() => setLoading(false))
-  }, [active, fetchAll])
+  const lastFetchedRef = useRef<typeof fetchAll | null>(null)
 
   useEffect(() => {
-    if (initialLoadedRef.current) fetchAll()
-  }, [fetchAll])
+    if (!active) {
+      lastFetchedRef.current = null
+      requestGenerationRef.current += 1
+      setRefreshing(false)
+      return
+    }
+    if (lastFetchedRef.current === fetchAll) return
+    lastFetchedRef.current = fetchAll
+
+    const isInitialLoad = !initialLoadedRef.current
+    if (isInitialLoad) {
+      setLoading(true)
+    }
+
+    fetchAll().then(({ isCurrent }) => {
+      if (isInitialLoad && isCurrent) {
+        setLoading(false)
+      }
+    })
+  }, [active, fetchAll])
 
   if (loading && !initialLoadedRef.current) {
     return (

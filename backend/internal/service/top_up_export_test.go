@@ -4,10 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+var errCSVFlush = errors.New("csv flush failed")
+
+type failCSVFlushWriter struct {
+	writes int
+}
+
+func (w *failCSVFlushWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes > 1 {
+		return 0, errCSVFlush
+	}
+	return len(p), nil
+}
 
 // seedTopUps creates the top_ups table on the in-memory SQLite and inserts n rows.
 // SQLite 接受 ? 占位符并兼容 LOWER/COALESCE，足够覆盖 ExportTopUpsToCSV 的查询面。
@@ -55,7 +70,7 @@ func seedTopUps(t *testing.T, n int) {
 	}
 }
 
-func countCSVRows(t *testing.T, buf []byte) int {
+func parseCSVRows(t *testing.T, buf []byte) [][]string {
 	t.Helper()
 	// 跳过 UTF-8 BOM
 	if len(buf) >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF {
@@ -67,7 +82,93 @@ func countCSVRows(t *testing.T, buf []byte) int {
 	if err != nil {
 		t.Fatalf("parse csv: %v", err)
 	}
-	return len(rows)
+	return rows
+}
+
+func countCSVRows(t *testing.T, buf []byte) int {
+	t.Helper()
+	return len(parseCSVRows(t, buf))
+}
+
+func TestSpreadsheetSafeCSVCell(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "equals", value: "=HYPERLINK(\"https://example.invalid\")", want: "'=HYPERLINK(\"https://example.invalid\")"},
+		{name: "plus", value: "+cmd|' /C calc'!A0", want: "'+cmd|' /C calc'!A0"},
+		{name: "minus", value: "-2+3", want: "'-2+3"},
+		{name: "at", value: "@SUM(1,2)", want: "'@SUM(1,2)"},
+		{name: "leading spaces", value: "  =1+1", want: "'  =1+1"},
+		{name: "leading tab", value: "\tplain", want: "'\tplain"},
+		{name: "leading carriage return", value: "\rplain", want: "'\rplain"},
+		{name: "leading newline before formula", value: "\n=1+1", want: "'\n=1+1"},
+		{name: "ordinary text", value: "alice", want: "alice"},
+		{name: "ordinary leading spaces", value: "  alice", want: "  alice"},
+		{name: "existing apostrophe", value: "'=1+1", want: "'=1+1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := spreadsheetSafeCSVCell(tt.value); got != tt.want {
+				t.Fatalf("spreadsheetSafeCSVCell(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExportTopUpsToCSV_NeutralizesSpreadsheetFormulas(t *testing.T) {
+	db := installSQLiteForTests(t)
+	schema := `
+	CREATE TABLE top_ups (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		amount INTEGER NOT NULL DEFAULT 0,
+		money REAL NOT NULL DEFAULT 0,
+		trade_no TEXT,
+		payment_method TEXT,
+		payment_provider TEXT,
+		create_time INTEGER NOT NULL DEFAULT 0,
+		complete_time INTEGER NOT NULL DEFAULT 0,
+		status TEXT
+	);
+	CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);`
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users (id, username) VALUES (1, '  =1+1')`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO top_ups (id, user_id, amount, money, trade_no, payment_method, payment_provider, create_time, complete_time, status)
+		 VALUES (1, 1, 100, 1.5, '+trade', '-method', '@provider', 1700000000, 1700000010, ?)`,
+		"\t=status",
+	); err != nil {
+		t.Fatalf("insert top-up: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{}); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	rows := parseCSVRows(t, buf.Bytes())
+	if len(rows) != 2 {
+		t.Fatalf("expected header plus one row, got %d rows", len(rows))
+	}
+
+	row := rows[1]
+	wants := map[int]string{
+		2: "'  =1+1",
+		5: "'+trade",
+		6: "'-method",
+		8: "'\t=status",
+	}
+	for column, want := range wants {
+		if got := row[column]; got != want {
+			t.Errorf("column %d = %q, want %q", column, got, want)
+		}
+	}
 }
 
 func TestExportTopUpsToCSV_BOMAndHeader(t *testing.T) {
@@ -89,6 +190,16 @@ func TestExportTopUpsToCSV_BOMAndHeader(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte("ID")) {
 		t.Errorf("CSV should contain header column 'ID'")
+	}
+}
+
+func TestExportTopUpsToCSV_ReturnsFinalFlushError(t *testing.T) {
+	seedTopUps(t, 1)
+
+	writer := &failCSVFlushWriter{}
+	err := ExportTopUpsToCSV(context.Background(), writer, ListTopUpParams{})
+	if !errors.Is(err, errCSVFlush) {
+		t.Fatalf("export error = %v, want %v", err, errCSVFlush)
 	}
 }
 

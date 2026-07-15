@@ -4,6 +4,51 @@ import { setGlobalLogout, clearGlobalLogout } from '../lib/api'
 const TOKEN_KEY = 'newapi_tools_token'
 const TOKEN_EXPIRY_KEY = 'newapi_tools_token_expiry'
 
+function removeAuthKeys(storage: Storage): void {
+  storage.removeItem(TOKEN_KEY)
+  storage.removeItem(TOKEN_EXPIRY_KEY)
+}
+
+function clearLegacyLocalAuthStorage(): void {
+  try {
+    removeAuthKeys(window.localStorage)
+  } catch {
+    // Storage can be unavailable in hardened/private browser contexts.
+  }
+}
+
+function clearSessionAuthStorage(): void {
+  try {
+    removeAuthKeys(window.sessionStorage)
+  } catch {
+    // The in-memory React state remains the source of truth for this page.
+  }
+}
+
+function clearAllAuthStorage(): void {
+  clearLegacyLocalAuthStorage()
+  clearSessionAuthStorage()
+}
+
+function readSessionAuthValue(key: string): string | null {
+  try {
+    return window.sessionStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function persistSessionAuth(token: string, expiryTime: number): void {
+  clearLegacyLocalAuthStorage()
+  try {
+    window.sessionStorage.setItem(TOKEN_KEY, token)
+    window.sessionStorage.setItem(TOKEN_EXPIRY_KEY, expiryTime.toString())
+  } catch {
+    clearSessionAuthStorage()
+    // The periodic expiry check will fail closed when persistence is unavailable.
+  }
+}
+
 interface AuthContextType {
   isAuthenticated: boolean
   token: string | null
@@ -27,37 +72,43 @@ interface AuthProviderProps {
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setToken] = useState<string | null>(() => {
-    const savedToken = localStorage.getItem(TOKEN_KEY)
-    const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY)
+    // v0.2.0 stops accepting long-lived admin bearer tokens from localStorage.
+    clearLegacyLocalAuthStorage()
+    const savedToken = readSessionAuthValue(TOKEN_KEY)
+    const expiry = readSessionAuthValue(TOKEN_EXPIRY_KEY)
 
     if (savedToken && expiry) {
-      const expiryTime = parseInt(expiry, 10)
-      if (Date.now() < expiryTime) {
+      const expiryTime = Number(expiry)
+      if (Number.isFinite(expiryTime) && Date.now() < expiryTime) {
         return savedToken
       }
-      // Token expired, clear it
-      localStorage.removeItem(TOKEN_KEY)
-      localStorage.removeItem(TOKEN_EXPIRY_KEY)
     }
+    clearSessionAuthStorage()
     return null
   })
 
   const isAuthenticated = token !== null
 
+  const logout = useCallback(() => {
+    setToken(null)
+    clearAllAuthStorage()
+  }, [])
+
   // Check token expiry periodically
   useEffect(() => {
+    if (!token) return
+
     const checkExpiry = () => {
-      const expiry = localStorage.getItem(TOKEN_EXPIRY_KEY)
-      if (expiry && Date.now() >= parseInt(expiry, 10)) {
-        setToken(null)
-        localStorage.removeItem(TOKEN_KEY)
-        localStorage.removeItem(TOKEN_EXPIRY_KEY)
+      const expiry = readSessionAuthValue(TOKEN_EXPIRY_KEY)
+      const expiryTime = Number(expiry)
+      if (!expiry || !Number.isFinite(expiryTime) || Date.now() >= expiryTime) {
+        logout()
       }
     }
 
     const interval = setInterval(checkExpiry, 60000) // Check every minute
     return () => clearInterval(interval)
-  }, [])
+  }, [logout, token])
 
   const login = useCallback(async (password: string): Promise<boolean> => {
     const apiUrl = import.meta.env.VITE_API_URL || ''
@@ -94,24 +145,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Parse expires_at or default 24 hours
       let expiryTime: number
       if (data.expires_at) {
-        expiryTime = new Date(data.expires_at).getTime()
+        const parsedExpiry = new Date(data.expires_at).getTime()
+        expiryTime = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now() + 86400 * 1000
       } else {
         expiryTime = Date.now() + 86400 * 1000
       }
 
+      persistSessionAuth(newToken, expiryTime)
       setToken(newToken)
-      localStorage.setItem(TOKEN_KEY, newToken)
-      localStorage.setItem(TOKEN_EXPIRY_KEY, expiryTime.toString())
       return true
     }
     // 2xx 但 success=false：按密码/凭证错误处理
     return false
-  }, [])
-
-  const logout = useCallback(() => {
-    setToken(null)
-    localStorage.removeItem(TOKEN_KEY)
-    localStorage.removeItem(TOKEN_EXPIRY_KEY)
   }, [])
 
   // Set global logout function for API interceptor

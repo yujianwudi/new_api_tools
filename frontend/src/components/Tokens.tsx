@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useToast } from './Toast'
 import { useAuth } from '../contexts/AuthContext'
 import { Key, Loader2, RefreshCw, Filter, Search, CheckCircle2, XCircle, AlertCircle, Clock, Tag } from 'lucide-react'
@@ -42,6 +42,7 @@ interface TokenStatistics {
   active: number
   disabled: number
   expired: number
+  exhausted: number
 }
 
 interface PaginatedResponse {
@@ -52,7 +53,32 @@ interface PaginatedResponse {
   total_pages: number
 }
 
-type StatusFilter = '' | 'active' | 'disabled' | 'expired'
+type StatusFilter = '' | 'active' | 'disabled' | 'expired' | 'exhausted'
+type EffectiveTokenStatus = Exclude<StatusFilter, ''> | 'unknown'
+type FetchOutcome = 'succeeded' | 'failed' | 'superseded'
+
+function getEffectiveTokenStatus(record: TokenRecord): EffectiveTokenStatus {
+  if (record.status === 2) return 'disabled'
+  if (record.status === 3) return 'expired'
+  if (record.status === 4) return 'exhausted'
+  if (record.status !== 1) return 'unknown'
+  if (record.expired_time > 0 && record.expired_time * 1000 <= Date.now()) return 'expired'
+  if (!record.unlimited_quota && record.remain_quota <= 0) return 'exhausted'
+  return 'active'
+}
+
+const tokenStatusMeta = {
+  active: { label: '启用', variant: 'success' },
+  disabled: { label: '禁用', variant: 'secondary' },
+  expired: { label: '已过期', variant: 'destructive' },
+  exhausted: { label: '已耗尽', variant: 'warning' },
+  unknown: { label: '未知', variant: 'outline' },
+} as const
+
+function TokenStatusBadge({ record }: { record: TokenRecord }) {
+  const meta = tokenStatusMeta[getEffectiveTokenStatus(record)]
+  return <Badge variant={meta.variant}>{meta.label}</Badge>
+}
 
 export function Tokens() {
   const { showToast } = useToast()
@@ -74,6 +100,8 @@ export function Tokens() {
   const [refreshing, setRefreshing] = useState(false)
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
   const [selectedUser, setSelectedUser] = useState<{ id: number; username: string } | null>(null)
+  const tokenRequestSequenceRef = useRef(0)
+  const tokenRequestAbortRef = useRef<AbortController | null>(null)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const getAuthHeaders = useCallback(() => ({
@@ -81,38 +109,69 @@ export function Tokens() {
     'Authorization': `Bearer ${token}`,
   }), [token])
 
-  const fetchStatistics = useCallback(async () => {
+  const fetchStatistics = useCallback(async (): Promise<FetchOutcome> => {
     setStatsLoading(true)
     try {
       const response = await fetch(`${apiUrl}/api/tokens/statistics`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) setStatistics(data.data)
+      if (!data.success) return 'failed'
+      setStatistics(data.data)
+      return 'succeeded'
     } catch (error) {
       console.error('Failed to fetch token statistics:', error)
+      return 'failed'
     } finally { setStatsLoading(false) }
   }, [apiUrl, getAuthHeaders])
 
-  const fetchGroups = useCallback(async () => {
+  const fetchGroups = useCallback(async (): Promise<FetchOutcome> => {
     try {
       const response = await fetch(`${apiUrl}/api/tokens/groups`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) setAvailableGroups(data.data || [])
+      if (!data.success) return 'failed'
+      setAvailableGroups(data.data || [])
+      return 'succeeded'
     } catch (error) {
       console.error('Failed to fetch token groups:', error)
+      return 'failed'
     }
   }, [apiUrl, getAuthHeaders])
 
-  const fetchTokens = useCallback(async () => {
+  const fetchTokens = useCallback(async (): Promise<FetchOutcome> => {
+    const requestSequence = ++tokenRequestSequenceRef.current
+    tokenRequestAbortRef.current?.abort()
+    const controller = new AbortController()
+    tokenRequestAbortRef.current = controller
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: page.toString(), page_size: pageSize.toString() })
       if (statusFilter) params.append('status', statusFilter)
       if (nameSearch) params.append('name', nameSearch)
-      if (keySearch.trim()) params.append('key', keySearch.trim())
       if (groupFilter) params.append('group', groupFilter)
 
-      const response = await fetch(`${apiUrl}/api/tokens?${params.toString()}`, { headers: getAuthHeaders() })
+      const exactKey = keySearch.trim()
+      const response = exactKey
+        ? await fetch(`${apiUrl}/api/tokens/search`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          cache: 'no-store',
+          signal: controller.signal,
+          body: JSON.stringify({
+            page,
+            page_size: pageSize,
+            status: statusFilter,
+            name: nameSearch,
+            key: exactKey,
+            group: groupFilter,
+          }),
+        })
+        : await fetch(`${apiUrl}/api/tokens?${params.toString()}`, {
+          headers: getAuthHeaders(),
+          signal: controller.signal,
+        })
       const data = await response.json()
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) {
+        return 'superseded'
+      }
       if (data.success) {
         const result: PaginatedResponse = data.data
         setTokens(result.items || [])
@@ -120,23 +179,46 @@ export function Tokens() {
         setTotalPages(result.total_pages)
       } else {
         showToast('error', data.message || '获取令牌列表失败')
+        return 'failed'
       }
+      return 'succeeded'
     } catch (error) {
+      if (controller.signal.aborted || tokenRequestSequenceRef.current !== requestSequence) {
+        return 'superseded'
+      }
       showToast('error', '网络错误，请重试')
       console.error('Failed to fetch tokens:', error)
-    } finally { setLoading(false) }
+      return 'failed'
+    } finally {
+      if (tokenRequestSequenceRef.current === requestSequence) {
+        if (tokenRequestAbortRef.current === controller) tokenRequestAbortRef.current = null
+        setLoading(false)
+      }
+    }
   }, [apiUrl, getAuthHeaders, page, pageSize, statusFilter, nameSearch, keySearch, groupFilter, showToast])
 
   useEffect(() => { fetchTokens() }, [fetchTokens])
+  useEffect(() => () => {
+    tokenRequestSequenceRef.current += 1
+    tokenRequestAbortRef.current?.abort()
+    tokenRequestAbortRef.current = null
+  }, [])
   useEffect(() => { fetchStatistics() }, [fetchStatistics])
   useEffect(() => { fetchGroups() }, [fetchGroups])
   useEffect(() => { setPage(1) }, [statusFilter, nameSearch, keySearch, groupFilter])
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchTokens(), fetchStatistics(), fetchGroups()])
-    setRefreshing(false)
-    showToast('success', '数据已刷新')
+    try {
+      const results = await Promise.all([fetchTokens(), fetchStatistics(), fetchGroups()])
+      if (results.includes('failed')) {
+        showToast('error', '部分数据刷新失败，请重试')
+      } else if (results.every((result) => result === 'succeeded')) {
+        showToast('success', '数据已刷新')
+      }
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   const formatTimestamp = (ts: number) => {
@@ -148,17 +230,7 @@ export function Tokens() {
 
   const isTokenExpired = (expiredTime: number) => {
     if (!expiredTime || expiredTime <= 0) return false
-    return expiredTime * 1000 < Date.now()
-  }
-
-  const getStatusBadge = (record: TokenRecord) => {
-    if (isTokenExpired(record.expired_time)) {
-      return <Badge variant="destructive">已过期</Badge>
-    }
-    if (record.status === 1) {
-      return <Badge variant="success">启用</Badge>
-    }
-    return <Badge variant="secondary">禁用</Badge>
+    return expiredTime * 1000 <= Date.now()
   }
 
   return (
@@ -178,7 +250,7 @@ export function Tokens() {
       </div>
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           title="总令牌"
           value={statsLoading ? '-' : `${statistics?.total || 0}`}
@@ -202,6 +274,14 @@ export function Tokens() {
           color="red"
           className="border-l-4 border-l-red-500"
           onClick={() => setStatusFilter('disabled')}
+        />
+        <StatCard
+          title="已耗尽"
+          value={statsLoading ? '-' : `${statistics?.exhausted || 0}`}
+          icon={AlertCircle}
+          color="orange"
+          className="border-l-4 border-l-orange-500"
+          onClick={() => setStatusFilter('exhausted')}
         />
         <StatCard
           title="已过期"
@@ -228,13 +308,14 @@ export function Tokens() {
             <div className="relative">
               <Key className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
               <Input
-                type="text"
+                type="password"
                 value={keySearch}
                 onChange={(e) => setKeySearch(e.target.value)}
                 placeholder="粘贴完整令牌 Key（如 sk-xxxx）精确查找所属用户..."
                 className="pl-9 pr-9 font-mono"
                 spellCheck={false}
                 autoComplete="off"
+                autoCapitalize="none"
               />
               {keySearch && (
                 <button
@@ -268,6 +349,7 @@ export function Tokens() {
                 <option value="">全部状态</option>
                 <option value="active">启用</option>
                 <option value="disabled">禁用</option>
+                <option value="exhausted">已耗尽</option>
                 <option value="expired">已过期</option>
               </Select>
             </div>
@@ -319,7 +401,7 @@ export function Tokens() {
                       <div className="text-sm font-medium truncate" title={t.name}>{t.name || '-'} <span className="text-[11px] text-muted-foreground font-mono">#{t.id}</span></div>
                       <code className="block mt-1 text-[11px] font-mono bg-muted px-1.5 py-0.5 rounded truncate">{t.key}</code>
                     </div>
-                    {getStatusBadge(t)}
+                    <TokenStatusBadge record={t} />
                   </div>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
                     <div className="text-muted-foreground">所属：
@@ -397,7 +479,7 @@ export function Tokens() {
                           <span className="text-sm text-muted-foreground">-</span>
                         )}
                       </TableCell>
-                      <TableCell>{getStatusBadge(t)}</TableCell>
+                      <TableCell><TokenStatusBadge record={t} /></TableCell>
                       <TableCell>
                         {t.group ? (
                           <span

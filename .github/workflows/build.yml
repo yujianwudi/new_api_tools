@@ -10,26 +10,115 @@ on:
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'index.html'
       - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose*.yml'
+      - '.env.example'
+      - 'deploy.sh'
+      - 'install.sh'
+      - 'setup-log-db.sh'
+      - 'tests/**'
       - '.github/workflows/build.yml'
-      # 忽略文档和配置文件
+      # 忽略文档
       - '!**/*.md'
       - '!**/.gitignore'
-      - '!.env.example'
   pull_request:
     branches: [main]
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'index.html'
       - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose*.yml'
+      - '.env.example'
+      - 'deploy.sh'
+      - 'install.sh'
+      - 'setup-log-db.sh'
+      - 'tests/**'
+      - '.github/workflows/build.yml'
       - '!**/*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  quality:
+    name: Test and security gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        run: |
+          bash -n deploy.sh install.sh setup-log-db.sh
+          bash tests/deploy_dsn_test.sh
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.host.yml config --quiet
+          LOG_NETWORK=example-log-network docker compose -f docker-compose.yml -f docker-compose.logdb.yml config --quiet
+          LOG_NETWORK=example-log-network docker compose -f docker-compose.yml -f docker-compose.host.yml -f docker-compose.logdb.yml config --quiet
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Run Go tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Run Go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: Scan reachable Go vulnerabilities
+        working-directory: backend
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test static redemption generator
+        run: node tests/index_expiry_validation_test.mjs
+
+      - name: Test browser secret storage guards
+        run: node tests/frontend_secret_storage_test.mjs
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Audit production dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
   build:
+    needs: quality
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

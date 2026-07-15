@@ -37,7 +37,7 @@ func GetIPStats(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetIPStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "IP statistics query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -57,7 +57,7 @@ func GetSharedIPs(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetSharedIPs(window, minTokens, limit, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "shared IP query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -77,7 +77,7 @@ func GetMultiIPTokens(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetMultiIPTokens(window, minIPs, limit, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "multi-IP token query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -97,7 +97,7 @@ func GetMultiIPUsers(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetMultiIPUsers(window, minIPs, limit, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "multi-IP user query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -108,7 +108,7 @@ func EnableAllIPRecording(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.EnableAllIPRecording()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("UPDATE_ERROR", err.Error(), ""))
+		respondInternalError(c, "UPDATE_ERROR", "Unable to update IP recording settings", "enable all IP recording", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data, "message": data["message"]})
@@ -128,7 +128,7 @@ func LookupIPUsers(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.LookupIPUsers(ip, window, limit, includeGeo)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "IP user lookup", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -150,7 +150,7 @@ func GetUserIPs(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetUserIPs(userID, window)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user IP history query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -161,7 +161,7 @@ func GetIPIndexStatus(c *gin.Context) {
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetIPIndexStatus()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "IP index status query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

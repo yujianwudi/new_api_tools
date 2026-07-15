@@ -30,17 +30,18 @@ type TokenInfo struct {
 
 // TokenStatistics holds aggregate token counts
 type TokenStatistics struct {
-	Total    int64 `json:"total"`
-	Active   int64 `json:"active"`
-	Disabled int64 `json:"disabled"`
-	Expired  int64 `json:"expired"`
+	Total     int64 `json:"total"`
+	Active    int64 `json:"active"`
+	Disabled  int64 `json:"disabled"`
+	Expired   int64 `json:"expired"`
+	Exhausted int64 `json:"exhausted"`
 }
 
 // TokenListParams holds query parameters for listing tokens
 type TokenListParams struct {
 	Page     int
 	PageSize int
-	Status   string // "active", "disabled", "expired", ""
+	Status   string // "active", "disabled", "expired", "exhausted", ""
 	Name     string
 	Key      string // exact token key match (sk- prefix is stripped)
 	UserID   int64
@@ -75,10 +76,35 @@ func (s *TokenService) groupCol() string {
 	return "`group`"
 }
 
+func tokenNotExpiredCondition(alias string, now int64) string {
+	return fmt.Sprintf("(%s.expired_time IS NULL OR %s.expired_time <= 0 OR %s.expired_time > %d)",
+		alias, alias, alias, now)
+}
+
+func tokenHasQuotaCondition(alias string) string {
+	return fmt.Sprintf("(COALESCE(%s.unlimited_quota, FALSE) = TRUE OR COALESCE(%s.remain_quota, 0) > 0)",
+		alias, alias)
+}
+
+func tokenEffectiveActiveCondition(alias string, now int64) string {
+	return fmt.Sprintf("(%s.status = 1 AND %s AND %s)",
+		alias, tokenNotExpiredCondition(alias, now), tokenHasQuotaCondition(alias))
+}
+
+func tokenEffectiveExpiredCondition(alias string, now int64) string {
+	return fmt.Sprintf("(%s.status = 3 OR (%s.status = 1 AND %s.expired_time > 0 AND %s.expired_time <= %d))",
+		alias, alias, alias, alias, now)
+}
+
+func tokenEffectiveExhaustedCondition(alias string, now int64) string {
+	return fmt.Sprintf("(%s.status = 4 OR (%s.status = 1 AND %s AND COALESCE(%s.unlimited_quota, FALSE) = FALSE AND COALESCE(%s.remain_quota, 0) <= 0))",
+		alias, alias, tokenNotExpiredCondition(alias, now), alias, alias)
+}
+
 // MaskTokenKey masks a token key, showing only the first 8 chars
 func MaskTokenKey(key string) string {
 	if len(key) <= 8 {
-		return key + "****"
+		return "****"
 	}
 	return key[:8] + "****"
 }
@@ -124,11 +150,13 @@ func (s *TokenService) ListTokens(params TokenListParams) (map[string]interface{
 
 	switch params.Status {
 	case "active":
-		conditions = append(conditions, "t.status = 1")
+		conditions = append(conditions, tokenEffectiveActiveCondition("t", now))
 	case "disabled":
-		conditions = append(conditions, "t.status != 1")
+		conditions = append(conditions, "t.status = 2")
 	case "expired":
-		conditions = append(conditions, fmt.Sprintf("t.expired_time > 0 AND t.expired_time <= %d", now))
+		conditions = append(conditions, tokenEffectiveExpiredCondition("t", now))
+	case "exhausted":
+		conditions = append(conditions, tokenEffectiveExhaustedCondition("t", now))
 	}
 
 	if params.Expired == "yes" {
@@ -248,14 +276,15 @@ func (s *TokenService) ListTokens(params TokenListParams) (map[string]interface{
 // GetTokenGroups 返回所有不同的令牌分组及其令牌数量
 func (s *TokenService) GetTokenGroups() ([]map[string]interface{}, error) {
 	groupCol := s.groupCol()
+	now := time.Now().Unix()
 	query := s.db.RebindQuery(fmt.Sprintf(`
-		SELECT COALESCE(NULLIF(%s, ''), 'default') as group_name,
+		SELECT COALESCE(NULLIF(t.%s, ''), 'default') as group_name,
 			COUNT(*) as token_count,
-			SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as active_count
-		FROM tokens
-		WHERE deleted_at IS NULL
-		GROUP BY COALESCE(NULLIF(%s, ''), 'default')
-		ORDER BY token_count DESC`, groupCol, groupCol))
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) as active_count
+		FROM tokens t
+		WHERE t.deleted_at IS NULL
+		GROUP BY COALESCE(NULLIF(t.%s, ''), 'default')
+		ORDER BY token_count DESC`, groupCol, tokenEffectiveActiveCondition("t", now), groupCol))
 
 	rows, err := s.db.Query(query)
 	if err != nil {
@@ -274,11 +303,15 @@ func (s *TokenService) GetTokenStatistics() (*TokenStatistics, error) {
 	query := s.db.RebindQuery(fmt.Sprintf(`
 		SELECT
 			COUNT(*) as total,
-			SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as active,
-			SUM(CASE WHEN status != 1 THEN 1 ELSE 0 END) as disabled,
-			SUM(CASE WHEN expired_time > 0 AND expired_time <= %d THEN 1 ELSE 0 END) as expired
-		FROM tokens
-		WHERE deleted_at IS NULL`, now))
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) as active,
+			SUM(CASE WHEN t.status = 2 THEN 1 ELSE 0 END) as disabled,
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) as expired,
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) as exhausted
+		FROM tokens t
+		WHERE t.deleted_at IS NULL`,
+		tokenEffectiveActiveCondition("t", now),
+		tokenEffectiveExpiredCondition("t", now),
+		tokenEffectiveExhaustedCondition("t", now)))
 
 	row, err := s.db.QueryOne(query)
 	if err != nil {
@@ -289,9 +322,10 @@ func (s *TokenService) GetTokenStatistics() (*TokenStatistics, error) {
 	}
 
 	return &TokenStatistics{
-		Total:    toInt64(row["total"]),
-		Active:   toInt64(row["active"]),
-		Disabled: toInt64(row["disabled"]),
-		Expired:  toInt64(row["expired"]),
+		Total:     toInt64(row["total"]),
+		Active:    toInt64(row["active"]),
+		Disabled:  toInt64(row["disabled"]),
+		Expired:   toInt64(row["expired"]),
+		Exhausted: toInt64(row["exhausted"]),
 	}, nil
 }

@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -33,7 +35,7 @@ func TestAbuseBroadcastSyncOnceStoresHubReports(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Node-ID") != "node_local" || r.Header.Get("X-Node-Secret") != "secret_local" {
 			t.Fatalf("missing node credentials")
 		}
@@ -75,6 +77,10 @@ func TestAbuseBroadcastSyncOnceStoresHubReports(t *testing.T) {
 	config.Load()
 
 	svc := NewAbuseBroadcastService()
+	// The production client rejects loopback destinations. This test injects the
+	// TLS test server explicitly while keeping the production policy fail-closed.
+	svc.httpClient = hub.Client()
+	svc.validateHubURL = func(context.Context, string) error { return nil }
 	enabled := true
 	hubURL := hub.URL + "/v1/live"
 	nodeID := "node_local"
@@ -135,6 +141,50 @@ func TestAbuseBroadcastSyncOnceStoresHubReports(t *testing.T) {
 	}
 }
 
+func TestAbuseBroadcastPullIntervalBounds(t *testing.T) {
+	tests := []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{name: "default for zero", value: 0, want: DefaultAbuseBroadcastPullIntervalSeconds},
+		{name: "default for negative", value: -1, want: DefaultAbuseBroadcastPullIntervalSeconds},
+		{name: "clamp legacy value below minimum", value: 1, want: MinAbuseBroadcastPullIntervalSeconds},
+		{name: "minimum", value: MinAbuseBroadcastPullIntervalSeconds, want: MinAbuseBroadcastPullIntervalSeconds},
+		{name: "maximum", value: MaxAbuseBroadcastPullIntervalSeconds, want: MaxAbuseBroadcastPullIntervalSeconds},
+		{name: "clamp legacy value above maximum", value: MaxAbuseBroadcastPullIntervalSeconds + 1, want: MaxAbuseBroadcastPullIntervalSeconds},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeAbuseBroadcastPullInterval(tt.value); got != tt.want {
+				t.Fatalf("normalize interval %d = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAbuseBroadcastUpdateSettingsRejectsUnsafePullIntervals(t *testing.T) {
+	t.Setenv("SQL_DSN", "not-used")
+	t.Setenv("DATA_DIR", t.TempDir())
+	config.Load()
+	svc := NewAbuseBroadcastService()
+
+	for _, value := range []int{
+		MinAbuseBroadcastPullIntervalSeconds - 1,
+		MaxAbuseBroadcastPullIntervalSeconds + 1,
+		int(^uint(0) >> 1),
+	} {
+		value := value
+		t.Run(fmt.Sprintf("%d", value), func(t *testing.T) {
+			if _, err := svc.UpdateSettings(context.Background(), AbuseBroadcastSettingsInput{
+				PullIntervalSeconds: &value,
+			}); err == nil {
+				t.Fatalf("expected interval %d to be rejected", value)
+			}
+		})
+	}
+}
+
 func TestAbuseBroadcastMatchReportFindsLinuxDoAndIP(t *testing.T) {
 	appDB := installSQLiteForTests(t)
 	stmts := []string{
@@ -178,8 +228,9 @@ func TestAbuseBroadcastMatchReportFindsLinuxDoAndIP(t *testing.T) {
 	config.Load()
 
 	svc := NewAbuseBroadcastService()
+	svc.validateHubURL = func(context.Context, string) error { return nil }
 	enabled := true
-	hubURL := "http://hub.local/v1/live"
+	hubURL := "https://hub.example/v1/live"
 	nodeID := "node_local"
 	secret := "secret_local"
 	if _, err := svc.UpdateSettings(context.Background(), AbuseBroadcastSettingsInput{
@@ -234,6 +285,24 @@ func TestAbuseBroadcastMatchReportFindsLinuxDoAndIP(t *testing.T) {
 	first := matches.Users[0]
 	if first.UserID != 1 || first.RequestCount != 2 || !containsString(first.MatchTypes, "linuxdo_id") || !containsString(first.MatchTypes, "ip") {
 		t.Fatalf("unexpected primary match: %+v", first)
+	}
+}
+
+func TestAbuseBroadcastMatchReportWrapsNotFoundSentinel(t *testing.T) {
+	t.Setenv("SQL_DSN", "not-used")
+	t.Setenv("DATA_DIR", t.TempDir())
+	config.Load()
+
+	svc := NewAbuseBroadcastService()
+	_, err := svc.MatchReport(context.Background(), "missing-report")
+	if err == nil {
+		t.Fatal("expected missing report error")
+	}
+	if !errors.Is(err, ErrAbuseBroadcastReportNotFound) {
+		t.Fatalf("expected ErrAbuseBroadcastReportNotFound, got %v", err)
+	}
+	if err == ErrAbuseBroadcastReportNotFound {
+		t.Fatal("expected sentinel to retain report context through wrapping")
 	}
 }
 

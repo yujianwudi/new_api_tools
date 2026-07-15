@@ -142,7 +142,7 @@ export function ResultModal({ result, onClose }: ResultModalProps) {
 
         {/* Footer */}
         <div className="px-6 py-4 bg-muted/50 border-t flex justify-between items-center flex-shrink-0">
-          <p className="text-sm text-muted-foreground">提示：兑换码已自动保存到历史记录</p>
+          <p className="text-sm text-muted-foreground">提示：关闭后不保留兑换码明文，请先复制或下载</p>
           <Button variant="secondary" onClick={onClose}>关闭</Button>
         </div>
       </div>

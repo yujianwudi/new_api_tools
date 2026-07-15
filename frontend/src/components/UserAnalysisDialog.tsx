@@ -211,8 +211,7 @@ export function UserAnalysisDialog({
         displayName?: string
         reason: string
         disableTokens: boolean
-        enableTokens: boolean
-    }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true, enableTokens: false })
+    }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true })
     const [reportDialog, setReportDialog] = useState({
         open: false,
         reasonPreset: '',
@@ -390,7 +389,7 @@ export function UserAnalysisDialog({
                     reason: banConfirmDialog.reason || null,
                     ...(isBan
                         ? { disable_tokens: banConfirmDialog.disableTokens }
-                        : { enable_tokens: banConfirmDialog.enableTokens }),
+                        : {}),
                     context: { source, ...contextData },
                 }),
             })
@@ -871,7 +870,7 @@ export function UserAnalysisDialog({
                                             setBanConfirmDialog({
                                                 open: true, type: 'unban', userId: analysis.user.id,
                                                 username: analysis.user.username, displayName: analysis.user.display_name || undefined,
-                                                reason: '', disableTokens: false, enableTokens: true,
+                                                reason: '', disableTokens: false,
                                             })
                                         }}
                                         disabled={mutating || analysisLoading}
@@ -888,7 +887,7 @@ export function UserAnalysisDialog({
                                             setBanConfirmDialog({
                                                 open: true, type: 'ban', userId: analysis.user.id,
                                                 username: analysis.user.username, displayName: analysis.user.display_name || undefined,
-                                                reason: '', disableTokens: true, enableTokens: false,
+                                                reason: '', disableTokens: true,
                                             })
                                         }}
                                         disabled={mutating || analysisLoading}
@@ -1026,18 +1025,22 @@ export function UserAnalysisDialog({
                             </Select>
                         </div>
 
-                        <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
-                            <input
-                                type="checkbox"
-                                checked={banConfirmDialog.type === 'ban' ? banConfirmDialog.disableTokens : banConfirmDialog.enableTokens}
-                                onChange={(e) => banConfirmDialog.type === 'ban'
-                                    ? setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))
-                                    : setBanConfirmDialog(prev => ({ ...prev, enableTokens: e.target.checked }))
-                                }
-                                className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                            />
-                            {banConfirmDialog.type === 'ban' ? '同时禁用该用户所有令牌' : '同时启用该用户所有令牌'}
-                        </label>
+                        {banConfirmDialog.type === 'ban' ? (
+                            <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
+                                <input
+                                    type="checkbox"
+                                    checked={banConfirmDialog.disableTokens}
+                                    onChange={(e) => setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))}
+                                    className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+                                />
+                                同时禁用该用户所有令牌
+                            </label>
+                        ) : (
+                            <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+                                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+                                <span>解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。</span>
+                            </div>
+                        )}
                     </div>
 
                     <DialogFooter className="gap-2 sm:gap-0 mt-2">

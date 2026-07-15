@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -27,24 +29,24 @@ func RegisterRedemptionRoutes(r *gin.RouterGroup) {
 func GenerateRedemptionCodes(c *gin.Context) {
 	var req service.GenerateParams
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 
 	result, err := service.GenerateCodes(req)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("GENERATION_ERROR", err.Error(), ""))
+		respondHandlerError(c, http.StatusBadRequest, "GENERATION_ERROR", "Invalid redemption generation parameters", "redemption code generation validation", err)
 		return
 	}
 
 	if !result.Success {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("GENERATION_FAILED", result.Message, ""))
+		respondInternalError(c, "GENERATION_FAILED", "Unable to generate redemption codes", "redemption code generation", errors.New(result.Message))
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": result.Message,
+		"message": fmt.Sprintf("Successfully generated %d redemption codes", result.Count),
 		"data": gin.H{
 			"keys":  result.Keys,
 			"count": result.Count,
@@ -68,7 +70,7 @@ func ListRedemptionCodes(c *gin.Context) {
 
 	result, err := service.ListCodes(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "redemption code list query", err)
 		return
 	}
 
@@ -85,7 +87,7 @@ func GetRedemptionStatistics(c *gin.Context) {
 
 	stats, err := service.GetRedemptionStatistics(startDate, endDate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "redemption statistics query", err)
 		return
 	}
 
@@ -101,13 +103,13 @@ func BatchDeleteRedemptionCodes(c *gin.Context) {
 		IDs []int64 `json:"ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 
 	affected, err := service.DeleteCodes(req.IDs)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+		respondInternalError(c, "DELETE_ERROR", "Unable to delete redemption codes", "redemption batch delete", err)
 		return
 	}
 
@@ -128,7 +130,7 @@ func DeleteRedemptionCode(c *gin.Context) {
 
 	affected, err := service.DeleteCodes([]int64{id})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+		respondInternalError(c, "DELETE_ERROR", "Unable to delete redemption code", "redemption delete", err)
 		return
 	}
 

@@ -13,6 +13,8 @@ import {
 // Types
 // ============================================================================
 
+type ModelHealthStatus = 'green' | 'yellow' | 'red' | 'unknown'
+
 interface SlotStatus {
   slot: number
   start_time: number
@@ -20,7 +22,7 @@ interface SlotStatus {
   total_requests: number
   success_count: number
   success_rate: number
-  status: 'green' | 'yellow' | 'red'
+	status: ModelHealthStatus
 }
 
 interface ModelStatus {
@@ -30,7 +32,7 @@ interface ModelStatus {
   total_requests: number
   success_count: number
   success_rate: number
-  current_status: 'green' | 'yellow' | 'red'
+	current_status: ModelHealthStatus
   slot_data: SlotStatus[]
 }
 
@@ -814,6 +816,7 @@ const STATUS_LABELS = {
   green: '正常',
   yellow: '警告',
   red: '异常',
+  unknown: '暂无数据',
 }
 
 // Time window options
@@ -850,12 +853,16 @@ function formatCountdown(seconds: number): string {
   return mins > 0 ? `${mins}:${secs.toString().padStart(2, '0')}` : `${secs}s`
 }
 
-function getStatusColor(status: 'green' | 'yellow' | 'red', styles: typeof themeStyles.obsidian) {
+function getStatusColor(status: ModelHealthStatus, styles: typeof themeStyles.obsidian) {
+  if (status === 'unknown') {
+    return cn(styles.statusEmpty, 'border border-dashed border-current/60 bg-transparent')
+  }
   return status === 'green' ? styles.statusGreen :
          status === 'yellow' ? styles.statusYellow : styles.statusRed
 }
 
-function getBadgeColor(status: 'green' | 'yellow' | 'red', styles: typeof themeStyles.obsidian) {
+function getBadgeColor(status: ModelHealthStatus, styles: typeof themeStyles.obsidian) {
+  if (status === 'unknown') return cn(styles.emptyText, 'border border-current/20 bg-transparent')
   return status === 'green' ? styles.badgeGreen :
          status === 'yellow' ? styles.badgeYellow : styles.badgeRed
 }
@@ -1110,11 +1117,12 @@ export function ModelStatusEmbed({
         {/* Stats Overview Bar */}
         {modelStatuses.length > 0 && theme !== 'minimal' && (() => {
           const totalRequests = modelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
-          const activeModels = modelStatuses.filter(m => m.total_requests > 0)
-          const avgRate = activeModels.length > 0 ? +(activeModels.reduce((sum, m) => sum + m.success_rate, 0) / activeModels.length).toFixed(1) : 0
+          const rateModels = modelStatuses.filter(m => m.total_requests > 0 && m.current_status !== 'unknown')
+          const avgRate = rateModels.length > 0 ? +(rateModels.reduce((sum, m) => sum + m.success_rate, 0) / rateModels.length).toFixed(1) : null
           const greenCount = modelStatuses.filter(m => m.current_status === 'green').length
           const yellowCount = modelStatuses.filter(m => m.current_status === 'yellow').length
           const redCount = modelStatuses.filter(m => m.current_status === 'red').length
+          const unknownCount = modelStatuses.filter(m => m.current_status === 'unknown').length
           return (
             <div className={cn(
               "flex flex-wrap items-center gap-x-6 gap-y-2 mb-6 px-4 py-3 rounded-xl text-sm",
@@ -1141,10 +1149,14 @@ export function ModelStatusEmbed({
               </div>
               <div className={cn("flex items-center gap-2", styles.statsText)}>
                 <span>平均成功率</span>
-                <span className={cn(
-                  'font-semibold tabular-nums',
-                  avgRate >= 95 ? styles.statusGreen.replace('bg-', 'text-') : avgRate >= 80 ? styles.statusYellow.replace('bg-', 'text-') : styles.statusRed.replace('bg-', 'text-')
-                )}>{avgRate}%</span>
+                {avgRate === null ? (
+                  <span className={cn('font-semibold', styles.emptyText)}>暂无数据</span>
+                ) : (
+                  <span className={cn(
+                    'font-semibold tabular-nums',
+                    avgRate >= 95 ? styles.statusGreen.replace('bg-', 'text-') : avgRate >= 80 ? styles.statusYellow.replace('bg-', 'text-') : styles.statusRed.replace('bg-', 'text-')
+                  )}>{avgRate}%</span>
+                )}
               </div>
               <div className="flex items-center gap-3 ml-auto">
                 <span className="flex items-center gap-1.5">
@@ -1158,6 +1170,10 @@ export function ModelStatusEmbed({
                 <span className="flex items-center gap-1.5">
                   <span className={cn('w-2 h-2 rounded-full', styles.statusRed)} />
                   <span className={cn(styles.statsText, 'tabular-nums')}>{redCount}</span>
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className={cn('w-2 h-2 rounded-full', styles.statusEmpty)} />
+                  <span className={cn(styles.statsText, 'tabular-nums')}>{unknownCount}</span>
                 </span>
               </div>
             </div>
@@ -1310,6 +1326,13 @@ export function ModelStatusEmbed({
               </span>
             </div>
           ))}
+          {/* Unknown status indicator */}
+          <div className="flex items-center gap-2">
+            <span className={cn(styles.legendDot, getStatusColor('unknown', styles))} />
+            <span className={styles.legendText}>
+              {theme === 'minimal' ? 'Unknown' : '状态未知'}
+            </span>
+          </div>
           {/* No requests indicator */}
           <div className="flex items-center gap-2">
             <span className={cn(styles.legendDot, styles.statusEmpty)} />
@@ -1346,10 +1369,19 @@ export function ModelStatusEmbed({
               <span className={styles.tooltipLabel}>成功率</span>
               <span className={cn(
                 styles.tooltipValue,
-                hoveredSlot.status === 'green' ? 'text-emerald-400' :
-                hoveredSlot.status === 'yellow' ? 'text-amber-400' : 'text-rose-400'
+                hoveredSlot.total_requests === 0 || hoveredSlot.status === 'unknown'
+                  ? styles.emptyText
+                  : hoveredSlot.status === 'green'
+                    ? 'text-emerald-400'
+                    : hoveredSlot.status === 'yellow'
+                      ? 'text-amber-400'
+                      : 'text-rose-400'
               )}>
-                {hoveredSlot.success_rate}%
+                {hoveredSlot.total_requests === 0
+                  ? '无请求'
+                  : hoveredSlot.status === 'unknown'
+                    ? '状态未知'
+                    : `${hoveredSlot.success_rate}%`}
               </span>
             </div>
           </div>
@@ -1421,12 +1453,12 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
           )}
           {isMinimal && (
             <span className={getBadgeColor(model.current_status, styles)}>
-              {model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : '○'}
+              {model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : model.current_status === 'red' ? '○' : '·'}
             </span>
           )}
         </div>
         <div className={styles.statsText}>
-          <span className={styles.statsValue}>{model.success_rate}%</span>
+          <span className={styles.statsValue}>{model.current_status === 'unknown' ? '—' : `${model.success_rate}%`}</span>
           {!isMinimal && ' 成功率'}
           <span className={isMinimal ? 'mx-1' : 'mx-2 opacity-30'}>·</span>
           <span>{model.total_requests.toLocaleString()}</span>

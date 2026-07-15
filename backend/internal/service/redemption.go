@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -21,19 +22,22 @@ type RedemptionCode struct {
 	UsedUserID   int64  `json:"used_user_id" db:"used_user_id"`
 	UsedUsername string `json:"used_username" db:"used_username"`
 	ExpiredTime  int64  `json:"expired_time" db:"expired_time"`
-	Status       string `json:"status"` // "unused", "used", "expired"
+	DBStatus     int64  `json:"-" db:"db_status"`
+	Status       string `json:"status"` // "unused", "disabled", "used", "expired"
 }
 
 // RedemptionStatistics holds aggregate statistics
 type RedemptionStatistics struct {
-	TotalCount   int64 `json:"total_count" db:"total_count"`
-	UnusedCount  int64 `json:"unused_count" db:"unused_count"`
-	UsedCount    int64 `json:"used_count" db:"used_count"`
-	ExpiredCount int64 `json:"expired_count" db:"expired_count"`
-	TotalQuota   int64 `json:"total_quota" db:"total_quota"`
-	UnusedQuota  int64 `json:"unused_quota" db:"unused_quota"`
-	UsedQuota    int64 `json:"used_quota" db:"used_quota"`
-	ExpiredQuota int64 `json:"expired_quota" db:"expired_quota"`
+	TotalCount    int64 `json:"total_count" db:"total_count"`
+	UnusedCount   int64 `json:"unused_count" db:"unused_count"`
+	UsedCount     int64 `json:"used_count" db:"used_count"`
+	ExpiredCount  int64 `json:"expired_count" db:"expired_count"`
+	DisabledCount int64 `json:"disabled_count" db:"disabled_count"`
+	TotalQuota    int64 `json:"total_quota" db:"total_quota"`
+	UnusedQuota   int64 `json:"unused_quota" db:"unused_quota"`
+	UsedQuota     int64 `json:"used_quota" db:"used_quota"`
+	ExpiredQuota  int64 `json:"expired_quota" db:"expired_quota"`
+	DisabledQuota int64 `json:"disabled_quota" db:"disabled_quota"`
 }
 
 // GenerateParams holds parameters for code generation
@@ -147,7 +151,7 @@ func GenerateCodes(params GenerateParams) (*GenerateResult, error) {
 	kc := keyCol(db.IsPG)
 
 	// Build SQL for display
-	sql := buildInsertSQL(keys, params.Name, quotas, createdTime, expiredTime, kc)
+	sql := buildInsertSQL(keys, params.Name, quotas, createdTime, expiredTime, kc, db.IsPG)
 
 	// Execute batch insert
 	insertSQL := fmt.Sprintf(`INSERT INTO redemptions (user_id, %s, name, quota, created_time, redeemed_time, used_user_id, expired_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, kc)
@@ -181,12 +185,24 @@ func GenerateCodes(params GenerateParams) (*GenerateResult, error) {
 	}, nil
 }
 
-func buildInsertSQL(keys []string, name string, quotas []int64, createdTime, expiredTime int64, kc string) string {
+func buildInsertSQL(keys []string, name string, quotas []int64, createdTime, expiredTime int64, kc string, isPG bool) string {
 	var values []string
 	for i, key := range keys {
-		values = append(values, fmt.Sprintf("(1, '%s', '%s', %d, %d, 0, 0, %d)", key, name, quotas[i], createdTime, expiredTime))
+		values = append(values, fmt.Sprintf("(1, %s, %s, %d, %d, 0, 0, %d)",
+			sqlTextLiteral(key, isPG), sqlTextLiteral(name, isPG), quotas[i], createdTime, expiredTime))
 	}
 	return fmt.Sprintf("INSERT INTO redemptions (user_id, %s, name, quota, created_time, redeemed_time, used_user_id, expired_time) VALUES\n%s;", kc, strings.Join(values, ",\n"))
+}
+
+// sqlTextLiteral uses a hex payload instead of quote/backslash escaping. This
+// remains safe across MySQL SQL modes and PostgreSQL string settings when an
+// operator copies the generated SQL into a database console.
+func sqlTextLiteral(value string, isPG bool) string {
+	payload := hex.EncodeToString([]byte(value))
+	if isPG {
+		return fmt.Sprintf("convert_from(decode('%s', 'hex'), 'UTF8')", payload)
+	}
+	return fmt.Sprintf("CONVERT(X'%s' USING utf8mb4)", payload)
 }
 
 // ListCodes lists redemption codes with pagination and filtering
@@ -216,8 +232,11 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 	if params.Status != "" {
 		switch params.Status {
 		case "used":
-			where = append(where, "(r.redeemed_time IS NOT NULL AND r.redeemed_time > 0)")
+			where = append(where, "(COALESCE(r.status, 1) = 3 OR (COALESCE(r.status, 1) = 1 AND r.redeemed_time IS NOT NULL AND r.redeemed_time > 0))")
+		case "disabled":
+			where = append(where, "COALESCE(r.status, 1) = 2")
 		case "expired":
+			where = append(where, "COALESCE(r.status, 1) = 1")
 			where = append(where, "(r.redeemed_time IS NULL OR r.redeemed_time = 0)")
 			where = append(where, "r.expired_time IS NOT NULL")
 			where = append(where, "r.expired_time > 0")
@@ -225,6 +244,7 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 			args = append(args, currentTime)
 			argIdx++
 		case "unused":
+			where = append(where, "COALESCE(r.status, 1) = 1")
 			where = append(where, "(r.redeemed_time IS NULL OR r.redeemed_time = 0)")
 			where = append(where, fmt.Sprintf("(r.expired_time IS NULL OR r.expired_time = 0 OR r.expired_time >= %s)", db.Placeholder(argIdx)))
 			args = append(args, currentTime)
@@ -266,7 +286,7 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 	offset := (params.Page - 1) * params.PageSize
 
 	// Query items with LEFT JOIN to get used username
-	selectSQL := fmt.Sprintf(`SELECT r.id, r.%s as "key", COALESCE(r.name,'') as name, COALESCE(r.quota,0) as quota, COALESCE(r.created_time,0) as created_time, COALESCE(r.redeemed_time,0) as redeemed_time, COALESCE(r.used_user_id,0) as used_user_id, COALESCE(u.username,'') as used_username, COALESCE(r.expired_time,0) as expired_time FROM redemptions r LEFT JOIN users u ON r.used_user_id = u.id AND r.used_user_id > 0 WHERE %s ORDER BY r.created_time DESC LIMIT %s OFFSET %s`,
+	selectSQL := fmt.Sprintf(`SELECT r.id, r.%s as "key", COALESCE(r.name,'') as name, COALESCE(r.quota,0) as quota, COALESCE(r.created_time,0) as created_time, COALESCE(r.redeemed_time,0) as redeemed_time, COALESCE(r.used_user_id,0) as used_user_id, COALESCE(u.username,'') as used_username, COALESCE(r.expired_time,0) as expired_time, COALESCE(r.status,1) as db_status FROM redemptions r LEFT JOIN users u ON r.used_user_id = u.id AND r.used_user_id > 0 WHERE %s ORDER BY r.created_time DESC LIMIT %s OFFSET %s`,
 		kc, whereSQL, db.Placeholder(argIdx), db.Placeholder(argIdx+1))
 	args = append(args, params.PageSize, offset)
 
@@ -283,7 +303,9 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 			continue
 		}
 		// Determine status
-		if code.RedeemedTime > 0 {
+		if code.DBStatus == 2 {
+			code.Status = "disabled"
+		} else if code.DBStatus == 3 || code.RedeemedTime > 0 {
 			code.Status = "used"
 		} else if code.ExpiredTime > 0 && code.ExpiredTime < currentTime {
 			code.Status = "expired"
@@ -367,13 +389,15 @@ func GetRedemptionStatistics(startDate, endDate string) (*RedemptionStatistics, 
 
 	sql := fmt.Sprintf(`SELECT 
 		COUNT(*) as total_count,
-		SUM(CASE WHEN (redeemed_time IS NULL OR redeemed_time = 0) AND (expired_time IS NULL OR expired_time = 0 OR expired_time >= %s) THEN 1 ELSE 0 END) as unused_count,
-		SUM(CASE WHEN redeemed_time IS NOT NULL AND redeemed_time > 0 THEN 1 ELSE 0 END) as used_count,
-		SUM(CASE WHEN (redeemed_time IS NULL OR redeemed_time = 0) AND expired_time IS NOT NULL AND expired_time > 0 AND expired_time < %s THEN 1 ELSE 0 END) as expired_count,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 1 AND (redeemed_time IS NULL OR redeemed_time = 0) AND (expired_time IS NULL OR expired_time = 0 OR expired_time >= %s) THEN 1 ELSE 0 END), 0) as unused_count,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 3 OR (COALESCE(status, 1) = 1 AND redeemed_time IS NOT NULL AND redeemed_time > 0) THEN 1 ELSE 0 END), 0) as used_count,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 1 AND (redeemed_time IS NULL OR redeemed_time = 0) AND expired_time IS NOT NULL AND expired_time > 0 AND expired_time < %s THEN 1 ELSE 0 END), 0) as expired_count,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 2 THEN 1 ELSE 0 END), 0) as disabled_count,
 		COALESCE(SUM(quota), 0) as total_quota,
-		COALESCE(SUM(CASE WHEN (redeemed_time IS NULL OR redeemed_time = 0) AND (expired_time IS NULL OR expired_time = 0 OR expired_time >= %s) THEN quota ELSE 0 END), 0) as unused_quota,
-		COALESCE(SUM(CASE WHEN redeemed_time IS NOT NULL AND redeemed_time > 0 THEN quota ELSE 0 END), 0) as used_quota,
-		COALESCE(SUM(CASE WHEN (redeemed_time IS NULL OR redeemed_time = 0) AND expired_time IS NOT NULL AND expired_time > 0 AND expired_time < %s THEN quota ELSE 0 END), 0) as expired_quota
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 1 AND (redeemed_time IS NULL OR redeemed_time = 0) AND (expired_time IS NULL OR expired_time = 0 OR expired_time >= %s) THEN quota ELSE 0 END), 0) as unused_quota,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 3 OR (COALESCE(status, 1) = 1 AND redeemed_time IS NOT NULL AND redeemed_time > 0) THEN quota ELSE 0 END), 0) as used_quota,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 1 AND (redeemed_time IS NULL OR redeemed_time = 0) AND expired_time IS NOT NULL AND expired_time > 0 AND expired_time < %s THEN quota ELSE 0 END), 0) as expired_quota,
+		COALESCE(SUM(CASE WHEN COALESCE(status, 1) = 2 THEN quota ELSE 0 END), 0) as disabled_quota
 		FROM redemptions WHERE %s`,
 		p(1), p(2), p(3), p(4), whereSQL)
 

@@ -23,6 +23,9 @@ interface GeneratorFormProps {
   isLoading: boolean
 }
 
+const MAX_KEY_PREFIX_LENGTH = 7
+const KEY_PREFIX_PATTERN = /^[a-z0-9_-]*$/
+
 const defaultFormData: GenerateFormData = {
   name: '',
   count: 1,
@@ -45,7 +48,11 @@ export function GeneratorForm({ onSubmit, isLoading }: GeneratorFormProps) {
 
     if (!formData.name.trim()) newErrors.name = '请输入兑换码名称'
     if (formData.count < 1 || formData.count > 1000) newErrors.count = '数量必须在 1-1000 之间'
-    if (formData.key_prefix.length > 20) newErrors.key_prefix = '前缀最多 20 个字符'
+    if (!KEY_PREFIX_PATTERN.test(formData.key_prefix)) {
+      newErrors.key_prefix = '前缀只能包含小写字母、数字、_ 和 -'
+    } else if (formData.key_prefix.length > MAX_KEY_PREFIX_LENGTH) {
+      newErrors.key_prefix = `前缀最多 ${MAX_KEY_PREFIX_LENGTH} 个字符`
+    }
 
     if (formData.quota_mode === 'fixed') {
       if (formData.fixed_amount <= 0) newErrors.fixed_amount = '固定额度必须大于 0'
@@ -74,6 +81,14 @@ export function GeneratorForm({ onSubmit, isLoading }: GeneratorFormProps) {
   const updateField = <K extends keyof GenerateFormData>(field: K, value: GenerateFormData[K]) => {
     setFormData((prev) => ({ ...prev, [field]: value }))
     if (errors[field]) setErrors((prev) => ({ ...prev, [field]: undefined }))
+  }
+
+  const handleKeyPrefixChange = (value: string) => {
+    const sanitized = value
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '')
+      .slice(0, MAX_KEY_PREFIX_LENGTH)
+    updateField('key_prefix', sanitized)
   }
 
   const inputClass = (hasError: boolean) =>
@@ -121,12 +136,15 @@ export function GeneratorForm({ onSubmit, isLoading }: GeneratorFormProps) {
         <input
           type="text"
           value={formData.key_prefix}
-          onChange={(e) => updateField('key_prefix', e.target.value)}
-          placeholder="例如: VIP"
-          maxLength={20}
+          onChange={(e) => handleKeyPrefixChange(e.target.value)}
+          placeholder="例如: vip"
+          maxLength={MAX_KEY_PREFIX_LENGTH}
+          pattern="[a-z0-9_-]*"
           className={inputClass(!!errors.key_prefix)}
         />
-        <p className="mt-1 text-xs text-muted-foreground">最多 20 个字符，将作为兑换码的前缀</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          最多 {MAX_KEY_PREFIX_LENGTH} 个字符，仅限小写字母、数字、_ 和 -
+        </p>
         {errors.key_prefix && <p className="mt-1 text-sm text-destructive">{errors.key_prefix}</p>}
       </div>
 

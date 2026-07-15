@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
@@ -34,7 +36,7 @@ func GetSystemOverview(c *gin.Context) {
 
 	data, err := svc.GetSystemOverview(period, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard system overview query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -48,7 +50,7 @@ func GetUsageStatistics(c *gin.Context) {
 
 	data, err := svc.GetUsageStatistics(period, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard usage statistics query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -63,7 +65,7 @@ func GetModelUsage(c *gin.Context) {
 
 	data, err := svc.GetModelUsage(period, limit, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard model usage query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -78,7 +80,7 @@ func GetDailyTrends(c *gin.Context) {
 
 	data, err := svc.GetDailyTrends(days, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard daily trends query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -93,7 +95,7 @@ func GetHourlyTrends(c *gin.Context) {
 
 	data, err := svc.GetHourlyTrends(hours, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard hourly trends query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -108,7 +110,7 @@ func GetTopUsers(c *gin.Context) {
 
 	data, err := svc.GetTopUsers(period, limit, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard top users query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -120,7 +122,7 @@ func GetChannelStatus(c *gin.Context) {
 
 	data, err := svc.GetChannelStatus()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard channel status query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -138,25 +140,36 @@ func InvalidateDashboardCache(c *gin.Context) {
 
 // GET /api/dashboard/refresh-estimate
 func GetRefreshEstimate(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"show_estimate":  false,
-			"estimated_time": 0,
-		},
-	})
+	period := c.DefaultQuery("period", "7d")
+	if !service.IsValidDashboardRefreshPeriod(period) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   gin.H{"message": "Invalid period value"},
+		})
+		return
+	}
+
+	svc := service.NewDashboardService()
+	data, err := svc.GetDashboardRefreshEstimate(period)
+	if err != nil {
+		respondHandlerError(c, http.StatusServiceUnavailable, "QUERY_ERROR", "Dashboard refresh estimate unavailable", "dashboard refresh estimate", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/dashboard/system-info
 func GetDashboardSystemInfo(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"scale":     "medium",
-			"cache_ttl": 300,
-			"tips":      []string{},
-		},
-	})
+	svc := service.NewDashboardService()
+	data, err := svc.GetDashboardSystemInfo()
+	if err != nil {
+		// This endpoint controls a frontend safety gate. Keep the response usable
+		// but conservatively classify the system as xlarge when metrics are not
+		// trustworthy, rather than allowing an unconfirmed refresh.
+		logger.L.Error(fmt.Sprintf("Dashboard system scale detection failed: %v", err), logger.CatAnalytics)
+		data = service.FailClosedDashboardSystemInfo()
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/dashboard/ip-distribution
@@ -171,7 +184,7 @@ func GetIPDistribution(c *gin.Context) {
 	svc := service.NewDashboardService()
 	data, err := svc.GetIPDistribution(window, noCache)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "dashboard IP distribution query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

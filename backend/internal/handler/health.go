@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/models"
 )
 
@@ -15,11 +16,11 @@ func RegisterHealthRoutes(r *gin.Engine) {
 }
 
 // HealthCheck handles GET /api/health
-// Matches Python: {"status": "healthy", "version": "0.1.0"}
+// HealthCheck returns the service status and release version.
 func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, models.HealthResponse{
 		Status:  "healthy",
-		Version: "0.1.0",
+		Version: "0.2.0",
 	})
 }
 
@@ -29,12 +30,13 @@ func DatabaseHealthCheck(c *gin.Context) {
 	db := database.Get()
 
 	if err := db.Ping(); err != nil {
+		logger.L.DBError("Database health check failed: " + err.Error())
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"success": false,
 			"status":  "disconnected",
 			"error": gin.H{
 				"code":    "DB_CONNECTION_FAILED",
-				"message": err.Error(),
+				"message": "Database connection unavailable",
 			},
 		})
 		return

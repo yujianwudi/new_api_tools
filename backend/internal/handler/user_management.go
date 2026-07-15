@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +16,58 @@ const (
 	confirmTextSoftDelete = "注销用户"
 	confirmTextHardDelete = "彻底删除"
 )
+
+type unbanUserRequest struct {
+	Reason       string `json:"reason"`
+	EnableTokens bool   `json:"enable_tokens"`
+}
+
+type purgeSoftDeletedRequest struct {
+	DryRun      bool   `json:"dry_run"`
+	ConfirmText string `json:"confirm_text"`
+	SnapshotID  string `json:"snapshot_id"`
+}
+
+func bindOptionalUnbanUserRequest(c *gin.Context) (unbanUserRequest, error) {
+	var req unbanUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		return unbanUserRequest{}, err
+	}
+	return req, nil
+}
+
+func bindOptionalPurgeSoftDeletedRequest(c *gin.Context) (purgeSoftDeletedRequest, error) {
+	req := purgeSoftDeletedRequest{DryRun: true}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		return purgeSoftDeletedRequest{}, err
+	}
+	return req, nil
+}
+
+func classifyDestructiveOperationError(err error) (int, string, string, bool) {
+	if errors.Is(err, service.ErrInvalidOrExpiredSnapshot) {
+		return http.StatusBadRequest, "SNAPSHOT_INVALID", "操作快照无效、已过期或已使用，请重新预览后再确认", true
+	}
+	if errors.Is(err, service.ErrSnapshotInvalidated) {
+		return http.StatusConflict, "SNAPSHOT_INVALIDATED", "预览后的候选用户已发生变化，请重新预览后再确认", true
+	}
+	if errors.Is(err, service.ErrDestructiveSnapshotStoreUnavailable) {
+		return http.StatusServiceUnavailable, "SNAPSHOT_STORE_UNAVAILABLE", "一次性操作快照存储暂不可用，请稍后重试", true
+	}
+	if errors.Is(err, service.ErrSeparateLogDBBatchDeleteBlocked) {
+		return http.StatusConflict, "BATCH_DELETE_UNSUPPORTED", "日志分库场景不支持安全执行旁路批量删除，请使用 NewAPI 管理 API", true
+	}
+	message := err.Error()
+	if strings.Contains(message, "ALLOW_UNSAFE_BATCH_DELETE=true") ||
+		strings.Contains(message, "ALLOW_UNSAFE_HARD_DELETE=true") ||
+		strings.Contains(message, "direct user/token mutation blocked") {
+		return http.StatusConflict, "OPERATION_SAFETY_GUARD", "Operation blocked by the configured production safety policy", true
+	}
+	if strings.Contains(message, "invalid activity level") {
+		return http.StatusBadRequest, "INVALID_ACTIVITY_LEVEL", "不支持的活跃度条件", true
+	}
+	return 0, "", "", false
+}
 
 func RegisterUserManagementRoutes(r *gin.RouterGroup) {
 	g := r.Group("/users")
@@ -40,7 +94,7 @@ func GetActivityStats(c *gin.Context) {
 
 	stats, err := svc.GetActivityStats(quick)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user activity statistics query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": stats})
@@ -55,7 +109,7 @@ func GetBannedUsers(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	result, err := svc.GetBannedUsers(page, pageSize, search)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "banned user list query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
@@ -80,7 +134,7 @@ func GetUsers(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	result, err := svc.GetUsers(params)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user list query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
@@ -111,7 +165,7 @@ func DeleteUser(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	affected, err := svc.DeleteUser(userID, hardDelete)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+		respondInternalError(c, "DELETE_ERROR", "Unable to delete user", "user delete", err)
 		return
 	}
 	if affected == 0 {
@@ -137,12 +191,13 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 		DryRun        bool   `json:"dry_run"`
 		HardDelete    bool   `json:"hard_delete"`
 		ConfirmText   string `json:"confirm_text"`
+		SnapshotID    string `json:"snapshot_id"`
 	}
 	req.ActivityLevel = "very_inactive"
 	req.DryRun = true
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 
@@ -157,9 +212,17 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 	}
 
 	svc := service.NewUserManagementService()
-	result, err := svc.BatchDeleteInactiveUsers(req.ActivityLevel, req.DryRun, req.HardDelete)
+	result, err := svc.BatchDeleteInactiveUsers(req.ActivityLevel, req.DryRun, req.HardDelete, req.SnapshotID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+		if status, code, message, ok := classifyDestructiveOperationError(err); ok {
+			if status >= http.StatusInternalServerError {
+				respondHandlerError(c, status, code, message, "inactive user batch delete", err)
+			} else {
+				c.JSON(status, models.ErrorResp(code, message, ""))
+			}
+			return
+		}
+		respondInternalError(c, "DELETE_ERROR", "Batch user deletion failed", "inactive user batch delete", err)
 		return
 	}
 
@@ -171,7 +234,7 @@ func GetSoftDeletedCount(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	count, err := svc.GetSoftDeletedCount()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "soft-deleted user count query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"count": count}})
@@ -179,14 +242,21 @@ func GetSoftDeletedCount(c *gin.Context) {
 
 // POST /api/users/soft-deleted/purge
 func PurgeSoftDeletedUsers(c *gin.Context) {
-	var req struct {
-		DryRun      bool   `json:"dry_run"`
-		ConfirmText string `json:"confirm_text"`
+	req, err := bindOptionalPurgeSoftDeletedRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
 	}
-	req.DryRun = true
-	c.ShouldBindJSON(&req)
 
 	if !req.DryRun && !requireDeleteConfirmText(c, req.ConfirmText, confirmTextHardDelete) {
+		return
+	}
+	if !req.DryRun && strings.TrimSpace(req.SnapshotID) == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResp(
+			"SNAPSHOT_REQUIRED",
+			"永久清理前必须重新预览并提交一次性快照",
+			"",
+		))
 		return
 	}
 
@@ -194,7 +264,15 @@ func PurgeSoftDeletedUsers(c *gin.Context) {
 	if req.DryRun {
 		result, err := svc.PreviewSoftDeletedUsers()
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+			if status, code, message, ok := classifyDestructiveOperationError(err); ok {
+				if status >= http.StatusInternalServerError {
+					respondHandlerError(c, status, code, message, "soft-deleted user purge preview", err)
+				} else {
+					c.JSON(status, models.ErrorResp(code, message, ""))
+				}
+				return
+			}
+			respondInternalError(c, "DELETE_ERROR", "Purge preview failed", "soft-deleted user purge preview", err)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
@@ -205,9 +283,17 @@ func PurgeSoftDeletedUsers(c *gin.Context) {
 		return
 	}
 
-	affected, err := svc.PurgeSoftDeleted(req.DryRun)
+	affected, err := svc.PurgeSoftDeleted(req.SnapshotID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("DELETE_ERROR", err.Error(), ""))
+		if status, code, message, ok := classifyDestructiveOperationError(err); ok {
+			if status >= http.StatusInternalServerError {
+				respondHandlerError(c, status, code, message, "soft-deleted user purge", err)
+			} else {
+				c.JSON(status, models.ErrorResp(code, message, ""))
+			}
+			return
+		}
+		respondInternalError(c, "DELETE_ERROR", "Purge failed", "soft-deleted user purge", err)
 		return
 	}
 
@@ -243,11 +329,14 @@ func BanUser(c *gin.Context) {
 		DisableTokens bool   `json:"disable_tokens"`
 	}
 	req.DisableTokens = true
-	c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
+	}
 
 	svc := service.NewUserManagementService()
 	if err := svc.BanUser(userID, req.DisableTokens); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("BAN_ERROR", err.Error(), ""))
+		respondInternalError(c, "BAN_ERROR", "Unable to ban user", "user ban", err)
 		return
 	}
 
@@ -265,15 +354,23 @@ func UnbanUser(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		Reason       string `json:"reason"`
-		EnableTokens bool   `json:"enable_tokens"`
+	req, err := bindOptionalUnbanUserRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
+		return
 	}
-	c.ShouldBindJSON(&req)
 
 	svc := service.NewUserManagementService()
 	if err := svc.UnbanUser(userID, req.EnableTokens); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("UNBAN_ERROR", err.Error(), ""))
+		if errors.Is(err, service.ErrBulkTokenReactivationDisabled) {
+			c.JSON(http.StatusBadRequest, models.ErrorResp(
+				"TOKEN_REACTIVATION_DISABLED",
+				"批量恢复 Token 已禁用，请逐个复核后启用",
+				"",
+			))
+			return
+		}
+		respondInternalError(c, "UNBAN_ERROR", "Unable to unban user", "user unban", err)
 		return
 	}
 
@@ -293,7 +390,7 @@ func DisableToken(c *gin.Context) {
 
 	svc := service.NewUserManagementService()
 	if err := svc.DisableToken(tokenID); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("DISABLE_ERROR", err.Error(), ""))
+		respondInternalError(c, "DISABLE_ERROR", "Unable to disable token", "user token disable", err)
 		return
 	}
 
@@ -317,7 +414,7 @@ func GetInvitedUsers(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	data, err := svc.GetInvitedUsers(userID, page, pageSize)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "invited user list query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

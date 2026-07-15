@@ -5,7 +5,8 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+#   bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
+#   NEWAPI_TOOLS_REF=main bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh) # 显式跟随开发分支
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -27,13 +28,193 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
 
-REPO_URL="https://github.com/james-6-23/new_api_tools.git"
+REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
+NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.2.0}"
+REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
+INSTALL_COMMIT=""
 REINSTALL=false
 
+validate_newapi_tools_image() {
+  local image="${1:-}"
+  [[ -n "$image" ]] || die "NEWAPI_TOOLS_IMAGE 不能为空"
+  (( ${#image} <= 512 )) || die "NEWAPI_TOOLS_IMAGE 过长"
+  [[ ! "$image" =~ [[:space:][:cntrl:]] ]] ||
+    die "NEWAPI_TOOLS_IMAGE 不能包含空白或控制字符"
+  [[ "$image" != -* ]] || die "NEWAPI_TOOLS_IMAGE 格式无效"
+}
+
+resolve_install_image() {
+  local ref="$1" commit="$2" requested_image="${3:-}"
+  [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || die "无法根据无效 Git commit 推导镜像"
+
+  local image=""
+  if [[ -n "$requested_image" ]]; then
+    image="$requested_image"
+  elif [[ "$ref" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${BASH_REMATCH[1]}"
+  elif [[ "$ref" == "main" ]]; then
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
+  else
+    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置 NEWAPI_TOOLS_IMAGE（完整 tag 或 digest）"
+  fi
+
+  validate_newapi_tools_image "$image"
+  printf '%s\n' "$image"
+}
+
+validate_install_ref() {
+  [[ "$INSTALL_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]] ||
+    die "NEWAPI_TOOLS_REF 格式无效"
+  [[ "$INSTALL_REF" != *..* && "$INSTALL_REF" != *@\{* && "$INSTALL_REF" != */ && "$INSTALL_REF" != *. ]] ||
+    die "NEWAPI_TOOLS_REF 格式无效"
+}
+
+checkout_install_ref() {
+  validate_install_ref
+  git fetch --force --prune --tags origin
+
+  local target=""
+  if [[ "$INSTALL_REF" == "main" ]]; then
+    git show-ref --verify --quiet "refs/remotes/origin/main" ||
+      die "远端 main 分支不存在"
+    target="refs/remotes/origin/main"
+  elif [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+    git show-ref --verify --quiet "refs/tags/${INSTALL_REF}"; then
+    target="refs/tags/${INSTALL_REF}"
+  elif git show-ref --verify --quiet "refs/remotes/origin/${INSTALL_REF}"; then
+    target="refs/remotes/origin/${INSTALL_REF}"
+  elif git rev-parse --verify --quiet "${INSTALL_REF}^{commit}" >/dev/null; then
+    target="$INSTALL_REF"
+  else
+    git fetch --force origin "$INSTALL_REF"
+    target="FETCH_HEAD"
+  fi
+
+  local commit
+  commit="$(git rev-parse --verify "${target}^{commit}")" ||
+    die "无法解析安装版本 ${INSTALL_REF}"
+  git reset --hard "$commit"
+  INSTALL_COMMIT="$commit"
+  NEWAPI_TOOLS_IMAGE="$(resolve_install_image "$INSTALL_REF" "$commit" "$REQUESTED_NEWAPI_TOOLS_IMAGE")"
+  export NEWAPI_TOOLS_IMAGE
+  export NEWAPI_TOOLS_SOURCE_COMMIT="$commit"
+  log_success "项目已固定到 ${INSTALL_REF} (${commit:0:12})"
+  log_success "部署镜像已固定到 ${NEWAPI_TOOLS_IMAGE}"
+}
+
+get_docker_compose_v2_version() {
+  local output
+  output="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null || true)"
+  if [[ "$output" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+
+version_at_least() {
+  local current="$1" required="$2"
+  local current_major current_minor current_patch required_major required_minor required_patch
+  IFS=. read -r current_major current_minor current_patch <<< "$current"
+  IFS=. read -r required_major required_minor required_patch <<< "$required"
+
+  (( 10#$current_major > 10#$required_major )) ||
+    (( 10#$current_major == 10#$required_major && 10#$current_minor > 10#$required_minor )) ||
+    (( 10#$current_major == 10#$required_major && 10#$current_minor == 10#$required_minor && 10#$current_patch >= 10#$required_patch ))
+}
+
+require_docker_compose_v224() {
+  local reason="${1:-当前 Compose 配置}"
+  if [[ "${DOCKER_COMPOSE:-}" != "docker compose" ]]; then
+    die "${reason} 依赖 !reset 语法，需要 Docker Compose v2.24+；检测到的是旧版 docker-compose，请安装/升级 Compose v2 插件"
+  fi
+
+  local version="${DOCKER_COMPOSE_V2_VERSION:-}"
+  [[ -n "$version" ]] || version="$(get_docker_compose_v2_version)"
+  [[ -n "$version" ]] || die "无法识别 Docker Compose v2 版本；${reason} 需要 v2.24+"
+  version_at_least "$version" "2.24.0" || die "Docker Compose v${version} 过旧；${reason} 依赖 !reset 语法，最低需要 v2.24.0"
+}
+
+env_file_value() {
+  local env_file="$1" key="$2"
+  local value
+  value="$(awk -v k="$key" 'index($0, k "=")==1 {print substr($0, length(k)+2); exit}' "$env_file" 2>/dev/null || true)"
+  value="${value%$'\r'}"
+  if [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\'/\'}"
+  elif [[ ${#value} -ge 2 && "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s\n' "$value"
+}
+
+dotenv_quote() {
+  local value="${1-}" escaped
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "环境变量值不能包含换行"
+  escaped="$(printf '%s' "$value" | sed "s/'/\\\\'/g")"
+  printf "'%s'" "$escaped"
+}
+
+legacy_image_version_to_reference() {
+  local version="${1:-}"
+  [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+    die "旧 NEWAPI_TOOLS_VERSION 格式无效；请改用完整 NEWAPI_TOOLS_IMAGE"
+  printf '%s:%s\n' "$NEWAPI_TOOLS_IMAGE_REPOSITORY" "$version"
+}
+
+# 将最终镜像引用以单一活动键幂等写入 .env，并停用旧版 tag-only 配置。
+migrate_image_env_file() {
+  local env_file="$1" selected_image="${2:-${NEWAPI_TOOLS_IMAGE:-}}"
+  [[ -f "$env_file" ]] || return 0
+
+  local current_image legacy_version
+  current_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+  legacy_version="$(env_file_value "$env_file" 'NEWAPI_TOOLS_VERSION')"
+
+  if [[ -z "$selected_image" ]]; then
+    if [[ -n "$current_image" ]]; then
+      selected_image="$current_image"
+    elif [[ -n "$legacy_version" ]]; then
+      selected_image="$(legacy_image_version_to_reference "$legacy_version")"
+    else
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.2.0"
+    fi
+  fi
+  validate_newapi_tools_image "$selected_image"
+
+  local tmp
+  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
+  awk '
+    index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
+    index($0, "NEWAPI_TOOLS_VERSION=") == 1 {
+      print "# Deprecated by install.sh: " $0
+      next
+    }
+    { print }
+  ' "$env_file" > "$tmp"
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$selected_image")" >> "$tmp"
+  chmod 600 "$tmp"
+
+  if cmp -s "$env_file" "$tmp"; then
+    rm -f "$tmp"
+    chmod 600 "$env_file"
+  else
+    mv "$tmp" "$env_file"
+    if [[ -n "$legacy_version" ]]; then
+      log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为完整 NEWAPI_TOOLS_IMAGE"
+    else
+      log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${selected_image}"
+    fi
+  fi
+
+  NEWAPI_TOOLS_IMAGE="$selected_image"
+  export NEWAPI_TOOLS_IMAGE
+}
+
 #######################################
-# 根据 .env 中的 NEWAPI_NETWORK 检测 host 模式，
-# 设置 COMPOSE_FILE 让所有后续 docker compose 调用自动叠加 host overlay。
+# 根据 .env 中的网络配置叠加 host / 日志库 overlay，
+# 设置 COMPOSE_FILE 让所有后续 docker compose 调用使用相同文件集合。
 # 在任何 $DOCKER_COMPOSE 调用前先调用本函数（通常 cd 到 project_dir 之后）。
 #######################################
 setup_compose_files() {
@@ -41,24 +222,118 @@ setup_compose_files() {
   local env_file="${project_dir}/.env"
   local base="${project_dir}/docker-compose.yml"
   local host_overlay="${project_dir}/docker-compose.host.yml"
+  local log_overlay="${project_dir}/docker-compose.logdb.yml"
 
   unset COMPOSE_FILE
 
   [[ -f "$env_file" ]] || return 0
 
+  local -a compose_files=("$base")
+
   # 必须显式存在 NEWAPI_NETWORK 行才判断；行缺失视为老版 .env，让 base compose 走默认 fallback
   # 注意：set -e + pipefail 下，grep 无匹配会让 pipe 退出码为 1 → 整个脚本死掉，必须 || true 兜底。
-  local nw_line
-  nw_line=$(grep -E '^NEWAPI_NETWORK=' "$env_file" 2>/dev/null | head -n1 || true)
-  [[ -n "$nw_line" ]] || return 0
+  if grep -qE '^NEWAPI_NETWORK=' "$env_file" 2>/dev/null; then
+    local nw
+    nw="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
 
-  local nw
-  nw=$(echo "$nw_line" | cut -d'=' -f2- | tr -d '\r\n')
-
-  # NEWAPI_NETWORK= （空值）→ deploy.sh 在 host 模式下生成的标记
-  if [[ -z "$nw" && -f "$host_overlay" ]]; then
-    export COMPOSE_FILE="${base}:${host_overlay}"
+    # NEWAPI_NETWORK= （空值）→ deploy.sh 在 host 模式下生成的标记
+    if [[ -z "$nw" ]]; then
+      [[ -f "$host_overlay" ]] ||
+        die "host 模式需要 ${host_overlay}，缺少该叠加层时无法安全移除基础 external network 配置"
+      require_docker_compose_v224 "host 网络叠加层 ${host_overlay}"
+      compose_files+=("$host_overlay")
+    fi
   fi
+
+  local log_network
+  log_network="$(env_file_value "$env_file" 'LOG_NETWORK')"
+  if [[ -n "$log_network" ]]; then
+    if [[ -f "$log_overlay" ]]; then
+      compose_files+=("$log_overlay")
+    else
+      log_warn "LOG_NETWORK=${log_network}，但未找到 ${log_overlay}；更新后将仅尝试运行时接入该网络"
+    fi
+  fi
+
+  if (( ${#compose_files[@]} > 1 )); then
+    local compose_file_value="${compose_files[0]}" i
+    for ((i = 1; i < ${#compose_files[@]}; i++)); do
+      compose_file_value+=":${compose_files[$i]}"
+    done
+    export COMPOSE_FILE="$compose_file_value"
+  fi
+}
+
+container_is_connected_to_network() {
+  local container="$1" network="$2"
+  docker network inspect "$network" -f '{{range .Containers}}{{println .Name}}{{end}}' 2>/dev/null |
+    grep -Fxq "$container"
+}
+
+ensure_container_network() {
+  local container="$1" network="$2" label="$3"
+  [[ -n "$network" ]] || return 0
+
+  if container_is_connected_to_network "$container" "$network"; then
+    return 0
+  fi
+
+  log_info "连接到${label}: $network"
+  if ! docker network connect "$network" "$container" 2>/dev/null &&
+    ! container_is_connected_to_network "$container" "$network"; then
+    log_error "无法连接到${label} '$network'，请检查网络是否存在以及 Docker 权限"
+    return 1
+  fi
+  container_is_connected_to_network "$container" "$network" || {
+    log_error "连接${label} '$network' 后验证失败"
+    return 1
+  }
+  log_success "已连接到${label}: $network"
+}
+
+# Compose down/up 会移除 docker network connect 手动附加的网络；每次重建后恢复它们。
+restore_runtime_network_connections() {
+  local project_dir="$1"
+  local env_file="${project_dir}/.env"
+  [[ -f "$env_file" ]] || return 0
+
+  local network_mode original_network newapi_network log_network
+  network_mode="$(env_file_value "$env_file" 'NEWAPI_NETWORK_MODE')"
+  original_network="$(env_file_value "$env_file" 'NEWAPI_ORIGINAL_NETWORK')"
+  newapi_network="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
+  log_network="$(env_file_value "$env_file" 'LOG_NETWORK')"
+
+  # 兼容旧版 deploy.sh：网络模式曾只写在注释里。
+  if [[ -z "$network_mode" ]]; then
+    network_mode="$(sed -n 's/^# 网络部署模式:[[:space:]]*//p' "$env_file" 2>/dev/null | head -n1 | tr -d '\r\n')"
+  fi
+
+  # 再兼容没有模式标记的默认 bridge 安装：以 NewAPI 容器实际网络模式为准。
+  if [[ -z "$network_mode" && "$newapi_network" == "newapi-tools-network" ]]; then
+    local newapi_container docker_network_mode
+    newapi_container="$(env_file_value "$env_file" 'NEWAPI_CONTAINER')"
+    [[ -n "$newapi_container" ]] || newapi_container="$(find_newapi_container || true)"
+    docker_network_mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$newapi_container" 2>/dev/null || true)"
+    case "$docker_network_mode" in
+      default|bridge)
+        network_mode="bridge"
+        original_network="${original_network:-bridge}"
+        ;;
+    esac
+  fi
+
+  case "$network_mode" in
+    bridge)
+      ensure_container_network "newapi-tools" "${original_network:-bridge}" " NewAPI 原始 bridge 网络"
+      ;;
+    host)
+      ;;
+    *)
+      ensure_container_network "newapi-tools" "$newapi_network" " NewAPI 网络"
+      ;;
+  esac
+
+  ensure_container_network "newapi-tools" "$log_network" "日志库网络"
 }
 
 #######################################
@@ -74,7 +349,7 @@ cleanup_project_docker_resources() {
     | xargs -r docker rm -f 2>/dev/null || true
 
   docker images --format '{{.Repository}}:{{.Tag}}' \
-    | grep -E '^(ghcr\.io/james-6-23/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
+    | grep -E '^(ghcr\.io/(yujianwudi|james-6-23)/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
     | xargs -r docker rmi -f 2>/dev/null || true
 
   docker network rm newapi-tools-network new_api_tools_default 2>/dev/null || true
@@ -89,13 +364,16 @@ check_requirements() {
   command -v git >/dev/null 2>&1 || missing+=("git")
   command -v docker >/dev/null 2>&1 || missing+=("docker")
 
-  # 检查 docker-compose 或 docker compose
-  if command -v docker-compose >/dev/null 2>&1; then
-    DOCKER_COMPOSE="docker-compose"
-  elif docker compose version >/dev/null 2>&1; then
+  # 优先 docker compose v2；仅在没有 v2 时兼容旧 docker-compose。
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
+    DOCKER_COMPOSE_V2_VERSION="$(get_docker_compose_v2_version)"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE="docker-compose"
+    DOCKER_COMPOSE_V2_VERSION=""
+    log_warn "未检测到 Docker Compose v2，暂用旧版 docker-compose；host 网络部署需要 v2.24+"
   else
-    missing+=("docker-compose 或 docker compose")
+    missing+=("Docker Compose v2（推荐）或旧版 docker-compose")
   fi
 
   if [[ ${#missing[@]} -gt 0 ]]; then
@@ -134,6 +412,65 @@ find_newapi_container() {
   [[ -n "$found" ]] && { echo "$found"; return 0; }
 
   return 1
+}
+
+#######################################
+# 将 NewAPI 的 Redis 状态同步到工具 .env。
+# 只有容器中明确存在空的 REDIS_CONN_STRING= 才写 true；变量缺失、
+# 容器不可读或值非空都写 false，避免直接 DB 写入绕过 NewAPI 缓存。
+#######################################
+sync_newapi_mutation_safety_config() {
+  local project_dir="$1"
+  local env_file="${project_dir}/.env"
+  [[ -f "$env_file" ]] || return 0
+
+  local container="" env_lines="" redis_entry="" redis_value="" redis_disabled=false
+  container=$(grep -E '^NEWAPI_CONTAINER=' "$env_file" 2>/dev/null | head -n1 | cut -d'=' -f2- || true)
+  [[ -z "$container" ]] && container=$(find_newapi_container || true)
+
+  if [[ -z "$container" ]]; then
+    log_warn "无法定位 NewAPI 容器，Redis 状态未知；NEWAPI_REDIS_DISABLED=false"
+    log_warn "用户、Token、分组和 IP 记录等直接写库操作将被阻止，请改用 NewAPI 管理 API"
+  elif ! env_lines="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null)"; then
+    log_warn "无法读取 NewAPI 容器环境变量，Redis 状态未知；NEWAPI_REDIS_DISABLED=false"
+    log_warn "用户、Token、分组和 IP 记录等直接写库操作将被阻止，请改用 NewAPI 管理 API"
+  else
+    redis_entry="$(printf '%s\n' "$env_lines" | awk -F= '$1=="REDIS_CONN_STRING"{print; exit}')"
+    if [[ -z "$redis_entry" ]]; then
+      log_warn "NewAPI 未显式声明 REDIS_CONN_STRING，Redis 状态未知；NEWAPI_REDIS_DISABLED=false"
+      log_warn "用户、Token、分组和 IP 记录等直接写库操作将被阻止，请改用 NewAPI 管理 API"
+    else
+      redis_value="${redis_entry#*=}"
+      if [[ -z "$redis_value" ]]; then
+        redis_disabled=true
+        log_success "NewAPI 明确配置 REDIS_CONN_STRING=（空），允许受保护的直接数据库写操作"
+      else
+        log_warn "检测到 NewAPI 已配置 Redis；NEWAPI_REDIS_DISABLED=false"
+        log_warn "为避免缓存中的权限延迟失效，相关直接写库操作将被阻止，请改用 NewAPI 管理 API"
+      fi
+    fi
+  fi
+
+  if grep -q '^NEWAPI_REDIS_DISABLED=' "$env_file" 2>/dev/null; then
+    sed -i.bak "s|^NEWAPI_REDIS_DISABLED=.*|NEWAPI_REDIS_DISABLED=${redis_disabled}|" "$env_file" && rm -f "${env_file}.bak"
+  else
+    echo "NEWAPI_REDIS_DISABLED=${redis_disabled}" >> "$env_file"
+  fi
+
+  if ! grep -q '^ALLOW_UNSAFE_HARD_DELETE=' "$env_file" 2>/dev/null; then
+    echo "ALLOW_UNSAFE_HARD_DELETE=false" >> "$env_file"
+    log_info "已加入安全默认值 ALLOW_UNSAFE_HARD_DELETE=false"
+  fi
+
+  if ! grep -q '^ALLOW_UNSAFE_BATCH_DELETE=' "$env_file" 2>/dev/null; then
+    echo "ALLOW_UNSAFE_BATCH_DELETE=false" >> "$env_file"
+    log_info "已加入安全默认值 ALLOW_UNSAFE_BATCH_DELETE=false"
+  fi
+
+  if ! grep -q '^ENFORCE_IP_RECORDING=' "$env_file" 2>/dev/null; then
+    echo "ENFORCE_IP_RECORDING=false" >> "$env_file"
+    log_info "已加入隐私安全默认值 ENFORCE_IP_RECORDING=false"
+  fi
 }
 
 #######################################
@@ -309,13 +646,13 @@ detect_env_details() {
   local env_file="${target_dir}/.env"
 
   if [[ -f "$env_file" ]]; then
-    ENV_NEWAPI_NETWORK=$(grep -E '^NEWAPI_NETWORK=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "未知")
-    ENV_DB_ENGINE=$(grep -E '^DB_ENGINE=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "未知")
-    ENV_DB_DNS=$(grep -E '^DB_DNS=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "未知")
-    ENV_DB_PORT=$(grep -E '^DB_PORT=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "未知")
-    ENV_DB_NAME=$(grep -E '^DB_NAME=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "未知")
-    ENV_FRONTEND_PORT=$(grep -E '^FRONTEND_PORT=' "$env_file" 2>/dev/null | cut -d'=' -f2 || echo "1145")
-    ENV_ADMIN_PASSWORD=$(grep -E '^ADMIN_PASSWORD=' "$env_file" 2>/dev/null | cut -d'=' -f2- || echo "")
+    ENV_NEWAPI_NETWORK="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"; ENV_NEWAPI_NETWORK="${ENV_NEWAPI_NETWORK:-未知}"
+    ENV_DB_ENGINE="$(env_file_value "$env_file" 'DB_ENGINE')"; ENV_DB_ENGINE="${ENV_DB_ENGINE:-未知}"
+    ENV_DB_DNS="$(env_file_value "$env_file" 'DB_DNS')"; ENV_DB_DNS="${ENV_DB_DNS:-未知}"
+    ENV_DB_PORT="$(env_file_value "$env_file" 'DB_PORT')"; ENV_DB_PORT="${ENV_DB_PORT:-未知}"
+    ENV_DB_NAME="$(env_file_value "$env_file" 'DB_NAME')"; ENV_DB_NAME="${ENV_DB_NAME:-未知}"
+    ENV_FRONTEND_PORT="$(env_file_value "$env_file" 'FRONTEND_PORT')"; ENV_FRONTEND_PORT="${ENV_FRONTEND_PORT:-1145}"
+    ENV_ADMIN_PASSWORD="$(env_file_value "$env_file" 'ADMIN_PASSWORD')"
     # SERVER_HOST 读取 .env 中显式声明的最后一行（处理用户多次写入的情况）；缺失视为默认 127.0.0.1
     local _sh_raw
     _sh_raw=$(grep -E '^SERVER_HOST=' "$env_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- || true)
@@ -325,7 +662,7 @@ detect_env_details() {
     local _fb_raw
     _fb_raw=$(grep -E '^FRONTEND_BIND=' "$env_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- || true)
     _fb_raw="${_fb_raw//[\"\'\ $'\r'$'\n'$'\t']/}"
-    ENV_FRONTEND_BIND="${_fb_raw:-0.0.0.0}"
+    ENV_FRONTEND_BIND="${_fb_raw:-127.0.0.1}"
   else
     ENV_NEWAPI_NETWORK="未配置"
     ENV_DB_ENGINE="未配置"
@@ -333,7 +670,7 @@ detect_env_details() {
     ENV_DB_PORT="未配置"
     ENV_DB_NAME="未配置"
     ENV_SERVER_HOST="未配置"
-    ENV_FRONTEND_BIND="未配置"
+    ENV_FRONTEND_BIND="127.0.0.1"
     ENV_FRONTEND_PORT="1145"
     ENV_ADMIN_PASSWORD=""
   fi
@@ -375,6 +712,16 @@ detect_env_details() {
   fi
 }
 
+show_frontend_access() {
+  local bind="${1:-127.0.0.1}" port="${2:-1145}" server_ip="${3:-localhost}" label="${4:-访问地址}"
+  if [[ "$bind" == "127.0.0.1" || "$bind" == "localhost" || "$bind" == "::1" ]]; then
+    echo -e "${label}: ${BLUE}http://localhost:${port}${NC} ${YELLOW}(仅服务器本机)${NC}"
+    echo -e "  远程访问: 请使用 nginx/Caddy 配置的 HTTPS 反向代理域名"
+  else
+    echo -e "${label}: ${BLUE}http://${server_ip}:${port}${NC}"
+  fi
+}
+
 #######################################
 # 显示管理菜单
 #######################################
@@ -398,7 +745,7 @@ show_management_menu() {
     echo -e "${GREEN}【环境检测】${NC}"
     echo -e "  项目目录: ${YELLOW}$target_dir${NC}"
     echo -e "  服务状态: $service_status"
-    echo -e "  访问地址: ${BLUE}http://${server_ip}:${ENV_FRONTEND_PORT}${NC}"
+    show_frontend_access "$ENV_FRONTEND_BIND" "$ENV_FRONTEND_PORT" "$server_ip" "  访问地址"
     echo ""
     echo -e "${GREEN}【登录凭证】${NC}"
     if [[ -n "$ENV_ADMIN_PASSWORD" ]]; then
@@ -565,7 +912,7 @@ do_toggle_frontend_bind_interactive() {
   local current
   current=$(grep -E '^FRONTEND_BIND=' "$env_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- || true)
   current="${current//[\"\'\ $'\r'$'\n'$'\t']/}"
-  current="${current:-0.0.0.0}"
+  current="${current:-127.0.0.1}"
 
   echo ""
   echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
@@ -575,8 +922,8 @@ do_toggle_frontend_bind_interactive() {
   echo -e "  当前: ${YELLOW}${current}:${ENV_FRONTEND_PORT}${NC}"
   echo ""
   echo -e "  ${YELLOW}1) 公网可达${NC}    FRONTEND_BIND=0.0.0.0"
-  echo -e "                  浏览器可直接 http://server-ip:${ENV_FRONTEND_PORT} 访问"
-  echo -e "                  适合内网部署 / 域名解析未就绪 / 需要快速访问的场景"
+  echo -e "                  必须置于 HTTPS 反向代理、访问控制和防火墙之后"
+  echo -e "                  不要在公网使用明文 http://server-ip:${ENV_FRONTEND_PORT}"
   echo ""
   echo -e "  ${GREEN}2) 仅本机${NC}      FRONTEND_BIND=127.0.0.1"
   echo -e "                  外部直连不通，需配宿主机 nginx 反代到 https://your-domain"
@@ -587,11 +934,18 @@ do_toggle_frontend_bind_interactive() {
   read -r -p "请选择 [0-2]: " choice
   local target=""
   case "$choice" in
-    1) target="0.0.0.0" ;;
-    2)
+    1)
       echo ""
-      log_warn "切换后将无法用 IP:${ENV_FRONTEND_PORT} 直接访问，必须先在宿主机配好 nginx 反代"
-      log_warn "示例 nginx 配置:"
+      log_warn "该操作会把 ${ENV_FRONTEND_PORT} 端口绑定到所有网卡"
+      log_warn "只有在 HTTPS 反向代理、访问控制和防火墙已经就绪时才应继续"
+      read -r -p "确认切换到公网监听? [y/N]: " confirm
+      [[ "$confirm" =~ ^[yY]$ ]] || { log_info "已取消"; return 0; }
+      target="0.0.0.0"
+      ;;
+    2)
+      target="127.0.0.1"
+      log_info "将切换为仅本机监听；请使用宿主机 HTTPS 反向代理访问"
+      log_info "示例 nginx 配置:"
       cat <<NGINX
    server {
      listen 443 ssl http2;
@@ -602,15 +956,14 @@ do_toggle_frontend_bind_interactive() {
        proxy_pass http://127.0.0.1:${ENV_FRONTEND_PORT};
        proxy_set_header Host \$host;
        proxy_set_header X-Real-IP \$remote_addr;
-       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+       # 覆盖客户端自带的 X-Forwarded-For，防止伪造限流身份。
+       proxy_set_header X-Forwarded-For \$remote_addr;
        proxy_set_header X-Forwarded-Proto \$scheme;
      }
    }
 NGINX
+      log_warn "若内层 Nginx 看到的外层代理来源不是 loopback，请把该精确 IP（/32 或 /128）追加到 TRUSTED_PROXY_CIDRS"
       echo ""
-      read -r -p "确认切换? [y/N]: " confirm
-      [[ "$confirm" =~ ^[yY]$ ]] || { log_info "已取消"; return 0; }
-      target="127.0.0.1"
       ;;
     0|"") log_info "已取消"; return 0 ;;
     *) log_warn "无效选择"; return 1 ;;
@@ -629,6 +982,7 @@ NGINX
   log_info "重启服务以应用新绑定..."
   $DOCKER_COMPOSE down 2>&1 | tail -5
   $DOCKER_COMPOSE up -d 2>&1 | tail -5
+  restore_runtime_network_connections "$project_dir"
   log_success "服务已重启"
 }
 
@@ -703,6 +1057,7 @@ do_toggle_bind_mode_interactive() {
   log_info "重启服务以应用新绑定..."
   $DOCKER_COMPOSE down 2>&1 | tail -5
   $DOCKER_COMPOSE up -d 2>&1 | tail -5
+  restore_runtime_network_connections "$project_dir"
   log_success "服务已用新绑定重启"
 }
 
@@ -715,9 +1070,8 @@ do_update_interactive() {
 
   # 更新代码
   if [[ -d ".git" ]]; then
-    log_info "更新代码..."
-    git fetch origin 2>/dev/null || true
-    git reset --hard origin/main 2>/dev/null || log_warn "代码更新跳过"
+    log_info "同步代码到固定版本 ${INSTALL_REF}..."
+    checkout_install_ref
   fi
 
   # 下载 GeoIP 数据库
@@ -727,6 +1081,9 @@ do_update_interactive() {
   # 迁移旧版 .env（补充 Go 版本所需字段）
   migrate_env_file "$project_dir"
 
+  # 按当前 NewAPI 容器 Redis 配置同步直接写库安全开关
+  sync_newapi_mutation_safety_config "$project_dir"
+
   # 安全检查：SERVER_HOST 是否绑定到不安全的 0.0.0.0
   check_server_host_security "$project_dir"
 
@@ -735,11 +1092,14 @@ do_update_interactive() {
 
   # 拉取最新镜像并重启
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE pull
+  if ! $DOCKER_COMPOSE pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
 
   log_info "重启服务..."
   $DOCKER_COMPOSE down
   $DOCKER_COMPOSE up -d
+  restore_runtime_network_connections "$project_dir"
 
   log_success "更新完成!"
   echo ""
@@ -750,8 +1110,9 @@ do_update_interactive() {
   frontend_port=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d'=' -f2 || echo "1145")
   local server_ip
   server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || server_ip="localhost"
+  detect_env_details "$project_dir"
   echo ""
-  echo -e "访问地址: ${GREEN}http://${server_ip}:${frontend_port}${NC}"
+  show_frontend_access "$ENV_FRONTEND_BIND" "$frontend_port" "$server_ip" "访问地址"
 }
 
 #######################################
@@ -776,7 +1137,8 @@ do_status_interactive() {
   frontend_port=$(grep -E '^FRONTEND_PORT=' .env 2>/dev/null | cut -d'=' -f2 || echo "1145")
   local server_ip
   server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || server_ip="localhost"
-  echo -e "访问地址: ${GREEN}http://${server_ip}:${frontend_port}${NC}"
+  detect_env_details "$project_dir"
+  show_frontend_access "$ENV_FRONTEND_BIND" "$frontend_port" "$server_ip" "访问地址"
 
   echo ""
   echo -e "${BLUE}--- 配置信息 ---${NC}"
@@ -847,7 +1209,9 @@ do_reconfigure_interactive() {
 
   # 备份旧配置
   if [[ -f ".env" ]]; then
-    cp .env ".env.backup.$(date +%Y%m%d_%H%M%S)"
+    local env_backup=".env.backup.$(date +%Y%m%d_%H%M%S)"
+    (umask 077; cp .env "$env_backup")
+    chmod 600 "$env_backup"
     log_info "已备份旧配置文件"
   fi
 
@@ -872,7 +1236,7 @@ do_purge_interactive() {
   echo ""
   echo -e "${YELLOW}将永久删除以下 newapi-tools 自身的数据：${NC}"
   echo "  • 容器: newapi-tools / newapi-tools-redis"
-  echo "  • 镜像: ghcr.io/james-6-23/new_api_tools:*"
+  echo "  • 镜像: ghcr.io/yujianwudi/new_api_tools:*"
   echo "  • Redis 缓存卷 (仪表盘 / 模型状态 / 等缓存)"
   echo "  • Docker 网络: newapi-tools-network (若存在)"
   echo "  • 配置文件 .env (含登录密码)"
@@ -1032,16 +1396,15 @@ clone_or_update_project() {
   local target_dir="${INSTALL_DIR}/${PROJECT_NAME}"
 
   if [[ -d "$target_dir" ]]; then
-    log_info "项目已存在，正在更新..."
+    log_info "项目已存在，正在同步到 ${INSTALL_REF}..."
     cd "$target_dir"
-    git fetch origin
-    git reset --hard origin/main
-    log_success "项目已更新到最新版本"
+    checkout_install_ref
   else
     log_info "正在克隆项目到: $target_dir"
-    git clone "$REPO_URL" "$target_dir"
+    git clone --no-checkout "$REPO_URL" "$target_dir"
     log_success "项目克隆完成"
     cd "$target_dir"
+    checkout_install_ref
   fi
 
   PROJECT_DIR="$target_dir"
@@ -1121,15 +1484,18 @@ migrate_env_file() {
 
   local migrated=false
 
+  # 镜像与当前安装 ref/显式覆盖保持一致；旧 tag-only 键只用于一次性迁移。
+  migrate_image_env_file "$env_file" "${NEWAPI_TOOLS_IMAGE:-}"
+
   # 补充 SQL_DSN（从分离字段构建）
   if ! grep -q '^SQL_DSN=' "$env_file" 2>/dev/null; then
     local db_engine db_dns db_port db_user db_password db_name sql_dsn=""
-    db_engine=$(grep -E '^DB_ENGINE=' "$env_file" | cut -d'=' -f2)
-    db_dns=$(grep -E '^DB_DNS=' "$env_file" | cut -d'=' -f2)
-    db_port=$(grep -E '^DB_PORT=' "$env_file" | cut -d'=' -f2)
-    db_user=$(grep -E '^DB_USER=' "$env_file" | cut -d'=' -f2)
-    db_password=$(grep -E '^DB_PASSWORD=' "$env_file" | cut -d'=' -f2)
-    db_name=$(grep -E '^DB_NAME=' "$env_file" | cut -d'=' -f2)
+    db_engine="$(env_file_value "$env_file" 'DB_ENGINE')"
+    db_dns="$(env_file_value "$env_file" 'DB_DNS')"
+    db_port="$(env_file_value "$env_file" 'DB_PORT')"
+    db_user="$(env_file_value "$env_file" 'DB_USER')"
+    db_password="$(env_file_value "$env_file" 'DB_PASSWORD')"
+    db_name="$(env_file_value "$env_file" 'DB_NAME')"
 
     if [[ -n "$db_dns" ]]; then
       if [[ "$db_engine" == "postgres" || "$db_engine" == "postgresql" ]]; then
@@ -1139,9 +1505,7 @@ migrate_env_file() {
       fi
     fi
 
-    # 在数据库配置段后插入 SQL_DSN
-    sed -i "/^DB_ENGINE=/i SQL_DSN=${sql_dsn}" "$env_file" 2>/dev/null || \
-      echo "SQL_DSN=${sql_dsn}" >> "$env_file"
+    echo "SQL_DSN=$(dotenv_quote "$sql_dsn")" >> "$env_file"
     migrated=true
     log_info "已补充 SQL_DSN 配置"
   fi
@@ -1160,9 +1524,20 @@ migrate_env_file() {
 
   # 补充 REDIS_PASSWORD（避免 compose WARN）
   if ! grep -q '^REDIS_PASSWORD=' "$env_file" 2>/dev/null; then
-    echo "REDIS_PASSWORD=" >> "$env_file"
+    echo "REDIS_PASSWORD=''" >> "$env_file"
     migrated=true
   fi
+
+  # 合并镜像的内层 Nginx 通过 loopback 访问 Go；只有精确信任的
+  # 直接对端才允许后端解析 X-Forwarded-For。
+  if ! grep -q '^TRUSTED_PROXY_CIDRS=' "$env_file" 2>/dev/null; then
+    echo "TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128" >> "$env_file"
+    migrated=true
+  fi
+
+  # .env contains database credentials and signing secrets. Older installs may
+  # have inherited a permissive umask, so every migration repairs the mode.
+  chmod 600 "$env_file"
 
   if [[ "$migrated" == "true" ]]; then
     log_success "已自动补充 Go 版本所需的配置字段"
@@ -1180,7 +1555,7 @@ check_server_host_security() {
 
   local host_line
   # set -e + pipefail 下，grep 无匹配会让 pipe 退出码为 1 → 必须 || true 兜底，否则脚本静默退出。
-  host_line=$(grep -E '^SERVER_HOST=' "$env_file" 2>/dev/null | head -n1 || true)
+  host_line=$(grep -E '^SERVER_HOST=' "$env_file" 2>/dev/null | tail -n1 || true)
   [[ -z "$host_line" ]] && return 0
 
   local host_value
@@ -1232,6 +1607,9 @@ quick_update() {
   # 迁移旧版 .env（补充 Go 版本所需字段）
   migrate_env_file "$PROJECT_DIR"
 
+  # 按当前 NewAPI 容器 Redis 配置同步直接写库安全开关
+  sync_newapi_mutation_safety_config "$PROJECT_DIR"
+
   # 安全检查：SERVER_HOST 是否绑定到不安全的 0.0.0.0
   check_server_host_security "$PROJECT_DIR"
 
@@ -1247,19 +1625,15 @@ quick_update() {
 
   # 拉取最新镜像
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${compose_args[@]}" pull
+  if ! $DOCKER_COMPOSE "${compose_args[@]}" pull newapi-tools; then
+    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  fi
 
   log_info "重启服务..."
   $DOCKER_COMPOSE "${compose_args[@]}" down
   $DOCKER_COMPOSE "${compose_args[@]}" up -d
 
-  # 确保容器连接到 NewAPI 网络（host 模式下 NEWAPI_NETWORK 为空，跳过）
-  local newapi_network
-  newapi_network=$(grep -E '^NEWAPI_NETWORK=' "$env_file" | cut -d'=' -f2 || true)
-  if [[ -n "$newapi_network" ]]; then
-    log_info "连接到 NewAPI 网络: $newapi_network"
-    docker network connect "$newapi_network" newapi-tools 2>/dev/null || log_warn "网络已连接"
-  fi
+  restore_runtime_network_connections "$PROJECT_DIR"
 
   # 获取前端端口
   local frontend_port
@@ -1268,13 +1642,14 @@ quick_update() {
   # 获取服务器 IP
   local server_ip
   server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || server_ip="$(ip route get 1 2>/dev/null | awk '{print $7; exit}')" || server_ip="localhost"
+  detect_env_details "$PROJECT_DIR"
 
   echo ""
   echo -e "${GREEN}========================================${NC}"
   echo -e "${GREEN}  更新完成!${NC}"
   echo -e "${GREEN}========================================${NC}"
   echo ""
-  echo -e "前端访问地址: ${BLUE}http://${server_ip}:${frontend_port}${NC}"
+  show_frontend_access "$ENV_FRONTEND_BIND" "$frontend_port" "$server_ip" "前端访问地址"
   echo ""
   echo -e "查看日志: ${YELLOW}cd ${PROJECT_DIR} && docker compose logs -f${NC}"
   echo ""
@@ -1365,10 +1740,12 @@ NewAPI Middleware Tool - 安装管理脚本
   --help          显示此帮助信息
 
 环境变量:
-  PROJECT_DIR      指定项目目录（默认: 自动检测）
-  NEWAPI_CONTAINER 指定 NewAPI 容器名（默认: 自动检测）
+  PROJECT_DIR        指定项目目录（默认: 自动检测）
+  NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
+  NEWAPI_TOOLS_REF   Git 安装版本（默认: v0.2.0；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_IMAGE 完整镜像 tag/digest；自定义 ref 必须显式设置
 
-更多信息: https://github.com/james-6-23/new_api_tools
+更多信息: https://github.com/yujianwudi/new_api_tools
 EOF
 }
 
@@ -1405,4 +1782,6 @@ main() {
   run_deploy
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

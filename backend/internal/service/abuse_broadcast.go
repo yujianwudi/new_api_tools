@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/security"
 
 	_ "modernc.org/sqlite"
 )
@@ -32,11 +32,15 @@ const (
 	defaultAbuseReportRecentLogLimit = 10
 )
 
-var ErrAbuseBroadcastNotConnected = errors.New("abuse broadcast hub is not connected")
+var (
+	ErrAbuseBroadcastNotConnected   = errors.New("abuse broadcast hub is not connected")
+	ErrAbuseBroadcastReportNotFound = errors.New("abuse broadcast report not found")
+)
 
 type AbuseBroadcastService struct {
-	cfg        *config.Config
-	httpClient *http.Client
+	cfg            *config.Config
+	httpClient     *http.Client
+	validateHubURL func(context.Context, string) error
 }
 
 type AbuseBroadcastStatus struct {
@@ -183,15 +187,31 @@ type abuseSettings struct {
 	UpdatedAt           int64
 }
 
+const (
+	DefaultAbuseBroadcastPullIntervalSeconds = 300
+	MinAbuseBroadcastPullIntervalSeconds     = 30
+	MaxAbuseBroadcastPullIntervalSeconds     = 86400
+)
+
+func normalizeAbuseBroadcastPullInterval(seconds int) int {
+	if seconds <= 0 {
+		return DefaultAbuseBroadcastPullIntervalSeconds
+	}
+	if seconds < MinAbuseBroadcastPullIntervalSeconds {
+		return MinAbuseBroadcastPullIntervalSeconds
+	}
+	if seconds > MaxAbuseBroadcastPullIntervalSeconds {
+		return MaxAbuseBroadcastPullIntervalSeconds
+	}
+	return seconds
+}
+
 func (s abuseSettings) configured() bool {
 	return s.HubURL != "" && s.NodeID != "" && s.Secret != ""
 }
 
 func (s abuseSettings) interval() int {
-	if s.PullIntervalSeconds <= 0 {
-		return 300
-	}
-	return s.PullIntervalSeconds
+	return normalizeAbuseBroadcastPullInterval(s.PullIntervalSeconds)
 }
 
 type hubEnvelope struct {
@@ -243,10 +263,9 @@ type hubCreateReportRequest struct {
 
 func NewAbuseBroadcastService() *AbuseBroadcastService {
 	return &AbuseBroadcastService{
-		cfg: config.Get(),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		cfg:            config.Get(),
+		httpClient:     security.NewHTTPSClient(30 * time.Second),
+		validateHubURL: security.ValidateHTTPSURL,
 	}
 }
 
@@ -331,7 +350,13 @@ func (s *AbuseBroadcastService) UpdateSettings(ctx context.Context, input AbuseB
 		settings.Enabled = *input.Enabled
 	}
 	if input.HubURL != nil {
-		settings.HubURL = strings.TrimRight(strings.TrimSpace(*input.HubURL), "/")
+		hubURL := strings.TrimRight(strings.TrimSpace(*input.HubURL), "/")
+		if hubURL != "" {
+			if err := s.validateHubURL(ctx, hubURL); err != nil {
+				return AbuseBroadcastSettings{}, fmt.Errorf("unsafe Hub URL: %w", err)
+			}
+		}
+		settings.HubURL = hubURL
 	}
 	if input.NodeID != nil {
 		settings.NodeID = strings.TrimSpace(*input.NodeID)
@@ -342,7 +367,13 @@ func (s *AbuseBroadcastService) UpdateSettings(ctx context.Context, input AbuseB
 	if input.PullIntervalSeconds != nil {
 		val := *input.PullIntervalSeconds
 		if val <= 0 {
-			val = 300
+			val = DefaultAbuseBroadcastPullIntervalSeconds
+		} else if val < MinAbuseBroadcastPullIntervalSeconds || val > MaxAbuseBroadcastPullIntervalSeconds {
+			return AbuseBroadcastSettings{}, fmt.Errorf(
+				"拉取间隔必须在 %d 到 %d 秒之间",
+				MinAbuseBroadcastPullIntervalSeconds,
+				MaxAbuseBroadcastPullIntervalSeconds,
+			)
 		}
 		settings.PullIntervalSeconds = val
 	}
@@ -403,7 +434,7 @@ func (s *AbuseBroadcastService) connect(ctx context.Context, settings abuseSetti
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	body, err := security.ReadLimitedBody(resp.Body, 2<<20)
 	if err != nil {
 		return result, err
 	}
@@ -736,7 +767,7 @@ func (s *AbuseBroadcastService) MatchReport(ctx context.Context, reportID string
 		return AbuseBroadcastMatchResult{}, err
 	}
 	if exists == 0 {
-		return AbuseBroadcastMatchResult{}, fmt.Errorf("report not found")
+		return AbuseBroadcastMatchResult{}, fmt.Errorf("%w: report_id=%q", ErrAbuseBroadcastReportNotFound, reportID)
 	}
 	identities, err := listAbuseIdentities(ctx, db, reportID)
 	if err != nil {
@@ -784,7 +815,7 @@ func (s *AbuseBroadcastService) submitReport(ctx context.Context, settings abuse
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	raw, err := security.ReadLimitedBody(resp.Body, 8<<20)
 	if err != nil {
 		return hubReportPayload{}, "", err
 	}
@@ -1003,7 +1034,7 @@ func (s *AbuseBroadcastService) fetchEvents(ctx context.Context, settings abuseS
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := security.ReadLimitedBody(resp.Body, 8<<20)
 	if err != nil {
 		return hubPullResponse{}, err
 	}
@@ -1644,16 +1675,14 @@ func loadAbuseSettings(ctx context.Context, db *sql.DB) (abuseSettings, error) {
 		&settings.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
-		return abuseSettings{PullIntervalSeconds: 300}, nil
+		return abuseSettings{PullIntervalSeconds: DefaultAbuseBroadcastPullIntervalSeconds}, nil
 	}
 	if err != nil {
 		return abuseSettings{}, err
 	}
 	settings.Enabled = enabled == 1
 	settings.HubURL = strings.TrimRight(settings.HubURL, "/")
-	if settings.PullIntervalSeconds <= 0 {
-		settings.PullIntervalSeconds = 300
-	}
+	settings.PullIntervalSeconds = normalizeAbuseBroadcastPullInterval(settings.PullIntervalSeconds)
 	return settings, nil
 }
 

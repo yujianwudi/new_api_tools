@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -28,6 +29,58 @@ var mgr *Manager
 // configured, otherwise aliases the main manager (mgr). Queries against the
 // `logs` table go through GetLog(); everything else uses Get().
 var logMgr *Manager
+
+// Log source modes make it explicit whether log reads are using the main
+// database, a dedicated LOG_SQL_DSN connection, or a degraded fallback.  The
+// fallback remains available for non-destructive dashboards, but callers that
+// make destructive decisions must reject it.
+const (
+	LogSourceModeUnknown   = "unknown"
+	LogSourceModeMain      = "main"
+	LogSourceModeDedicated = "dedicated"
+	LogSourceModeFallback  = "fallback"
+)
+
+// LogSourceStatus describes the currently selected source for `logs` reads.
+// Healthy only means the configured source connected successfully; callers
+// that depend on current data must additionally validate query freshness.
+type LogSourceStatus struct {
+	Mode          string    `json:"mode"`
+	Configured    bool      `json:"configured"`
+	Healthy       bool      `json:"healthy"`
+	UsingFallback bool      `json:"using_fallback"`
+	LastError     string    `json:"last_error,omitempty"`
+	CheckedAt     time.Time `json:"checked_at"`
+}
+
+// SafeForDestructiveReads reports whether logs come from the intended source.
+// A configured-but-unavailable dedicated database is deliberately unsafe even
+// though read-only features may still fall back to the main database.
+func (s LogSourceStatus) SafeForDestructiveReads() bool {
+	return s.Healthy && !s.UsingFallback && s.Mode != LogSourceModeUnknown
+}
+
+var (
+	logSourceMu     sync.RWMutex
+	logSourceStatus = LogSourceStatus{Mode: LogSourceModeUnknown}
+)
+
+func setLogSourceStatus(status LogSourceStatus) {
+	if status.CheckedAt.IsZero() {
+		status.CheckedAt = time.Now()
+	}
+	logSourceMu.Lock()
+	logSourceStatus = status
+	logSourceMu.Unlock()
+}
+
+// GetLogSourceStatus returns a snapshot of the log-source health and fallback
+// state. It is safe to expose through a health endpoint without exposing DSNs.
+func GetLogSourceStatus() LogSourceStatus {
+	logSourceMu.RLock()
+	defer logSourceMu.RUnlock()
+	return logSourceStatus
+}
 
 // Init creates and configures the database connection pool
 func Init(cfg *config.Config) (*Manager, error) {
@@ -86,6 +139,11 @@ func Init(cfg *config.Config) (*Manager, error) {
 func initLogDB(cfg *config.Config, maxOpen, maxIdle int) error {
 	if !cfg.HasSeparateLogDB() {
 		logMgr = mgr
+		setLogSourceStatus(LogSourceStatus{
+			Mode:       LogSourceModeMain,
+			Configured: strings.TrimSpace(cfg.LogSQLDSN) != "",
+			Healthy:    true,
+		})
 		return nil
 	}
 
@@ -99,6 +157,13 @@ func initLogDB(cfg *config.Config, maxOpen, maxIdle int) error {
 		// 并告警提示用户修复网络/DSN（通常重跑 setup-log-db.sh 即可）。
 		logger.L.Warn(fmt.Sprintf("日志库连接失败，已降级为读取主库（日志/流量可能为空）: %v", err), logger.CatSystem)
 		logMgr = mgr
+		setLogSourceStatus(LogSourceStatus{
+			Mode:          LogSourceModeFallback,
+			Configured:    true,
+			Healthy:       false,
+			UsingFallback: true,
+			LastError:     err.Error(),
+		})
 		return nil
 	}
 
@@ -114,6 +179,11 @@ func initLogDB(cfg *config.Config, maxOpen, maxIdle int) error {
 		Config: cfg,
 		IsPG:   isPG,
 	}
+	setLogSourceStatus(LogSourceStatus{
+		Mode:       LogSourceModeDedicated,
+		Configured: true,
+		Healthy:    true,
+	})
 
 	engineStr := "MySQL"
 	if isPG {
@@ -148,6 +218,17 @@ func GetLog() *Manager {
 func SetForTesting(m *Manager) {
 	mgr = m
 	logMgr = m
+	setLogSourceStatus(LogSourceStatus{
+		Mode:    LogSourceModeMain,
+		Healthy: m != nil && m.DB != nil,
+	})
+}
+
+// SetLogForTesting overrides the log manager and its status independently.
+// It exists so tests can exercise dedicated and degraded log-source behavior.
+func SetLogForTesting(m *Manager, status LogSourceStatus) {
+	logMgr = m
+	setLogSourceStatus(status)
 }
 
 // Close closes the database connection(s)
@@ -158,8 +239,15 @@ func Close() error {
 	}
 	if mgr != nil && mgr.DB != nil {
 		logger.L.DBDisconnected("正常关闭")
-		return mgr.DB.Close()
+		err := mgr.DB.Close()
+		mgr = nil
+		logMgr = nil
+		setLogSourceStatus(LogSourceStatus{Mode: LogSourceModeUnknown})
+		return err
 	}
+	mgr = nil
+	logMgr = nil
+	setLogSourceStatus(LogSourceStatus{Mode: LogSourceModeUnknown})
 	return nil
 }
 
@@ -172,7 +260,11 @@ func (m *Manager) Ping() error {
 func (m *Manager) QueryWithTimeout(timeout time.Duration, query string, args ...interface{}) ([]map[string]interface{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return m.QueryContext(ctx, query, args...)
+}
 
+// QueryContext executes a row query using the caller's cancellation deadline.
+func (m *Manager) QueryContext(ctx context.Context, query string, args ...interface{}) ([]map[string]interface{}, error) {
 	rows, err := m.DB.QueryxContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -297,7 +389,7 @@ func (m *Manager) TableExists(tableName string) (bool, error) {
 		query = `SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1`
 	}
 
-	row, err := m.QueryOne(query, tableName)
+	row, err := m.QueryOneWithTimeout(5*time.Second, query, tableName)
 	if err != nil {
 		return false, err
 	}

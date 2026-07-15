@@ -23,7 +23,7 @@ interface RedemptionCode {
   used_user_id: number
   used_username: string
   expired_time: number
-  status: 'unused' | 'used' | 'expired'
+  status: 'unused' | 'disabled' | 'used' | 'expired'
 }
 
 interface RedemptionStatistics {
@@ -31,10 +31,12 @@ interface RedemptionStatistics {
   unused_count: number
   used_count: number
   expired_count: number
+  disabled_count: number
   total_quota: number
   unused_quota: number
   used_quota: number
   expired_quota: number
+  disabled_quota: number
 }
 
 interface PaginatedResponse {
@@ -45,7 +47,19 @@ interface PaginatedResponse {
   total_pages: number
 }
 
-type StatusFilter = '' | 'unused' | 'used' | 'expired'
+type StatusFilter = '' | RedemptionCode['status']
+
+const redemptionStatusMeta = {
+  unused: { label: '未使用', variant: 'success' },
+  disabled: { label: '已禁用', variant: 'warning' },
+  used: { label: '已使用', variant: 'secondary' },
+  expired: { label: '已过期', variant: 'destructive' },
+} as const
+
+function RedemptionStatusBadge({ status }: { status: RedemptionCode['status'] }) {
+  const meta = redemptionStatusMeta[status]
+  return <Badge variant={meta.variant}>{meta.label}</Badge>
+}
 
 export function Redemptions() {
   const { showToast } = useToast()
@@ -215,7 +229,7 @@ export function Redemptions() {
       </div>
 
       {/* Statistics Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard 
           title="未使用" 
           value={statsLoading ? '-' : `${statistics?.unused_count || 0} 个`}
@@ -224,6 +238,15 @@ export function Redemptions() {
           color="green" 
           className="border-l-4 border-l-green-500"
           onClick={() => setStatusFilter('unused')}
+        />
+        <StatCard
+          title="已禁用"
+          value={statsLoading ? '-' : `${statistics?.disabled_count || 0} 个`}
+          subValue={statsLoading ? '-' : `${formatQuota(statistics?.disabled_quota || 0)}`}
+          icon={AlertCircle}
+          color="orange"
+          className="border-l-4 border-l-orange-500"
+          onClick={() => setStatusFilter('disabled')}
         />
         <StatCard 
           title="已使用" 
@@ -289,6 +312,7 @@ export function Redemptions() {
                 <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)} className="pl-9">
                   <option value="">全部状态</option>
                   <option value="unused">未使用</option>
+                  <option value="disabled">已禁用</option>
                   <option value="used">已使用</option>
                   <option value="expired">已过期</option>
                 </Select>
@@ -352,9 +376,7 @@ export function Redemptions() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between gap-2">
                           <span className="font-medium text-sm truncate">{code.name || '未命名'}</span>
-                          <Badge variant={code.status === 'unused' ? 'success' : code.status === 'used' ? 'secondary' : 'destructive'}>
-                            {code.status === 'unused' ? '未使用' : code.status === 'used' ? '已使用' : '已过期'}
-                          </Badge>
+                          <RedemptionStatusBadge status={code.status} />
                         </div>
                         <div className="mt-1 flex items-center gap-2">
                           <code className="text-[11px] font-mono bg-muted px-1.5 py-0.5 rounded truncate flex-1">{code.key}</code>
@@ -454,9 +476,7 @@ export function Redemptions() {
                       <TableCell className="font-medium text-sm">{code.name}</TableCell>
                       <TableCell className="font-medium text-green-600">{formatQuota(code.quota)}</TableCell>
                       <TableCell>
-                        <Badge variant={code.status === 'unused' ? 'success' : code.status === 'used' ? 'secondary' : 'destructive'}>
-                          {code.status === 'unused' ? '未使用' : code.status === 'used' ? '已使用' : '已过期'}
-                        </Badge>
+                        <RedemptionStatusBadge status={code.status} />
                       </TableCell>
                       <TableCell>
                         {code.used_user_id > 0 ? (

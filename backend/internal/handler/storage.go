@@ -71,13 +71,13 @@ func SetConfig(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
 		return
 	}
 
 	cm := cache.Get()
 	if err := cm.HashSet("app:config", req.Key, req.Value); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("STORAGE_ERROR", "Failed to save config", err.Error()))
+		respondInternalError(c, "STORAGE_ERROR", "Failed to save config", "storage configuration save", err)
 		return
 	}
 
