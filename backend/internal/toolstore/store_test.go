@@ -633,6 +633,129 @@ func TestOperationAuditAppendOnlyIdempotencyAndCursor(t *testing.T) {
 	}
 }
 
+func TestCreatedAtOrderedListsUseTupleCursorWithoutChangingDefaultIDOrder(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	base := testNow.Truncate(time.Millisecond)
+	createdTimes := []time.Time{base.Add(3 * time.Second), base.Add(time.Second), base.Add(2 * time.Second), base.Add(2 * time.Second)}
+	for index, createdAt := range createdTimes {
+		current := createdAt
+		store.now = func() time.Time { return current }
+		sequence := index + 1
+		if _, err := store.AppendOperationAudit(ctx, OperationAuditInput{
+			RequestID: fmt.Sprintf("tuple-audit-%d", sequence), Actor: "admin", SourceIP: "127.0.0.1", AuthMethod: "jwt",
+			Action: "user.review", TargetType: "user", TargetID: "42", Status: OperationSucceeded,
+			IdempotencyKey: fmt.Sprintf("tuple-audit-key-%d", sequence),
+		}); err != nil {
+			t.Fatalf("append tuple audit %d: %v", sequence, err)
+		}
+		if _, err := store.CreateRiskCase(ctx, RiskCaseInput{
+			CaseKey: fmt.Sprintf("tuple-risk-%d", sequence), Title: "Tuple risk", SubjectType: "user", SubjectID: "42",
+			Severity: RiskSeverityHigh, Status: RiskCaseOpen,
+		}); err != nil {
+			t.Fatalf("create tuple risk %d: %v", sequence, err)
+		}
+		if _, err := store.CreateSupportNote(ctx, SupportNoteInput{
+			SubjectType: "user", SubjectID: "42", Author: "support", Body: fmt.Sprintf("Tuple note %d", sequence),
+			Visibility: NoteInternal, IdempotencyKey: fmt.Sprintf("tuple-note-key-%d", sequence),
+		}); err != nil {
+			t.Fatalf("create tuple note %d: %v", sequence, err)
+		}
+	}
+
+	assertIDs := func(name string, got, want []int64) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s ids = %v, want %v", name, got, want)
+		}
+		for index := range want {
+			if got[index] != want[index] {
+				t.Fatalf("%s ids = %v, want %v", name, got, want)
+			}
+		}
+	}
+	defaultWant := []int64{4, 3, 2, 1}
+	tupleWant := []int64{1, 4, 3, 2}
+
+	auditDefault, err := store.ListOperationAudits(ctx, OperationAuditFilter{TargetType: "user", TargetID: "42", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditDefaultIDs := make([]int64, len(auditDefault.Items))
+	for index, item := range auditDefault.Items {
+		auditDefaultIDs[index] = item.ID
+	}
+	assertIDs("default operation audit", auditDefaultIDs, defaultWant)
+	auditTupleIDs := make([]int64, 0, len(tupleWant))
+	var auditBefore time.Time
+	var auditBeforeID int64
+	for len(auditTupleIDs) < len(tupleWant) {
+		page, err := store.ListOperationAudits(ctx, OperationAuditFilter{
+			TargetType: "user", TargetID: "42", BeforeCreatedAt: auditBefore, BeforeID: auditBeforeID,
+			OrderByCreatedAt: true, Limit: 1,
+		})
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("created_at operation audit page = %+v, error=%v", page, err)
+		}
+		item := page.Items[0]
+		auditTupleIDs = append(auditTupleIDs, item.ID)
+		auditBefore, auditBeforeID = item.CreatedAt, item.ID
+	}
+	assertIDs("created_at operation audit", auditTupleIDs, tupleWant)
+
+	riskDefault, err := store.ListRiskCases(ctx, RiskCaseFilter{SubjectType: "user", SubjectID: "42", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	riskDefaultIDs := make([]int64, len(riskDefault.Items))
+	for index, item := range riskDefault.Items {
+		riskDefaultIDs[index] = item.ID
+	}
+	assertIDs("default risk case", riskDefaultIDs, defaultWant)
+	riskTupleIDs := make([]int64, 0, len(tupleWant))
+	var riskBefore time.Time
+	var riskBeforeID int64
+	for len(riskTupleIDs) < len(tupleWant) {
+		page, err := store.ListRiskCases(ctx, RiskCaseFilter{
+			SubjectType: "user", SubjectID: "42", BeforeCreatedAt: riskBefore, BeforeID: riskBeforeID,
+			OrderByCreatedAt: true, Limit: 1,
+		})
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("created_at risk case page = %+v, error=%v", page, err)
+		}
+		item := page.Items[0]
+		riskTupleIDs = append(riskTupleIDs, item.ID)
+		riskBefore, riskBeforeID = item.CreatedAt, item.ID
+	}
+	assertIDs("created_at risk case", riskTupleIDs, tupleWant)
+
+	noteDefault, err := store.ListSupportNotes(ctx, SupportNoteFilter{SubjectType: "user", SubjectID: "42", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteDefaultIDs := make([]int64, len(noteDefault.Items))
+	for index, item := range noteDefault.Items {
+		noteDefaultIDs[index] = item.ID
+	}
+	assertIDs("default support note", noteDefaultIDs, defaultWant)
+	noteTupleIDs := make([]int64, 0, len(tupleWant))
+	var noteBefore time.Time
+	var noteBeforeID int64
+	for len(noteTupleIDs) < len(tupleWant) {
+		page, err := store.ListSupportNotes(ctx, SupportNoteFilter{
+			SubjectType: "user", SubjectID: "42", BeforeCreatedAt: noteBefore, BeforeID: noteBeforeID,
+			OrderByCreatedAt: true, Limit: 1,
+		})
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("created_at support note page = %+v, error=%v", page, err)
+		}
+		item := page.Items[0]
+		noteTupleIDs = append(noteTupleIDs, item.ID)
+		noteBefore, noteBeforeID = item.CreatedAt, item.ID
+	}
+	assertIDs("created_at support note", noteTupleIDs, tupleWant)
+}
+
 func TestOperationAuditClaimReportsSingleOwner(t *testing.T) {
 	store, path := newTestStore(t)
 	secondStore, err := Init(path)

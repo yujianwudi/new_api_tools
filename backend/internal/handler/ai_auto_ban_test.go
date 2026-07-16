@@ -39,7 +39,7 @@ func TestAIPlaceholderOperationsReturnNotImplemented(t *testing.T) {
 		code    string
 		handler gin.HandlerFunc
 	}{
-		{name: "manual assessment", method: http.MethodPost, path: "/api/ai-ban/assess", body: `{"user_id":1,"window":"1h"}`, code: "NOT_IMPLEMENTED", handler: ManualAssess},
+		{name: "manual assessment", method: http.MethodPost, path: "/api/ai-ban/assess", body: `{`, code: "NOT_IMPLEMENTED", handler: ManualAssess},
 		{name: "risk scan", method: http.MethodPost, path: "/api/ai-ban/scan?window=1h", code: "NOT_IMPLEMENTED", handler: RunAIBanScan},
 		{name: "connection test", method: http.MethodPost, path: "/api/ai-ban/test-connection", code: "NOT_IMPLEMENTED", handler: TestAIConnection},
 		{name: "model discovery", method: http.MethodPost, path: "/api/ai-ban/models", body: `{"api_key":"secret"}`, code: "AUDITED_EXTERNAL_CALL_REQUIRED", handler: FetchAIModels},

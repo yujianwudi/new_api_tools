@@ -51,14 +51,16 @@ type OperationAuditInput struct {
 }
 
 type OperationAuditFilter struct {
-	RequestID  string
-	Actor      string
-	Action     string
-	TargetType string
-	TargetID   string
-	Status     OperationStatus
-	BeforeID   int64
-	Limit      int
+	RequestID        string
+	Actor            string
+	Action           string
+	TargetType       string
+	TargetID         string
+	Status           OperationStatus
+	BeforeCreatedAt  time.Time
+	BeforeID         int64
+	OrderByCreatedAt bool
+	Limit            int
 }
 
 type OperationAuditPage struct {
@@ -125,13 +127,15 @@ type RiskCaseUpdate struct {
 }
 
 type RiskCaseFilter struct {
-	SubjectType string
-	SubjectID   string
-	Severity    RiskSeverity
-	Status      RiskCaseStatus
-	Assignee    string
-	BeforeID    int64
-	Limit       int
+	SubjectType      string
+	SubjectID        string
+	Severity         RiskSeverity
+	Status           RiskCaseStatus
+	Assignee         string
+	BeforeCreatedAt  time.Time
+	BeforeID         int64
+	OrderByCreatedAt bool
+	Limit            int
 }
 
 type RiskCasePage struct {
@@ -209,13 +213,15 @@ type SupportNoteUpdate struct {
 }
 
 type SupportNoteFilter struct {
-	SubjectType    string
-	SubjectID      string
-	Author         string
-	Visibility     NoteVisibility
-	IncludeDeleted bool
-	BeforeID       int64
-	Limit          int
+	SubjectType      string
+	SubjectID        string
+	Author           string
+	Visibility       NoteVisibility
+	IncludeDeleted   bool
+	BeforeCreatedAt  time.Time
+	BeforeID         int64
+	OrderByCreatedAt bool
+	Limit            int
 }
 
 type SupportNotePage struct {

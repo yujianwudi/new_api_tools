@@ -24,7 +24,7 @@ const (
 	ControlPlaneTimelineDefaultLimit = 50
 	ControlPlaneTimelineMaxLimit     = 100
 
-	controlPlaneTimelineCursorVersion = 1
+	controlPlaneTimelineCursorVersion = 2
 
 	timelineSourceLogs uint32 = 1 << iota
 	timelineSourceTopUps
@@ -127,15 +127,18 @@ type controlPlaneTimelineSourceResult struct {
 }
 
 type controlPlaneTimelineCursor struct {
-	Version       int    `json:"v"`
-	Disabled      uint32 `json:"disabled,omitempty"`
-	LogTime       int64  `json:"log_time,omitempty"`
-	LogID         int64  `json:"log_id,omitempty"`
-	TopUpTime     int64  `json:"topup_time,omitempty"`
-	TopUpID       int64  `json:"topup_id,omitempty"`
-	AuditBeforeID int64  `json:"audit_before_id,omitempty"`
-	RiskBeforeID  int64  `json:"risk_before_id,omitempty"`
-	NoteBeforeID  int64  `json:"note_before_id,omitempty"`
+	Version   int    `json:"v"`
+	Disabled  uint32 `json:"disabled,omitempty"`
+	LogTime   int64  `json:"log_time,omitempty"`
+	LogID     int64  `json:"log_id,omitempty"`
+	TopUpTime int64  `json:"topup_time,omitempty"`
+	TopUpID   int64  `json:"topup_id,omitempty"`
+	AuditTime int64  `json:"audit_time,omitempty"`
+	AuditID   int64  `json:"audit_id,omitempty"`
+	RiskTime  int64  `json:"risk_time,omitempty"`
+	RiskID    int64  `json:"risk_id,omitempty"`
+	NoteTime  int64  `json:"note_time,omitempty"`
+	NoteID    int64  `json:"note_id,omitempty"`
 }
 
 func NewControlPlaneSearchService(store *toolstore.Store) *ControlPlaneSearchService {
@@ -325,11 +328,14 @@ func (s *ControlPlaneSearchService) UserTimeline(
 			nextState.TopUpTime = event.sourceTime
 			nextState.TopUpID = event.sourceID
 		case timelineSourceAudits:
-			nextState.AuditBeforeID = event.sourceID
+			nextState.AuditTime = event.sourceTime
+			nextState.AuditID = event.sourceID
 		case timelineSourceRiskCases:
-			nextState.RiskBeforeID = event.sourceID
+			nextState.RiskTime = event.sourceTime
+			nextState.RiskID = event.sourceID
 		case timelineSourceSupportNotes:
-			nextState.NoteBeforeID = event.sourceID
+			nextState.NoteTime = event.sourceTime
+			nextState.NoteID = event.sourceID
 		}
 	}
 
@@ -672,7 +678,8 @@ func (s *ControlPlaneSearchService) timelineOperationAudits(
 	}
 	page, err := s.store.ListOperationAudits(ctx, toolstore.OperationAuditFilter{
 		TargetType: "user", TargetID: strconv.FormatInt(userID, 10),
-		BeforeID: cursor.AuditBeforeID, Limit: limit,
+		BeforeCreatedAt: controlPlaneTimelineCursorTime(cursor.AuditTime), BeforeID: cursor.AuditID,
+		OrderByCreatedAt: true, Limit: limit,
 	})
 	if err != nil {
 		result.err = err
@@ -691,7 +698,7 @@ func (s *ControlPlaneSearchService) timelineOperationAudits(
 				"target_type": item.TargetType, "target_id": item.TargetID,
 				"status": item.Status, "error_code": item.ErrorCode, "occurred_at": item.OccurredAt.UnixMilli(),
 			},
-			sourceBit: timelineSourceAudits, sourceRank: 2, sourceID: item.ID,
+			sourceBit: timelineSourceAudits, sourceRank: 2, sourceID: item.ID, sourceTime: item.CreatedAt.UnixMilli(),
 		})
 	}
 	result.status.Available = true
@@ -719,7 +726,8 @@ func (s *ControlPlaneSearchService) timelineRiskCases(
 	}
 	page, err := s.store.ListRiskCases(ctx, toolstore.RiskCaseFilter{
 		SubjectType: "user", SubjectID: strconv.FormatInt(userID, 10),
-		BeforeID: cursor.RiskBeforeID, Limit: limit,
+		BeforeCreatedAt: controlPlaneTimelineCursorTime(cursor.RiskTime), BeforeID: cursor.RiskID,
+		OrderByCreatedAt: true, Limit: limit,
 	})
 	if err != nil {
 		result.err = err
@@ -736,7 +744,7 @@ func (s *ControlPlaneSearchService) timelineRiskCases(
 			Details: map[string]interface{}{
 				"case_key": item.CaseKey, "opened_at": item.OpenedAt.UnixMilli(),
 			},
-			sourceBit: timelineSourceRiskCases, sourceRank: 3, sourceID: item.ID,
+			sourceBit: timelineSourceRiskCases, sourceRank: 3, sourceID: item.ID, sourceTime: item.CreatedAt.UnixMilli(),
 		})
 	}
 	result.status.Available = true
@@ -764,7 +772,8 @@ func (s *ControlPlaneSearchService) timelineSupportNotes(
 	}
 	page, err := s.store.ListSupportNotes(ctx, toolstore.SupportNoteFilter{
 		SubjectType: "user", SubjectID: strconv.FormatInt(userID, 10), IncludeDeleted: true,
-		BeforeID: cursor.NoteBeforeID, Limit: limit,
+		BeforeCreatedAt: controlPlaneTimelineCursorTime(cursor.NoteTime), BeforeID: cursor.NoteID,
+		OrderByCreatedAt: true, Limit: limit,
 	})
 	if err != nil {
 		result.err = err
@@ -781,7 +790,7 @@ func (s *ControlPlaneSearchService) timelineSupportNotes(
 			Details: map[string]interface{}{
 				"author": item.Author,
 			},
-			sourceBit: timelineSourceSupportNotes, sourceRank: 4, sourceID: item.ID,
+			sourceBit: timelineSourceSupportNotes, sourceRank: 4, sourceID: item.ID, sourceTime: item.CreatedAt.UnixMilli(),
 		})
 	}
 	result.status.Available = true
@@ -880,6 +889,13 @@ func unixSecondsToMillis(value int64) int64 {
 	return value * 1000
 }
 
+func controlPlaneTimelineCursorTime(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(value).UTC()
+}
+
 func controlPlaneSummary(primary, secondary string) string {
 	primary = strings.TrimSpace(primary)
 	secondary = strings.TrimSpace(secondary)
@@ -924,8 +940,10 @@ func decodeControlPlaneTimelineCursor(value string) (controlPlaneTimelineCursor,
 	}
 	if cursor.Disabled & ^uint32(timelineSourceLogs|timelineSourceTopUps|timelineSourceAudits|timelineSourceRiskCases|timelineSourceSupportNotes) != 0 ||
 		cursor.LogTime < 0 || cursor.LogID < 0 || cursor.TopUpTime < 0 || cursor.TopUpID < 0 ||
-		cursor.AuditBeforeID < 0 || cursor.RiskBeforeID < 0 || cursor.NoteBeforeID < 0 ||
-		(cursor.LogTime == 0) != (cursor.LogID == 0) || (cursor.TopUpTime == 0) != (cursor.TopUpID == 0) {
+		cursor.AuditTime < 0 || cursor.AuditID < 0 || cursor.RiskTime < 0 || cursor.RiskID < 0 || cursor.NoteTime < 0 || cursor.NoteID < 0 ||
+		(cursor.LogTime == 0) != (cursor.LogID == 0) || (cursor.TopUpTime == 0) != (cursor.TopUpID == 0) ||
+		(cursor.AuditTime == 0) != (cursor.AuditID == 0) || (cursor.RiskTime == 0) != (cursor.RiskID == 0) ||
+		(cursor.NoteTime == 0) != (cursor.NoteID == 0) {
 		return controlPlaneTimelineCursor{}, ErrControlPlaneInvalidCursor
 	}
 	return cursor, nil

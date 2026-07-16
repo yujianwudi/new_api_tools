@@ -263,6 +263,9 @@ func TestExportTopUpsToCSV_ContextCancel(t *testing.T) {
 		if rows > 1 { // header 之外不应有数据
 			t.Errorf("expected ctx cancel to abort early, but got %d rows", rows)
 		}
+		if !result.Truncated {
+			t.Errorf("cancelled export result = %+v, want truncated", result)
+		}
 		return
 	}
 	if ctx.Err() == nil {
@@ -270,6 +273,16 @@ func TestExportTopUpsToCSV_ContextCancel(t *testing.T) {
 	}
 	if !result.Truncated {
 		t.Errorf("cancelled export result = %+v, want truncated", result)
+	}
+}
+
+func TestCountTopUpsPropagatesCallerCancellation(t *testing.T) {
+	seedTopUps(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := CountTopUps(ctx, ListTopUpParams{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CountTopUps cancellation error = %v, want context canceled", err)
 	}
 }
 

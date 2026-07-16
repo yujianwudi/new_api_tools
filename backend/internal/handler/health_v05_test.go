@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,6 +90,146 @@ func TestDependencyHealthTreatsStalenessAsDiagnostic(t *testing.T) {
 		return
 	}
 	t.Fatalf("dependency health omitted log_freshness check: %s", recorder.Body.String())
+}
+
+func TestCollectDependencyChecksEnforcesDeadlineWhenProbeIgnoresCancellation(t *testing.T) {
+	coordinator := &dependencyProbeCoordinator{}
+	release := make(chan struct{})
+	releaseProbe := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	t.Cleanup(releaseProbe)
+	finished := make(chan struct{})
+	var starts atomic.Int32
+	stalled := dependencyProbe{name: "stalled", required: true, check: func(context.Context) DependencyCheck {
+		call := starts.Add(1)
+		<-release
+		if call == 1 {
+			close(finished)
+		}
+		return DependencyCheck{Status: "healthy", OK: true}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	checks := collectDependencyCheckResults(ctx, observability.NewRegistry(), coordinator, []dependencyProbe{
+		{name: "fast", check: func(context.Context) DependencyCheck {
+			return DependencyCheck{Status: "healthy", OK: true}
+		}},
+		stalled,
+	})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("dependency checks blocked for %s after deadline", elapsed)
+	}
+	if len(checks) != 2 || checks[0].Name != "fast" || checks[1].Name != "stalled" {
+		t.Fatalf("dependency checks were not complete and sorted: %#v", checks)
+	}
+	if checks[1].Status != "timeout" || checks[1].OK || !checks[1].Required {
+		t.Fatalf("stalled dependency was not synthesized as a required timeout: %#v", checks[1])
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("stalled dependency starts = %d, want 1", starts.Load())
+	}
+
+	reusedStarted := time.Now()
+	reused := collectDependencyCheckResults(context.Background(), observability.NewRegistry(), coordinator, []dependencyProbe{stalled})
+	if elapsed := time.Since(reusedStarted); elapsed > 100*time.Millisecond {
+		t.Fatalf("cached stalled dependency timeout took %s", elapsed)
+	}
+	if len(reused) != 1 || reused[0].Status != "timeout" || reused[0].Details["probe_state"] != "still_running" {
+		t.Fatalf("stalled dependency timeout was not reused: %#v", reused)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("timed-out dependency started another goroutine: starts=%d", starts.Load())
+	}
+
+	releaseProbe()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("stalled dependency did not finish after release")
+	}
+	waitForDependencyProbeIdle(t, coordinator, "stalled")
+
+	refreshed := collectDependencyCheckResults(context.Background(), observability.NewRegistry(), coordinator, []dependencyProbe{stalled})
+	if len(refreshed) != 1 || refreshed[0].Status != "healthy" || !refreshed[0].OK {
+		t.Fatalf("completed dependency could not be probed again: %#v", refreshed)
+	}
+	if starts.Load() != 2 {
+		t.Fatalf("dependency starts after completion = %d, want 2", starts.Load())
+	}
+}
+
+func TestDependencyProbeCoordinatorSingleFlightsConcurrentRequests(t *testing.T) {
+	coordinator := &dependencyProbeCoordinator{}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var starts atomic.Int32
+	probe := dependencyProbe{name: "shared", check: func(context.Context) DependencyCheck {
+		if starts.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return DependencyCheck{Status: "healthy", OK: true}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	first, cached := coordinator.acquire(ctx, probe)
+	if cached != nil || first == nil {
+		t.Fatalf("first probe acquire = run:%p cached:%#v", first, cached)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first dependency probe did not start")
+	}
+	second, cached := coordinator.acquire(ctx, probe)
+	if cached != nil || second != first {
+		t.Fatalf("concurrent dependency probe was not single-flighted: first=%p second=%p cached=%#v", first, second, cached)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("concurrent dependency probe starts = %d, want 1", starts.Load())
+	}
+
+	close(release)
+	if check := coordinator.wait(ctx, first, time.Now()); check.Status != "healthy" || !check.OK {
+		t.Fatalf("single-flight dependency result = %#v", check)
+	}
+	waitForDependencyProbeIdle(t, coordinator, "shared")
+
+	third, cached := coordinator.acquire(ctx, probe)
+	if cached != nil || third == nil || third == first {
+		t.Fatalf("completed dependency did not start a fresh probe: first=%p third=%p cached=%#v", first, third, cached)
+	}
+	if check := coordinator.wait(ctx, third, time.Now()); check.Status != "healthy" || !check.OK {
+		t.Fatalf("fresh dependency result = %#v", check)
+	}
+	if starts.Load() != 2 {
+		t.Fatalf("dependency starts after fresh probe = %d, want 2", starts.Load())
+	}
+}
+
+func waitForDependencyProbeIdle(t *testing.T, coordinator *dependencyProbeCoordinator, name string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		coordinator.mu.Lock()
+		_, active := coordinator.active[name]
+		coordinator.mu.Unlock()
+		if !active {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dependency probe %q remained active after completion", name)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestLogFreshnessRejectsFutureTimestampsAsClockSkew(t *testing.T) {

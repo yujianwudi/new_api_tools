@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const operationAuditColumns = `id, request_id, actor, source_ip, auth_method, action,
@@ -179,11 +180,33 @@ func (s *Store) ListOperationAudits(ctx context.Context, filter OperationAuditFi
 		}
 		addStringFilter("status", string(filter.Status))
 	}
-	if filter.BeforeID > 0 {
-		query.WriteString(" AND id < ?")
-		args = append(args, filter.BeforeID)
+	if filter.OrderByCreatedAt {
+		if filter.BeforeID < 0 {
+			return OperationAuditPage{}, fmt.Errorf("%w: before_id cannot be negative", ErrInvalid)
+		}
+		if filter.BeforeCreatedAt.IsZero() != (filter.BeforeID == 0) ||
+			(!filter.BeforeCreatedAt.IsZero() && filter.BeforeCreatedAt.UnixMilli() < 0) {
+			return OperationAuditPage{}, fmt.Errorf("%w: created_at cursor requires a non-negative timestamp and positive id", ErrInvalid)
+		}
+		if filter.BeforeID > 0 {
+			before := filter.BeforeCreatedAt.UTC().Truncate(time.Millisecond)
+			query.WriteString(" AND (created_at < ? OR (created_at = ? AND id < ?))")
+			args = append(args, dbTime(before), dbTime(before), filter.BeforeID)
+		}
+		query.WriteString(" ORDER BY created_at DESC, id DESC LIMIT ?")
+	} else {
+		if filter.BeforeID < 0 {
+			return OperationAuditPage{}, fmt.Errorf("%w: before_id cannot be negative", ErrInvalid)
+		}
+		if !filter.BeforeCreatedAt.IsZero() {
+			return OperationAuditPage{}, fmt.Errorf("%w: created_at cursor requires created_at ordering", ErrInvalid)
+		}
+		if filter.BeforeID > 0 {
+			query.WriteString(" AND id < ?")
+			args = append(args, filter.BeforeID)
+		}
+		query.WriteString(" ORDER BY id DESC LIMIT ?")
 	}
-	query.WriteString(" ORDER BY id DESC LIMIT ?")
 	args = append(args, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)

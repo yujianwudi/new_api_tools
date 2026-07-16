@@ -389,6 +389,9 @@ func (s *redisAutoGroupAuditStore) ReserveIDs(ctx context.Context, count int) ([
 	if count <= 0 {
 		return []int64{}, nil
 	}
+	if int64(count) > autoGroupMaxPendingLogs {
+		return nil, fmt.Errorf("audit log batch exceeds the supported limit of %d", autoGroupMaxPendingLogs)
+	}
 	if s == nil || s.client == nil {
 		return nil, errors.New("Redis client is not initialized")
 	}
@@ -423,6 +426,9 @@ func (s *redisAutoGroupAuditStore) StageLogs(ctx context.Context, logs []string)
 	if len(logs) == 0 {
 		return nil
 	}
+	if int64(len(logs)) > autoGroupMaxPendingLogs {
+		return fmt.Errorf("audit log batch exceeds the supported limit of %d", autoGroupMaxPendingLogs)
+	}
 	if s == nil || s.client == nil {
 		return errors.New("Redis client is not initialized")
 	}
@@ -430,8 +436,7 @@ func (s *redisAutoGroupAuditStore) StageLogs(ctx context.Context, logs []string)
 	if err != nil {
 		return err
 	}
-	values := make([]interface{}, 0, len(logs)*2+1)
-	values = append(values, autoGroupMaxPendingLogs)
+	values := []interface{}{autoGroupMaxPendingLogs}
 	for i, id := range ids {
 		values = append(values, strconv.FormatInt(id, 10), logs[i])
 	}

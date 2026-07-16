@@ -49,6 +49,7 @@ func (h *StoreHandler) RegisterRoutes(api *gin.RouterGroup) {
 
 	group.GET("/operation-audits", authenticated, viewer, h.ListOperationAudits)
 	group.GET("/operation-audits/:id", authenticated, viewer, h.GetOperationAudit)
+	group.GET("/operations/:idempotency_key", authenticated, viewer, h.GetOperationReconciliation)
 
 	group.POST("/risk-cases", authenticated, operator, h.CreateRiskCase)
 	group.GET("/risk-cases", authenticated, viewer, h.ListRiskCases)

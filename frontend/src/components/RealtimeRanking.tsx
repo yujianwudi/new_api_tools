@@ -12,11 +12,19 @@ import { Input } from './ui/input'
 import { cn, isCloudflareIp } from '../lib/utils'
 import { UserAnalysisDialog, BAN_REASONS, UNBAN_REASONS, RISK_FLAG_LABELS } from './UserAnalysisDialog'
 import {
-  clearIdempotencyKey,
-  getOrCreateIdempotencyKey,
+  beginPendingMutation,
+  bindOperationReleaseCandidate,
+  clearPendingMutation,
+  fetchOperationReconciliation,
+  getPendingMutation,
   idempotencyHeader,
-  mutationResponseRequiresReconciliation,
-  type IdempotencyOperation,
+  operationReconciliationAction,
+  operationReconciliationDecision,
+  operationReleaseCandidateMatches,
+  userMutationOperationIdentifier,
+  type OperationReleaseCandidate,
+  type PendingMutationRecord,
+  type PendingMutationSnapshot,
 } from '../lib/idempotency'
 
 type WindowKey = '1h' | '3h' | '6h' | '12h' | '24h' | '3d' | '7d'
@@ -147,6 +155,17 @@ interface BannedUserItem {
   ban_operator: string | null
   ban_context: Record<string, any> | null
 }
+
+interface UserStatusMutationPayload extends Record<string, unknown> {
+  userId: number
+  action: 'disable' | 'enable'
+  type: 'ban' | 'unban'
+  username: string
+  displayName?: string
+  reason: string
+}
+
+type UserStatusPendingMutation = PendingMutationRecord | PendingMutationSnapshot<UserStatusMutationPayload>
 
 // IP Monitoring Types
 interface IPStats {
@@ -285,7 +304,11 @@ export function RealtimeRanking() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [selected, setSelected] = useState<{ item: LeaderboardItem; window: WindowKey; endTime?: number } | null>(null)
   const [mutating, setMutating] = useState(false)
-  const banOperationRef = useRef<IdempotencyOperation | null>(null)
+  const [pendingBanMutation, setPendingBanMutation] = useState<UserStatusPendingMutation | null>(null)
+  const [banReleaseCandidate, setBanReleaseCandidate] = useState<OperationReleaseCandidate | null>(null)
+  const [banReconciling, setBanReconciling] = useState(false)
+  const banPayloadLocked = pendingBanMutation !== null
+  const banReconciliationRequired = pendingBanMutation?.reconciliationRequired === true
 
   // 封禁列表状态
   const [bannedUsers, setBannedUsers] = useState<BannedUserItem[]>([])
@@ -1444,9 +1467,33 @@ export function RealtimeRanking() {
 
   const closeBanConfirmDialog = () => {
     setBanConfirmDialog((previous) => ({ ...previous, open: false }))
+    setPendingBanMutation(null)
+  }
+
+  const openBanConfirmDialog = (dialog: Omit<typeof banConfirmDialog, 'open'>) => {
+    const existing = getPendingMutation(userMutationOperationIdentifier(dialog.userId))
+    if (existing) {
+      setPendingBanMutation(existing)
+      setBanReleaseCandidate(current => operationReleaseCandidateMatches(current, existing) ? current : null)
+      setBanConfirmDialog({
+        ...dialog,
+        type: existing.action === 'user.enable' ? 'unban' : 'ban',
+        reason: '',
+        open: true,
+      })
+      showToast('error', '该用户已有待对账操作，请先读取 Tool Store 审计结果')
+      return
+    }
+    setPendingBanMutation(null)
+    setBanReleaseCandidate(null)
+    setBanConfirmDialog({ ...dialog, open: true })
   }
 
   const handleBanMutation = async () => {
+    if (pendingBanMutation) {
+      showToast('error', '操作结果尚未对账，当前提交已锁定')
+      return
+    }
     const reason = banConfirmDialog.reason.trim()
     if (reason.length < 3) {
       showToast('error', banConfirmDialog.type === 'ban' ? '请选择封禁原因' : '请选择解封原因')
@@ -1455,38 +1502,124 @@ export function RealtimeRanking() {
 
     const isBan = banConfirmDialog.type === 'ban'
     const action = isBan ? 'disable' : 'enable'
-    const requestBody = { reason }
-    const fingerprint = JSON.stringify({ action: `user.${action}`, user_id: banConfirmDialog.userId, ...requestBody })
-    const idempotencyKey = getOrCreateIdempotencyKey(banOperationRef, fingerprint, 'realtime.user.status')
+    const operationIdentifier = userMutationOperationIdentifier(banConfirmDialog.userId)
+    let pending: PendingMutationSnapshot<UserStatusMutationPayload>
+    try {
+      pending = beginPendingMutation({
+        operationIdentifier,
+        fingerprint: JSON.stringify({ action: `user.${action}`, user_id: banConfirmDialog.userId, reason }),
+        action: `user.${action}`,
+        targetType: 'user',
+        targetId: String(banConfirmDialog.userId),
+        payload: {
+          userId: banConfirmDialog.userId,
+          action,
+          type: banConfirmDialog.type,
+          username: banConfirmDialog.username,
+          displayName: banConfirmDialog.displayName,
+          reason,
+        },
+      })
+    } catch (error) {
+      const existing = getPendingMutation(operationIdentifier)
+      if (existing) setPendingBanMutation(existing)
+      showToast('error', error instanceof Error ? error.message : '该用户已有待对账操作')
+      return
+    }
 
+    setPendingBanMutation(pending)
+    setBanReleaseCandidate(null)
     setMutating(true)
     try {
-      const response = await fetch(`${apiUrl}/api/control-plane/users/${banConfirmDialog.userId}/${action}`, {
+      const response = await fetch(`${apiUrl}/api/control-plane/users/${pending.payload.userId}/${pending.payload.action}`, {
         method: 'POST',
-        headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
-        body: JSON.stringify(requestBody),
+        headers: { ...getAuthHeaders(), ...idempotencyHeader(pending.key) },
+        body: JSON.stringify({ reason: pending.payload.reason }),
       })
       const result = await response.json()
       if (result.success) {
-        clearIdempotencyKey(banOperationRef)
-        showToast('success', result.message || (isBan ? '已封禁' : '已解封'))
+        const lockCleared = clearPendingMutation(pending)
+        setPendingBanMutation(current => current?.key === pending.key
+          ? (lockCleared ? null : (getPendingMutation(operationIdentifier) ?? pending))
+          : current)
+        if (lockCleared) setBanReleaseCandidate(null)
+        showToast(
+          lockCleared ? 'success' : 'error',
+          lockCleared
+            ? result.message || (pending.payload.type === 'ban' ? '已封禁' : '已解封')
+            : '操作已生效并写入审计，但浏览器未能清理本地锁；请重新对账',
+        )
         setBanConfirmDialog((previous) => ({ ...previous, open: false }))
         setDialogOpen(false)
         void Promise.all([
           fetchLeaderboards(),
-          fetchBannedUsers(isBan ? 1 : bannedPage),
-          fetchBanRecords(isBan ? 1 : recordsPage),
+          fetchBannedUsers(pending.payload.type === 'ban' ? 1 : bannedPage),
+          fetchBanRecords(pending.payload.type === 'ban' ? 1 : recordsPage),
         ])
       } else {
-        showToast('error', mutationResponseRequiresReconciliation(result)
-          ? '操作结果不确定，请先对账，切勿修改内容后重新提交'
-          : result.error?.message || result.message || (isBan ? '封禁失败' : '解封失败'))
+        showToast('error', result.error?.message || result.message || '提交未成功；本地操作锁已保留，请先对账')
       }
     } catch (error) {
-      console.error(`Failed to ${action} user:`, error)
-      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
+      console.error(`Failed to ${pending.payload.action} user:`, error)
+      showToast('error', '网络中断，本地操作锁已保留；请读取 Tool Store 审计结果，切勿直接重试')
     } finally {
       setMutating(false)
+    }
+  }
+
+  const reconcileBanMutation = async () => {
+    const pending = pendingBanMutation
+    if (!pending) return
+    setBanReconciling(true)
+    try {
+      const candidateMatches = operationReleaseCandidateMatches(banReleaseCandidate, pending)
+      const reconciliation = candidateMatches
+        ? banReleaseCandidate
+        : await fetchOperationReconciliation(apiUrl, getAuthHeaders(), pending)
+      const decision = operationReconciliationDecision(reconciliation.status)
+      const nextAction = operationReconciliationAction(reconciliation.status, candidateMatches)
+      if (nextAction === 'keep_locked') {
+        setBanReleaseCandidate(null)
+        const message = reconciliation.status === 'not_found'
+          ? 'Tool Store 尚未发现可证明终态的审计记录；原请求可能仍在到达，当前操作继续锁定'
+          : reconciliation.status === 'pending'
+            ? `审计 #${reconciliation.audit_id} 仍只有操作意图，当前操作继续锁定`
+            : `审计 #${reconciliation.audit_id} 已标记 cancelled，结果仍不确定；请人工处置`
+        showToast('error', message)
+        return
+      }
+      if (nextAction === 'confirm_release') {
+        setBanReleaseCandidate(bindOperationReleaseCandidate(pending, reconciliation))
+        showToast('info', `审计 #${reconciliation.audit_id} 确认为 ${reconciliation.status}；操作未生效。请再次点击“确认解除本地锁”`)
+        return
+      }
+      if (!clearPendingMutation(pending)) {
+        setPendingBanMutation(current => current?.key === pending.key
+          ? (getPendingMutation(pending.operationIdentifier) ?? pending)
+          : current)
+        showToast('error', '审计已确认终态，但浏览器未能安全清理本地锁；请勿重试并再次对账')
+        return
+      }
+      setBanReleaseCandidate(null)
+      setPendingBanMutation(current => current?.key === pending.key ? null : current)
+      setBanConfirmDialog(previous => ({ ...previous, open: false }))
+      setDialogOpen(false)
+      showToast(
+        decision === 'applied' ? 'success' : 'info',
+        decision === 'applied'
+          ? `审计 #${reconciliation.audit_id} 确认操作已经生效，已解除提交锁`
+          : `审计 #${reconciliation.audit_id} 确认为 ${reconciliation.status}，已释放本地所有权`,
+      )
+      void Promise.all([
+        fetchLeaderboards(),
+        fetchBannedUsers(reconciliation.action === 'user.disable' ? 1 : bannedPage),
+        fetchBanRecords(reconciliation.action === 'user.disable' ? 1 : recordsPage),
+      ])
+    } catch (error) {
+      console.error('Failed to reconcile user status mutation:', error)
+      showToast('error', '对账失败，操作表单保持锁定，请检查网络后重试')
+    } finally {
+      setBanReconciling(false)
     }
   }
 
@@ -2021,8 +2154,7 @@ export function RealtimeRanking() {
                                     className="h-8 px-3 text-xs font-medium hover:bg-green-50 hover:text-green-700 hover:border-green-200 transition-colors"
                                     disabled={mutating}
                                     onClick={() => {
-                                      setBanConfirmDialog({
-                                        open: true,
+                                      openBanConfirmDialog({
                                         type: 'unban',
                                         userId: user.id,
                                         username: user.username,
@@ -3504,8 +3636,7 @@ export function RealtimeRanking() {
                       variant="destructive"
                       size="sm"
                       onClick={() => {
-                        setBanConfirmDialog({
-                          open: true,
+                        openBanConfirmDialog({
                           type: 'ban',
                           userId: aiAssessResult.user_id,
                           username: aiAssessResult.username,
@@ -4198,7 +4329,12 @@ export function RealtimeRanking() {
         <DialogContent className="max-w-[600px] w-full rounded-xl gap-6 p-6 overflow-visible">
           <DialogHeader className="space-y-2">
             <DialogTitle className="flex items-center gap-2 text-lg">
-              {banConfirmDialog.type === 'ban' ? (
+              {banPayloadLocked ? (
+                <>
+                  <AlertTriangle className="h-5 w-5 text-amber-600" />
+                  用户操作待对账
+                </>
+              ) : banConfirmDialog.type === 'ban' ? (
                 <>
                   <ShieldBan className="h-5 w-5 text-destructive" />
                   确认封禁用户
@@ -4211,13 +4347,28 @@ export function RealtimeRanking() {
               )}
             </DialogTitle>
             <DialogDescription className="text-sm">
-              {banConfirmDialog.type === 'ban'
+              {banPayloadLocked
+                ? <span className="block break-words">用户 #{pendingBanMutation?.targetId} 的 {pendingBanMutation?.action} 已持久锁定，只能依据 Tool Store 审计终态解锁。</span>
+                : banConfirmDialog.type === 'ban'
                 ? <span className="block break-words">即将封禁用户 <span className="font-medium text-foreground">{banConfirmDialog.displayName || banConfirmDialog.username}</span>{banConfirmDialog.displayName && banConfirmDialog.displayName !== banConfirmDialog.username && <span className="text-muted-foreground"> (@{banConfirmDialog.username})</span>}</span>
                 : <span className="block break-words">即将解封用户 <span className="font-medium text-foreground">{banConfirmDialog.displayName || banConfirmDialog.username}</span>{banConfirmDialog.displayName && banConfirmDialog.displayName !== banConfirmDialog.username && <span className="text-muted-foreground"> (@{banConfirmDialog.username})</span>}</span>}
             </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-4">
+            {banPayloadLocked && (
+              <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+                <span>
+                  浏览器不会根据当前用户状态猜测结果，也不会使用原幂等键盲目重试。请先读取持久审计结果。
+                  {banReleaseCandidate && (
+                    <span className="mt-1 block font-medium text-amber-700 dark:text-amber-300">
+                      审计 #{banReleaseCandidate.audit_id} 已确认为 {banReleaseCandidate.status}。请显式确认后解除本地锁。
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
             <div className="space-y-2">
               <label className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
                 {banConfirmDialog.type === 'ban' ? '请选择封禁原因' : '请选择解封原因'}
@@ -4226,6 +4377,7 @@ export function RealtimeRanking() {
                 value={banConfirmDialog.reason}
                 onChange={(e) => setBanConfirmDialog(prev => ({ ...prev, reason: e.target.value }))}
                 className="w-full"
+                disabled={banPayloadLocked}
               >
                 {(banConfirmDialog.type === 'ban' ? BAN_REASONS : UNBAN_REASONS).map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
@@ -4246,15 +4398,20 @@ export function RealtimeRanking() {
             <Button
               variant="ghost"
               onClick={closeBanConfirmDialog}
-              disabled={mutating}
+              disabled={mutating || banReconciling}
               className="flex-1 sm:flex-none"
             >
-              取消
+              {banPayloadLocked ? '暂时关闭' : '取消'}
             </Button>
-            {banConfirmDialog.type === 'ban' ? (
+            {banReconciliationRequired ? (
+              <Button onClick={reconcileBanMutation} disabled={mutating || banReconciling}>
+                {banReconciling ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                {banReleaseCandidate ? '确认解除本地锁' : '重新对账'}
+              </Button>
+            ) : banConfirmDialog.type === 'ban' ? (
               <Button
                 variant="destructive"
-                disabled={mutating || banConfirmDialog.reason.trim().length < 3}
+                disabled={mutating || banReconciling || banConfirmDialog.reason.trim().length < 3}
                 className="flex-1 sm:flex-none min-w-[100px]"
                 onClick={handleBanMutation}
               >
@@ -4264,7 +4421,7 @@ export function RealtimeRanking() {
             ) : (
               <Button
                 className="bg-green-600 hover:bg-green-700 flex-1 sm:flex-none min-w-[100px]"
-                disabled={mutating || banConfirmDialog.reason.trim().length < 3}
+                disabled={mutating || banReconciling || banConfirmDialog.reason.trim().length < 3}
                 onClick={handleBanMutation}
               >
                 {mutating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ShieldCheck className="h-4 w-4 mr-2" />}

@@ -21,6 +21,7 @@ on:
       - 'tests/**'
       - 'README.md'
       - 'RELEASE_*.md'
+      - '.github/dependabot.yml'
       - '.github/workflows/build.yml'
       - '!**/.gitignore'
   pull_request:
@@ -39,6 +40,7 @@ on:
       - 'tests/**'
       - 'README.md'
       - 'RELEASE_*.md'
+      - '.github/dependabot.yml'
       - '.github/workflows/build.yml'
 
 concurrency:
@@ -62,6 +64,53 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate release tag identity
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag must use strict vMAJOR.MINOR.PATCH syntax: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+
+          [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] || {
+            echo "release tag must be annotated: $tag" >&2
+            exit 1
+          }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "release tag commit is not reachable from origin/main: $GITHUB_SHA" >&2
+            exit 1
+          }
+
+          source_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' \
+            backend/internal/buildinfo/buildinfo.go)"
+          [[ "$source_version" == "$version" ]] || {
+            echo "release tag $tag does not match source version $source_version" >&2
+            exit 1
+          }
+
+          release_doc="RELEASE_${version}.md"
+          [[ -f "$release_doc" ]] || {
+            echo "missing release document: $release_doc" >&2
+            exit 1
+          }
+          grep -Fxq "# NewAPI Tools v${version} 发行说明" "$release_doc" || {
+            echo "release document title does not match $tag" >&2
+            exit 1
+          }
+          grep -Fq "NEWAPI_TOOLS_REF=${tag} \\" "$release_doc" || {
+            echo "release document installer ref does not match $tag" >&2
+            exit 1
+          }
+          grep -Fxq "# NewAPI Tools v${version}" README.md || {
+            echo "README version does not match $tag" >&2
+            exit 1
+          }
 
       - name: Validate deployment configuration
         env:
@@ -69,6 +118,7 @@ jobs:
         run: |
           bash -n deploy.sh install.sh setup-log-db.sh
           bash tests/deploy_dsn_test.sh
+          bash tests/setup_log_db_safety_test.sh
           bash tests/supply_chain_pins_test.sh
           docker compose config --quiet
           docker compose -f docker-compose.yml -f docker-compose.host.yml config --quiet
@@ -177,7 +227,7 @@ jobs:
         id: build_identity
         shell: bash
         run: |
-          version="0.5.0-dev"
+          version="0.5.1-dev"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           fi

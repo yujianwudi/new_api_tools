@@ -409,13 +409,17 @@ func respondSelectedModels(c *gin.Context, maxBatch int) {
 // PUT /selected
 func SetSelectedModels(c *gin.Context) {
 	var req struct {
-		Models []string `json:"models"`
+		Models *[]string `json:"models"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
-	validatedModels, errMessage := sanitizeSelectedModelNames(req.Models)
+	if req.Models == nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Models must be provided as an array", ""))
+		return
+	}
+	validatedModels, errMessage := sanitizeSelectedModelNames(*req.Models)
 	if errMessage != "" {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", errMessage, ""))
 		return

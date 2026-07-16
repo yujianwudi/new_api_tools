@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useCallback, ReactNode, useEffect } from 'react'
 import { setGlobalLogout, clearGlobalLogout } from '../lib/api'
+import { clearReusableIdempotencyKeys } from '../lib/idempotency'
 
 const TOKEN_KEY = 'newapi_tools_token'
 const TOKEN_EXPIRY_KEY = 'newapi_tools_token_expiry'
@@ -94,6 +95,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }
     }
     clearSessionAuthStorage()
+    clearReusableIdempotencyKeys()
     return null
   })
 
@@ -102,6 +104,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const logout = useCallback(() => {
     setToken(null)
     clearAllAuthStorage()
+    clearReusableIdempotencyKeys()
   }, [])
 
   // Check token expiry periodically

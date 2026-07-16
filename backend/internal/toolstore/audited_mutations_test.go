@@ -337,7 +337,7 @@ func TestAuditedMutationReplaysReturnOriginalResults(t *testing.T) {
 	assertTableCount(t, store, "operation_audit", 7)
 }
 
-func TestCreateSupportNoteAuditedReplayRejectsDeletedStoredNote(t *testing.T) {
+func TestCreateSupportNoteAuditedReplayReturnsImmutableSnapshotAfterLaterChanges(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 	input := SupportNoteInput{
@@ -345,15 +345,25 @@ func TestCreateSupportNoteAuditedReplayRejectsDeletedStoredNote(t *testing.T) {
 		Body: "Replay must remain live", Visibility: NoteInternal, IdempotencyKey: "audit-support_note.create",
 	}
 	auditInput := testMutationAudit("support_note.create")
-	created, _, err := store.CreateSupportNoteAudited(ctx, input, auditInput)
+	created, audit, err := store.CreateSupportNoteAudited(ctx, input, auditInput)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateSupportNote(ctx, SupportNoteUpdate{
+		ID: created.ID, Body: "Later mutable body", Visibility: NoteCustomer,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DeleteSupportNote(ctx, created.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.CreateSupportNoteAudited(ctx, input, auditInput); !errors.Is(err, ErrConflict) {
-		t.Fatalf("deleted audited note replay error = %v, want ErrConflict", err)
+	replayed, replayAudit, err := store.CreateSupportNoteAudited(ctx, input, auditInput)
+	if err != nil {
+		t.Fatalf("immutable create replay error = %v", err)
+	}
+	if replayAudit.ID != audit.ID || replayed.ID != created.ID || replayed.Body != created.Body ||
+		replayed.Visibility != created.Visibility || replayed.DeletedAt != nil || replayed.UpdatedAt != created.UpdatedAt {
+		t.Fatalf("immutable create replay = %+v/%+v, want original %+v/%+v", replayed, replayAudit, created, audit)
 	}
 	assertTableCount(t, store, "operation_audit", 1)
 }

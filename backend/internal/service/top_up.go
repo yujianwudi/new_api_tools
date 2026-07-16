@@ -451,8 +451,8 @@ func (p *TopUpExportPlan) Close() error {
 
 // CountTopUps returns a count from a fixed snapshot. Export handlers should use
 // PrepareTopUpExport directly so the same snapshot remains open for streaming.
-func CountTopUps(params ListTopUpParams) (int64, error) {
-	plan, err := PrepareTopUpExport(context.Background(), params)
+func CountTopUps(ctx context.Context, params ListTopUpParams) (int64, error) {
+	plan, err := PrepareTopUpExport(ctx, params)
 	if err != nil {
 		return 0, err
 	}

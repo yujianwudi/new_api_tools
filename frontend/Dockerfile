@@ -2,7 +2,7 @@
 # Multi-stage build: Node.js build + Nginx runtime
 
 # Stage 1: Build
-FROM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS builder
+FROM --platform=$BUILDPLATFORM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS builder
 
 WORKDIR /app
 

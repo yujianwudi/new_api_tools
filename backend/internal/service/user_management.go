@@ -718,6 +718,30 @@ type ListUsersParams struct {
 	OrderDir       string `json:"order_dir"`
 }
 
+func userListOrderColumn(orderBy string) string {
+	switch orderBy {
+	case "id":
+		return "id"
+	case "username":
+		return "username"
+	case "quota":
+		return "quota"
+	case "used_quota":
+		return "used_quota"
+	case "request_count":
+		return "request_count"
+	default:
+		return "request_count"
+	}
+}
+
+func userListOrderDirection(orderDir string) string {
+	if strings.EqualFold(orderDir, "ASC") {
+		return "ASC"
+	}
+	return "DESC"
+}
+
 // GetUsers returns paginated user list
 func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]interface{}, error) {
 	if params.Page < 1 {
@@ -726,25 +750,10 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 	if params.PageSize < 1 || params.PageSize > 100 {
 		params.PageSize = 20
 	}
-	if params.OrderBy == "" {
-		params.OrderBy = "request_count"
-	}
-	if params.OrderDir == "" {
-		params.OrderDir = "DESC"
-	}
-
-	// Validate order_by
-	allowedOrderBy := map[string]bool{
-		"id": true, "username": true, "request_count": true,
-		"quota": true, "used_quota": true,
-	}
-	if !allowedOrderBy[params.OrderBy] {
-		params.OrderBy = "request_count"
-	}
-	orderDir := strings.ToUpper(params.OrderDir)
-	if orderDir != "ASC" && orderDir != "DESC" {
-		orderDir = "DESC"
-	}
+	// ORDER BY identifiers cannot be parameterized. Map all external values to
+	// fixed literals before composing the query so no request data reaches SQL.
+	orderBy := userListOrderColumn(params.OrderBy)
+	orderDir := userListOrderDirection(params.OrderDir)
 
 	groupCol := "`group`"
 	if s.db.IsPG {
@@ -871,12 +880,12 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 	if s.db.IsPG {
 		selectQuery = fmt.Sprintf(
 			"SELECT %s FROM users u WHERE %s ORDER BY u.%s %s LIMIT $%d OFFSET $%d",
-			selectCols, whereClause, params.OrderBy, orderDir, argIdx, argIdx+1)
+			selectCols, whereClause, orderBy, orderDir, argIdx, argIdx+1)
 		args = append(args, params.PageSize, offset)
 	} else {
 		selectQuery = fmt.Sprintf(
 			"SELECT %s FROM users u WHERE %s ORDER BY u.%s %s LIMIT ? OFFSET ?",
-			selectCols, whereClause, params.OrderBy, orderDir)
+			selectCols, whereClause, orderBy, orderDir)
 		args = append(args, params.PageSize, offset)
 		selectQuery = s.db.RebindQuery(selectQuery)
 	}

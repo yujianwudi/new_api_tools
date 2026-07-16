@@ -79,7 +79,7 @@ install_compose_detection() (
   log_success() { :; }
   command() {
     if [[ "${1:-}" == '-v' ]]; then
-      case "${2:-}" in git|docker|sha256sum|docker-compose) return 0 ;; esac
+        case "${2:-}" in git|docker|flock|id|sha256sum|stat|sync|docker-compose) return 0 ;; esac
     fi
     builtin command "$@"
   }
@@ -969,6 +969,7 @@ deploy_start_order() (
   DOCKER_COMPOSE='fake_compose'
   COMPOSE_FILES=(-f "$REPO_ROOT/docker-compose.yml")
   ENV_FILE="${install_fixture}/.env"
+  rm -f -- "${ENV_FILE}.rollback"
   printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$previous_test_image" > "$ENV_FILE"
   NEWAPI_TOOLS_IMAGE='ghcr.io/yujianwudi/new_api_tools:0.2.0'
   NEWAPI_TOOLS_EXPECTED_REVISION=''
@@ -984,16 +985,19 @@ deploy_start_order() (
   (start_services >/dev/null 2>&1)
   status=$?
   set -e
-  printf '%s|%s|%s\n' "$status" "$(paste -sd, "$order_file")" "$(env_file_value "$ENV_FILE" 'NEWAPI_TOOLS_IMAGE')"
+  printf '%s|%s|%s|%s\n' \
+    "$status" "$(paste -sd, "$order_file")" \
+    "$(env_file_value "$ENV_FILE" 'NEWAPI_TOOLS_IMAGE')" \
+    "$([[ -e "${ENV_FILE}.rollback" || -L "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
 )
 
 assert_eq \
   'deployment waits for a healthy candidate before committing its digest' \
-  "0|pull:--include-deps+newapi-tools,pin,down,up-start,up-wait|${resolved_test_image}" \
+  "0|pull:--include-deps+newapi-tools,pin,down,up-start,up-wait|${resolved_test_image}|absent" \
   deploy_start_order
 assert_eq \
   'deployment restores the old digest and healthy old service when the candidate is unhealthy' \
-  "1|pull:--include-deps+newapi-tools,pin,down,up-start,up-wait,down,up-start,up-wait|${previous_test_image}" \
+  "1|pull:--include-deps+newapi-tools,pin,down,up-start,up-wait,down,up-start,up-wait|${previous_test_image}|present" \
   deploy_start_order 42 0
 
 deploy_pull_failure_actions() (
@@ -1119,7 +1123,8 @@ install_quick_update_actions() (
   fixture="$(mktemp -d)"
   order_file="$(mktemp)"
   trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
-  printf 'FRONTEND_PORT=1145\nNEWAPI_TOOLS_IMAGE=%s\n' "$existing_image" > "${fixture}/.env"
+  printf 'FRONTEND_PORT=1145\nCOMPOSE_PROJECT_NAME=old-project\nNEWAPI_TOOLS_IMAGE=%s\n' \
+    "$existing_image" > "${fixture}/.env"
   : > "${fixture}/docker-compose.yml"
 
   log_info() { :; }
@@ -1232,7 +1237,8 @@ install_interactive_update_actions() (
   fixture="$(mktemp -d)"
   order_file="$(mktemp)"
   trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
-  printf 'FRONTEND_PORT=1145\nNEWAPI_TOOLS_IMAGE=%s\n' "$existing_image" > "${fixture}/.env"
+  printf 'FRONTEND_PORT=1145\nCOMPOSE_PROJECT_NAME=old-project\nNEWAPI_TOOLS_IMAGE=%s\n' \
+    "$existing_image" > "${fixture}/.env"
   : > "${fixture}/docker-compose.yml"
 
   log_info() { :; }
@@ -1347,6 +1353,7 @@ deploy_preactivation_failure_restores_full_env() (
     'COMPOSE_PROJECT_NAME=old-project' \
     'NEWAPI_NETWORK_MODE=custom' \
     'NEWAPI_NETWORK=old-network' \
+    "SQL_DSN='host=old-db password=old-db-secret'" \
     'OLD_ONLY=preserve-me')"
   printf '%s\n' \
     'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.0' \
@@ -1422,35 +1429,131 @@ deploy_preactivation_failure_restores_full_env() (
   NEWAPI_NETWORK=''
   ORIGINAL_NETWORK=''
   LOG_NETWORK=''
+  FRONTEND_BIND='127.0.0.1'
+  FRONTEND_PORT='1145'
 
   set +e
   (start_services >/dev/null 2>&1)
   status=$?
   set -e
-  printf '%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$status" \
     "$(paste -sd, "$order_file")" \
     "$(env_file_value "$ENV_FILE" 'ADMIN_PASSWORD')" \
     "$(env_file_value "$ENV_FILE" 'OLD_ONLY')" \
-    "$(grep -c '^NEW_ONLY=' "$ENV_FILE" || true)"
+    "$(grep -c '^NEW_ONLY=' "$ENV_FILE" || true)" \
+    "$([[ -f "${ENV_FILE}.rollback" ]] && printf present || printf absent)" \
+    "$(env_file_value "${ENV_FILE}.rollback" 'ADMIN_PASSWORD')" \
+    "$(env_file_value "${ENV_FILE}.rollback" 'SQL_DSN')" \
+    "$(env_file_value "${ENV_FILE}.rollback" 'NEWAPI_NETWORK')" \
+    "$(stat -c '%a' "${ENV_FILE}.rollback")"
 )
 
 assert_eq \
   'deploy preflight failure restores the complete old dotenv before pull' \
-  '1||old-secret|preserve-me|0' \
+  '1||old-secret|preserve-me|0|present|old-secret|host=old-db password=old-db-secret|old-network|600' \
   deploy_preactivation_failure_restores_full_env precheck
 assert_eq \
   'deploy pull failure restores the complete old dotenv after generate_env_file replacement' \
-  '1|pull|old-secret|preserve-me|0' \
+  '1|pull|old-secret|preserve-me|0|present|old-secret|host=old-db password=old-db-secret|old-network|600' \
   deploy_preactivation_failure_restores_full_env pull
 assert_eq \
   'deploy digest pin failure restores the complete old dotenv before any stop' \
-  '1|pull,pin|old-secret|preserve-me|0' \
+  '1|pull,pin|old-secret|preserve-me|0|present|old-secret|host=old-db password=old-db-secret|old-network|600' \
   deploy_preactivation_failure_restores_full_env pin
 assert_eq \
   'deploy treats an initial down error as partial removal and rebuilds the old service' \
-  '1|pull,pin,down-fail,up-start,up-wait|old-secret|preserve-me|0' \
+  '1|pull,pin,down-fail,up-start,up-wait|old-secret|preserve-me|0|present|old-secret|host=old-db password=old-db-secret|old-network|600' \
   deploy_preactivation_failure_restores_full_env down
+
+deploy_first_install_commits_without_rollback_snapshot() (
+  local fixture order_file status start_output
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.1' \
+    'COMPOSE_PROJECT_NAME=first-install' > "${fixture}/.env"
+
+  download_geoip_database() { :; }
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  connect_deploy_runtime_networks() { :; }
+  verify_deploy_application_health() { :; }
+  pin_deploy_image_after_pull() {
+    printf 'pin\n' >> "$order_file"
+    NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+    export NEWAPI_TOOLS_IMAGE
+  }
+  fake_compose() {
+    local arg
+    for arg in "$@"; do
+      case "$arg" in
+        pull)
+          printf 'pull\n' >> "$order_file"
+          return 0
+          ;;
+        up)
+          if [[ " $* " == *' --wait '* ]]; then
+            printf 'up-wait\n' >> "$order_file"
+          else
+            printf 'up-start\n' >> "$order_file"
+          fi
+          return 0
+          ;;
+      esac
+    done
+  }
+  docker() {
+    if [[ "${1:-}" == 'ps' ]]; then
+      return 0
+    fi
+  }
+
+  SCRIPT_DIR="$REPO_ROOT"
+  ENV_FILE="${fixture}/.env"
+  COMPOSE_FILE="${REPO_ROOT}/docker-compose.yml"
+  COMPOSE_HOST_FILE="${REPO_ROOT}/docker-compose.host.yml"
+  COMPOSE_LOGDB_FILE="${REPO_ROOT}/docker-compose.logdb.yml"
+  COMPOSE_FILES=(-f "$COMPOSE_FILE")
+  DOCKER_COMPOSE='fake_compose'
+  DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+  DEPLOY_ROLLBACK_ENV_CONTENT=''
+  DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  NEWAPI_TOOLS_IMAGE='ghcr.io/yujianwudi/new_api_tools:0.5.1'
+  NEWAPI_TOOLS_EXPECTED_REVISION=''
+  FRONTEND_BIND='127.0.0.1'
+  FRONTEND_PORT='1145'
+  ADMIN_PASSWORD='test-password'
+  AUTO_GENERATED_PASSWORD=false
+  USE_HOST_MODE=true
+  USE_BRIDGE_MODE=false
+  NEWAPI_CONTAINER='new-api'
+  NEWAPI_NETWORK=''
+  ORIGINAL_NETWORK=''
+  LOG_NETWORK=''
+
+  set +e
+  start_output="$(start_services 2>&1)"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$start_output" >&2
+    return "$status"
+  fi
+  printf '%s|%s|%s|%s\n' \
+    "$status" \
+    "$(paste -sd, "$order_file")" \
+    "$(env_file_value "$ENV_FILE" 'NEWAPI_TOOLS_IMAGE')" \
+    "$([[ -e "${ENV_FILE}.rollback" || -L "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'deploy first install commits a healthy candidate without requiring a nonexistent rollback snapshot' \
+  "0|pull,pin,up-start,up-wait|${resolved_test_image}|absent" \
+  deploy_first_install_commits_without_rollback_snapshot
 
 deploy_rollback_ignores_candidate_exports() (
   local fixture order_file status
@@ -1628,19 +1731,20 @@ deploy_custom_project_identity_transaction() (
   (start_services >/dev/null 2>&1)
   status=$?
   set -e
-  printf '%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s\n' \
     "$status" "$(paste -sd, "$order_file")" \
     "$(env_file_value "$ENV_FILE" COMPOSE_PROJECT_NAME)" \
-    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)"
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$([[ -e "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
 )
 
 assert_eq \
   'candidate down/up stays in the explicit old Compose project and commits that identity' \
-  "0|pull:old-project,pin,down:old-project,up:old-project,up:old-project:wait|old-project|${resolved_test_image}" \
+  "0|pull:old-project,pin,down:old-project,up:old-project,up:old-project:wait|old-project|${resolved_test_image}|absent" \
   deploy_custom_project_identity_transaction true
 assert_eq \
   'an inline-only historical Compose project is recovered from the running container label' \
-  "0|pull:old-project,pin,down:old-project,up:old-project,up:old-project:wait|old-project|${resolved_test_image}" \
+  "0|pull:old-project,pin,down:old-project,up:old-project,up:old-project:wait|old-project|${resolved_test_image}|absent" \
   deploy_custom_project_identity_transaction false
 
 deploy_compose_project_conflict() (
@@ -2007,6 +2111,1251 @@ assert_eq \
   'installer aborts without tag inspection or dotenv mutation when container enumeration fails' \
   '1||ghcr.io/yujianwudi/new_api_tools:0.2.0' \
   install_container_listing_failure_is_fail_closed
+
+deploy_capture_persists_complete_snapshot() (
+  local fixture
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.2.0' \
+    'ADMIN_PASSWORD=old-secret' \
+    "SQL_DSN='host=old-db password=old-db-secret'" \
+    "LOG_SQL_DSN='host=old-log password=old-log-secret'" \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' > "$ENV_FILE"
+  log_warn() { :; }
+  resolve_deploy_running_compose_project() { printf 'old-project\n'; }
+  resolve_deploy_running_image_digest() { printf '%s\n' "$previous_test_image"; }
+
+  capture_deploy_rollback_env 'newapi-tools'
+
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "${ENV_FILE}.rollback" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "${ENV_FILE}.rollback" COMPOSE_PROJECT_NAME)" \
+    "$(env_file_value "${ENV_FILE}.rollback" ADMIN_PASSWORD)" \
+    "$(env_file_value "${ENV_FILE}.rollback" SQL_DSN)" \
+    "$(env_file_value "${ENV_FILE}.rollback" LOG_SQL_DSN)" \
+    "$(env_file_value "${ENV_FILE}.rollback" NEWAPI_NETWORK)" \
+    "$(stat -c '%a' "${ENV_FILE}.rollback")" \
+    "$DEPLOY_ROLLBACK_ENV_AVAILABLE"
+)
+
+assert_eq \
+  'deploy atomically captures a mode-600 complete rollback dotenv before regeneration' \
+  "ghcr.io/yujianwudi/new_api_tools:0.2.0|${previous_test_image}|old-project|old-secret|host=old-db password=old-db-secret|host=old-log password=old-log-secret|old-network|600|true" \
+  deploy_capture_persists_complete_snapshot
+
+deploy_capture_rejects_permissive_snapshot() (
+  local fixture
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'ADMIN_PASSWORD=candidate-secret' > "$ENV_FILE"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${ENV_FILE}.rollback"
+  chmod 640 "${ENV_FILE}.rollback"
+  log_warn() { :; }
+  resolve_deploy_running_compose_project() { printf 'candidate-project\n'; }
+  resolve_deploy_running_image_digest() { printf '%s\n' "$resolved_test_image"; }
+  capture_deploy_rollback_env 'newapi-tools'
+)
+
+assert_rejected \
+  'deploy rejects a preexisting rollback snapshot unless its permissions are exactly 0600' \
+  deploy_capture_rejects_permissive_snapshot
+
+deploy_recovers_snapshot_after_candidate_start_crash() (
+  local fixture order_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$ENV_FILE"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    "SQL_DSN='host=old-db password=old-db-secret'" \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' > "${ENV_FILE}.rollback"
+  chmod 600 "${ENV_FILE}.rollback"
+
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  resolve_deploy_running_compose_project() {
+    printf 'resolver-project-called\n' >> "$order_file"
+    printf 'candidate-project\n'
+  }
+  resolve_deploy_running_image_digest() {
+    printf 'resolver-image-called\n' >> "$order_file"
+    printf '%s\n' "$resolved_test_image"
+  }
+  configure_deploy_context_from_env() {
+    printf 'configure:%s:%s\n' \
+      "$(env_file_value "$1" ADMIN_PASSWORD)" \
+      "$(env_file_value "$1" NEWAPI_TOOLS_IMAGE)" >> "$order_file"
+  }
+  run_deploy_compose() {
+    printf '%s:%s\n' "$3" "$2" >> "$order_file"
+  }
+  start_deploy_services_and_wait() {
+    printf 'start:%s:%s:%s\n' \
+      "$1" "$2" "$(env_file_value "$ENV_FILE" ADMIN_PASSWORD)" >> "$order_file"
+  }
+
+  capture_deploy_rollback_env 'newapi-tools'
+  local captured_image captured_project
+  captured_image="$(env_file_value "${ENV_FILE}.rollback" NEWAPI_TOOLS_IMAGE)"
+  captured_project="$(env_file_value "${ENV_FILE}.rollback" COMPOSE_PROJECT_NAME)"
+  recover_preexisting_deploy_rollback_snapshot
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$captured_image" \
+    "$captured_project" \
+    "$(env_file_value "${ENV_FILE}.rollback" ADMIN_PASSWORD)" \
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$ENV_FILE" ADMIN_PASSWORD)" \
+    "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'a crash after candidate start restores the authoritative old snapshot without adopting candidate identity' \
+  "${previous_test_image}|old-project|old-secret|${previous_test_image}|old-secret|false|configure:old-secret:${previous_test_image},down:${previous_test_image},start:rollback:${previous_test_image}:old-secret" \
+  deploy_recovers_snapshot_after_candidate_start_crash
+
+deploy_recovers_snapshot_after_down_crash_without_container() (
+  local fixture order_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' > "${ENV_FILE}.rollback"
+  chmod 600 "${ENV_FILE}.rollback"
+
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  configure_deploy_context_from_env() {
+    printf 'configure:%s\n' "$(env_file_value "$1" NEWAPI_TOOLS_IMAGE)" >> "$order_file"
+  }
+  run_deploy_compose() {
+    printf '%s:%s\n' "$3" "$2" >> "$order_file"
+  }
+  start_deploy_services_and_wait() {
+    printf 'start:%s:%s\n' "$1" "$2" >> "$order_file"
+  }
+
+  capture_deploy_rollback_env ''
+  recover_preexisting_deploy_rollback_snapshot
+  printf '%s|%s|%s|%s\n' \
+    "$DEPLOY_ROLLBACK_ENV_AVAILABLE" \
+    "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" \
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'a crash after compose down restores the old snapshot even when no tool container remains' \
+  "true|false|${previous_test_image}|configure:${previous_test_image},down:${previous_test_image},start:rollback:${previous_test_image}" \
+  deploy_recovers_snapshot_after_down_crash_without_container
+
+deploy_snapshot_symlink_directory_race_is_safe() (
+  local fixture called=0 status target_kind attacker_files
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  mkdir "${fixture}/attacker"
+  sync() {
+    called=$((called + 1))
+    if [[ "$called" == "1" ]]; then
+      ln -s "${fixture}/attacker" "${ENV_FILE}.rollback"
+    fi
+    return 0
+  }
+  set +e
+  persist_deploy_rollback_snapshot 'ADMIN_PASSWORD=top-secret' 2>/dev/null
+  status=$?
+  set -e
+  target_kind="$([[ -f "${ENV_FILE}.rollback" && ! -L "${ENV_FILE}.rollback" ]] && printf regular || printf unsafe)"
+  attacker_files="$(find "${fixture}/attacker" -type f | wc -l | tr -d '[:space:]')"
+  printf '%s|%s|%s|%s|%s\n' \
+    "$status" "$target_kind" "$attacker_files" \
+    "$(env_file_value "${ENV_FILE}.rollback" ADMIN_PASSWORD)" \
+    "$(stat -c '%a' "${ENV_FILE}.rollback")"
+)
+
+assert_eq \
+  'rollback snapshot rename does not follow a concurrently inserted symlink-to-directory' \
+  '0|regular|0|top-secret|600' \
+  deploy_snapshot_symlink_directory_race_is_safe
+
+deploy_snapshot_directory_race_fails_closed() (
+  local fixture called=0 status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  sync() {
+    called=$((called + 1))
+    if [[ "$called" == "1" ]]; then
+      mkdir "${ENV_FILE}.rollback"
+    fi
+    return 0
+  }
+  set +e
+  persist_deploy_rollback_snapshot 'ADMIN_PASSWORD=top-secret' 2>/dev/null
+  status=$?
+  set -e
+  printf '%s|%s|%s\n' \
+    "$status" \
+    "$([[ -d "${ENV_FILE}.rollback" ]] && printf directory || printf other)" \
+    "$(find "${ENV_FILE}.rollback" -type f | wc -l | tr -d '[:space:]')"
+)
+
+assert_eq \
+  'rollback snapshot persistence fails closed when a directory is inserted before rename' \
+  '1|directory|0' \
+  deploy_snapshot_directory_race_fails_closed
+
+install_recovers_persistent_snapshot() (
+  local container_mode="$1" fixture order_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  local env_file="${fixture}/.env"
+  : > "${fixture}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$env_file"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' > "${env_file}.rollback"
+  chmod 600 "${env_file}.rollback"
+
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  list_install_container_names() {
+    printf 'container-list-called\n' >> "$order_file"
+    [[ "$container_mode" == 'candidate' ]] && printf 'newapi-tools\n'
+  }
+  resolve_install_running_compose_project() {
+    printf 'project-resolver-called\n' >> "$order_file"
+    return 1
+  }
+  resolve_install_running_image_digest() {
+    printf 'image-resolver-called\n' >> "$order_file"
+    return 1
+  }
+  setup_compose_files() { unset COMPOSE_FILE; }
+  run_install_compose() {
+    printf '%s:%s\n' "${*: -1}" "$3" >> "$order_file"
+  }
+  start_install_services_and_wait() {
+    printf 'start:%s:%s\n' "$3" "$4" >> "$order_file"
+  }
+
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  prepare_install_rollback_transaction "$env_file" "$fixture"
+  printf '%s|%s|%s|%s|%s|%s\n' \
+    "$INSTALL_ROLLBACK_ENV_AVAILABLE" \
+    "$INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING" \
+    "$(env_file_value "$env_file" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$env_file" ADMIN_PASSWORD)" \
+    "$NEWAPI_TOOLS_IMAGE" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'installer restores a persistent old snapshot after candidate-start-before-commit crash' \
+  "true|false|${previous_test_image}|old-secret|${resolved_test_image}|down:${previous_test_image},start:rollback:${previous_test_image}" \
+  install_recovers_persistent_snapshot candidate
+
+assert_eq \
+  'installer restores a persistent old snapshot when a crash after down left no container' \
+  "true|false|${previous_test_image}|old-secret|${resolved_test_image}|down:${previous_test_image},start:rollback:${previous_test_image}" \
+  install_recovers_persistent_snapshot none
+
+install_recovers_before_management_menu() (
+  local fixture order_file target_dir
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  target_dir="${fixture}/new_api_tools"
+  mkdir -p "$target_dir"
+  : > "${target_dir}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "${target_dir}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${target_dir}/.env.rollback"
+  chmod 600 "${target_dir}/.env.rollback"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  setup_compose_files() { unset COMPOSE_FILE; }
+  run_install_compose() { printf 'recover-down\n' >> "$order_file"; }
+  start_install_services_and_wait() { printf 'recover-start\n' >> "$order_file"; }
+  show_management_menu() { printf 'menu\n' >> "$order_file"; }
+  docker() {
+    [[ "${1:-} ${2:-}" == 'ps --format' ]] && printf 'newapi-tools\n'
+  }
+
+  INSTALL_DIR="$fixture"
+  unset NEWAPI_TOOLS_IMAGE
+  check_existing_installation
+  prepare_install_rollback_transaction "${target_dir}/.env" "$target_dir"
+  printf '%s|%s|%s|%s\n' \
+    "$(env_file_value "${target_dir}/.env" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "${target_dir}/.env" ADMIN_PASSWORD)" \
+    "$([[ -n "${NEWAPI_TOOLS_IMAGE+x}" ]] && printf set || printf unset)" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'installer restores an interrupted transaction before exposing management actions' \
+  "${previous_test_image}|old-secret|unset|recover-down,recover-start,menu" \
+  install_recovers_before_management_menu
+
+install_persistent_transaction_result() (
+  local candidate_status="$1" fixture status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  local env_file="${fixture}/.env"
+  : > "${fixture}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$env_file"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${env_file}.rollback"
+  chmod 600 "${env_file}.rollback"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  list_install_container_names() { printf 'newapi-tools\n'; }
+  setup_compose_files() { unset COMPOSE_FILE; }
+  run_install_compose() { :; }
+  start_install_services_and_wait() {
+    [[ "$3" == 'candidate' ]] && return "$candidate_status"
+    return 0
+  }
+
+  INSTALL_ROLLBACK_ENV_AVAILABLE=true
+  INSTALL_ROLLBACK_ENV_CONTENT="$(<"${env_file}.rollback")"
+  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE='old-project'
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  set +e
+  (restart_install_services_transactionally "$env_file" "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s\n' \
+    "$status" \
+    "$(env_file_value "$env_file" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$env_file" ADMIN_PASSWORD)" \
+    "$([[ -e "${env_file}.rollback" || -L "${env_file}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'installer durably commits a healthy candidate before clearing its rollback snapshot' \
+  "0|${resolved_test_image}|candidate-secret|absent" \
+  install_persistent_transaction_result 0
+
+assert_eq \
+  'installer retains the rollback snapshot and restores the full old dotenv after candidate failure' \
+  "1|${previous_test_image}|old-secret|present" \
+  install_persistent_transaction_result 42
+
+deploy_fresh_preseeded_env_has_no_false_rollback() (
+  local fixture before after
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  cp "${REPO_ROOT}/.env.example" "$ENV_FILE"
+  before="$(sha256sum "$ENV_FILE" | awk '{print $1}')"
+  capture_deploy_rollback_env ''
+  after="$(sha256sum "$ENV_FILE" | awk '{print $1}')"
+  printf '%s|%s|%s\n' \
+    "$DEPLOY_ROLLBACK_ENV_AVAILABLE" \
+    "$([[ -e "${ENV_FILE}.rollback" || -L "${ENV_FILE}.rollback" ]] && printf present || printf absent)" \
+    "$([[ "$before" == "$after" ]] && printf unchanged || printf changed)"
+)
+
+assert_eq \
+  'deploy treats a copied fresh .env.example with empty image identity as first-install input' \
+  'false|absent|unchanged' \
+  deploy_fresh_preseeded_env_has_no_false_rollback
+
+install_fresh_preseeded_env_has_no_false_rollback() (
+  local fixture env_file before after
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  env_file="${fixture}/.env"
+  cp "${REPO_ROOT}/.env.example" "$env_file"
+  before="$(sha256sum "$env_file" | awk '{print $1}')"
+  list_install_container_names() { return 0; }
+  capture_install_rollback_env "$env_file"
+  after="$(sha256sum "$env_file" | awk '{print $1}')"
+  printf '%s|%s|%s\n' \
+    "$INSTALL_ROLLBACK_ENV_AVAILABLE" \
+    "$([[ -e "${env_file}.rollback" || -L "${env_file}.rollback" ]] && printf present || printf absent)" \
+    "$([[ "$before" == "$after" ]] && printf unchanged || printf changed)"
+)
+
+assert_eq \
+  'installer treats a copied fresh .env.example with empty image identity as first-install input' \
+  'false|absent|unchanged' \
+  install_fresh_preseeded_env_has_no_false_rollback
+
+deploy_stopped_installation_restores_full_env() (
+  local fixture order_file status
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' \
+    'OLD_ONLY=preserve-me' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  resolve_deploy_image_digest() {
+    printf 'mutable-resolver-called\n' >> "$order_file"
+    return 1
+  }
+  capture_deploy_rollback_env ''
+
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.1' \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' \
+    'NEWAPI_NETWORK_MODE=host' \
+    'NEWAPI_NETWORK=' \
+    'NEW_ONLY=remove-me' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  download_geoip_database() { :; }
+  list_deploy_container_names() { return 0; }
+  pin_deploy_image_after_pull() {
+    printf 'pin\n' >> "$order_file"
+    NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+    export NEWAPI_TOOLS_IMAGE
+  }
+  run_deploy_compose() {
+    printf 'compose:%s:%s\n' "$3" "$2" >> "$order_file"
+  }
+  configure_deploy_context_from_env() { :; }
+  start_deploy_services_and_wait() {
+    printf 'start:%s:%s\n' "$1" "$2" >> "$order_file"
+    [[ "$1" == 'rollback' ]]
+  }
+
+  NEWAPI_TOOLS_IMAGE='ghcr.io/yujianwudi/new_api_tools:0.5.1'
+  NEWAPI_TOOLS_EXPECTED_REVISION=''
+  DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  set +e
+  (start_services) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$ENV_FILE" ADMIN_PASSWORD)" \
+    "$(env_file_value "$ENV_FILE" NEWAPI_NETWORK)" \
+    "$(env_file_value "$ENV_FILE" OLD_ONLY)" \
+    "$(grep -c '^NEW_ONLY=' "$ENV_FILE" || true)" \
+    "$([[ -e "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'deploy treats a safe stopped installation as rollback-capable and restores its complete dotenv' \
+  "1|${previous_test_image}|old-secret|old-network|preserve-me|0|present" \
+  deploy_stopped_installation_restores_full_env
+
+deploy_stopped_installation_commits_authoritative_project() (
+  local fixture status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  capture_deploy_rollback_env ''
+
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.1' \
+    'ADMIN_PASSWORD=candidate-secret' \
+    'FRONTEND_BIND=127.0.0.1' \
+    'FRONTEND_PORT=1145' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  download_geoip_database() { :; }
+  list_deploy_container_names() { return 0; }
+  run_deploy_compose() { :; }
+  pin_deploy_image_after_pull() {
+    NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+    export NEWAPI_TOOLS_IMAGE
+  }
+  start_deploy_services_and_wait() { :; }
+
+  NEWAPI_TOOLS_IMAGE='ghcr.io/yujianwudi/new_api_tools:0.5.1'
+  NEWAPI_TOOLS_EXPECTED_REVISION=''
+  FRONTEND_BIND='127.0.0.1'
+  FRONTEND_PORT='1145'
+  ADMIN_PASSWORD='candidate-secret'
+  AUTO_GENERATED_PASSWORD=false
+  set +e
+  (start_services) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s\n' \
+    "$status" \
+    "$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$ENV_FILE" COMPOSE_PROJECT_NAME)" \
+    "$([[ -e "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'deploy durably keeps the stopped installation project when a healthy candidate commits' \
+  "0|${resolved_test_image}|old-project|absent" \
+  deploy_stopped_installation_commits_authoritative_project
+
+deploy_stopped_mutable_image_is_anchored_locally() (
+  local fixture resolver_file
+  fixture="$(mktemp -d)"
+  resolver_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$resolver_file"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.0' \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  resolve_deploy_image_digest() {
+    printf 'called\n' >> "$resolver_file"
+    [[ "$1" == 'ghcr.io/yujianwudi/new_api_tools:0.5.0' && -z "$2" ]] || return 1
+    printf '%s\n' "$previous_test_image"
+  }
+  capture_deploy_rollback_env ''
+  printf '%s|%s|%s\n' \
+    "$(wc -l < "$resolver_file" | tr -d '[:space:]')" \
+    "$(env_file_value "${ENV_FILE}.rollback" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "${ENV_FILE}.rollback" COMPOSE_PROJECT_NAME)"
+)
+
+assert_eq \
+  'deploy anchors a stopped mutable image to one local same-repository digest before migration' \
+  "1|${previous_test_image}|old-project" \
+  deploy_stopped_mutable_image_is_anchored_locally
+
+deploy_stopped_installation_without_project_is_rejected() (
+  local fixture
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'ADMIN_PASSWORD=old-secret' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  capture_deploy_rollback_env ''
+)
+
+assert_rejected \
+  'deploy refuses to guess the Compose project for a stopped installation' \
+  deploy_stopped_installation_without_project_is_rejected
+
+install_stopped_installation_restores_full_env() (
+  local fixture order_file status env_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  env_file="${fixture}/.env"
+  : > "${fixture}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    'NEWAPI_NETWORK_MODE=custom' \
+    'NEWAPI_NETWORK=old-network' \
+    'OLD_ONLY=preserve-me' > "$env_file"
+  chmod 600 "$env_file"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  list_install_container_names() { return 0; }
+  capture_install_rollback_env "$env_file"
+
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' \
+    'NEWAPI_NETWORK_MODE=host' \
+    'NEWAPI_NETWORK=' \
+    'NEW_ONLY=remove-me' > "$env_file"
+  chmod 600 "$env_file"
+  setup_compose_files() { unset COMPOSE_FILE; }
+  run_install_compose() { :; }
+  start_install_services_and_wait() {
+    printf 'start:%s:%s\n' "$3" "$4" >> "$order_file"
+    [[ "$3" == 'rollback' ]]
+  }
+
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  set +e
+  (restart_install_services_transactionally "$env_file" "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(env_file_value "$env_file" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "$env_file" ADMIN_PASSWORD)" \
+    "$(env_file_value "$env_file" NEWAPI_NETWORK)" \
+    "$(env_file_value "$env_file" OLD_ONLY)" \
+    "$(grep -c '^NEW_ONLY=' "$env_file" || true)" \
+    "$([[ -e "${env_file}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'installer snapshots a stopped installation before migration and restores every old setting' \
+  "1|${previous_test_image}|old-secret|old-network|preserve-me|0|present" \
+  install_stopped_installation_restores_full_env
+
+install_stopped_mutable_image_is_anchored_locally() (
+  local fixture resolver_file env_file
+  fixture="$(mktemp -d)"
+  resolver_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$resolver_file"' EXIT
+  env_file="${fixture}/.env"
+  printf '%s\n' \
+    'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools:0.5.0' \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "$env_file"
+  chmod 600 "$env_file"
+  list_install_container_names() { return 0; }
+  resolve_install_image_digest() {
+    printf 'called\n' >> "$resolver_file"
+    [[ "$1" == 'ghcr.io/yujianwudi/new_api_tools:0.5.0' && -z "$2" ]] || return 1
+    printf '%s\n' "$previous_test_image"
+  }
+  capture_install_rollback_env "$env_file"
+  printf '%s|%s|%s\n' \
+    "$(wc -l < "$resolver_file" | tr -d '[:space:]')" \
+    "$(env_file_value "${env_file}.rollback" NEWAPI_TOOLS_IMAGE)" \
+    "$(env_file_value "${env_file}.rollback" COMPOSE_PROJECT_NAME)"
+)
+
+assert_eq \
+  'installer anchors a stopped mutable image to one local same-repository digest before migration' \
+  "1|${previous_test_image}|old-project" \
+  install_stopped_mutable_image_is_anchored_locally
+
+install_stopped_installation_without_project_is_rejected() (
+  local fixture env_file
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  env_file="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'ADMIN_PASSWORD=old-secret' > "$env_file"
+  chmod 600 "$env_file"
+  list_install_container_names() { return 0; }
+  capture_install_rollback_env "$env_file"
+)
+
+assert_rejected \
+  'installer refuses to guess the Compose project for a stopped installation' \
+  install_stopped_installation_without_project_is_rejected
+
+deploy_uninstall_discards_crash_snapshot() (
+  local fixture order_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$ENV_FILE"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' \
+    "SQL_DSN='host=old-db password=old-db-secret'" > "${ENV_FILE}.rollback"
+  chmod 600 "$ENV_FILE" "${ENV_FILE}.rollback"
+
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  configure_deploy_context_from_env() { :; }
+  run_deploy_compose() {
+    printf '%s:%s:%s\n' \
+      "$3" "$2" "$(env_file_value "$1" ADMIN_PASSWORD)" >> "$order_file"
+  }
+  start_deploy_services_and_wait() { printf 'unexpected-recovery\n' >> "$order_file"; }
+
+  uninstall
+  capture_deploy_rollback_env ''
+  recover_preexisting_deploy_rollback_snapshot
+  printf '%s|%s|%s|%s|%s\n' \
+    "$([[ -e "$ENV_FILE" || -L "$ENV_FILE" ]] && printf present || printf absent)" \
+    "$([[ -e "${ENV_FILE}.rollback" || -L "${ENV_FILE}.rollback" ]] && printf present || printf absent)" \
+    "$DEPLOY_ROLLBACK_ENV_AVAILABLE" \
+    "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'deploy uninstall durably discards a crash snapshot so the next deploy cannot resurrect old secrets or services' \
+  "absent|absent|false|false|down:${previous_test_image}:old-secret" \
+  deploy_uninstall_discards_crash_snapshot
+
+deploy_uninstall_cleanup_failure_keeps_recovery_files() (
+  local fixture status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$ENV_FILE"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${ENV_FILE}.rollback"
+  chmod 600 "$ENV_FILE" "${ENV_FILE}.rollback"
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  configure_deploy_context_from_env() { :; }
+  run_deploy_compose() { return 42; }
+  set +e
+  (uninstall) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s\n' \
+    "$status" \
+    "$([[ -f "$ENV_FILE" ]] && printf present || printf absent)" \
+    "$([[ -f "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'deploy uninstall never deletes recovery secrets or reports success after service cleanup fails' \
+  '1|present|present' \
+  deploy_uninstall_cleanup_failure_keeps_recovery_files
+
+install_purge_discards_project_snapshot_durably() (
+  local fixture project_dir order_file
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file"' EXIT
+  project_dir="${fixture}/new_api_tools"
+  mkdir -p "$project_dir"
+  : > "${project_dir}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${project_dir}/.env"
+  cp "${project_dir}/.env" "${project_dir}/.env.rollback"
+  chmod 600 "${project_dir}/.env" "${project_dir}/.env.rollback"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  run_install_compose() { printf 'down\n' >> "$order_file"; }
+  docker() { return 0; }
+  (do_purge_interactive "$project_dir" <<< 'DELETE') >/dev/null 2>&1
+  printf '%s|%s\n' \
+    "$([[ -e "$project_dir" || -L "$project_dir" ]] && printf present || printf absent)" \
+    "$(paste -sd, "$order_file")"
+)
+
+assert_eq \
+  'installer purge removes the project rollback snapshot only after successful service cleanup and parent sync' \
+  'absent|down' \
+  install_purge_discards_project_snapshot_durably
+
+install_purge_cleanup_failure_keeps_project_snapshot() (
+  local fixture project_dir status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project_dir="${fixture}/new_api_tools"
+  mkdir -p "$project_dir"
+  : > "${project_dir}/docker-compose.yml"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${previous_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=old-secret' > "${project_dir}/.env"
+  cp "${project_dir}/.env" "${project_dir}/.env.rollback"
+  chmod 600 "${project_dir}/.env" "${project_dir}/.env.rollback"
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  run_install_compose() { return 42; }
+  docker() { return 0; }
+  set +e
+  (do_purge_interactive "$project_dir" <<< 'DELETE') >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s\n' \
+    "$status" \
+    "$([[ -d "$project_dir" ]] && printf present || printf absent)" \
+    "$([[ -f "${project_dir}/.env.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'installer purge retains the full project and crash snapshot when service cleanup fails' \
+  '1|present|present' \
+  install_purge_cleanup_failure_keeps_project_snapshot
+
+deploy_uninstall_without_config_rejects_live_container() (
+  local fixture
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  list_deploy_container_names() { printf 'newapi-tools\n'; }
+  uninstall
+)
+
+assert_rejected \
+  'deploy uninstall refuses to report success when a live project container has no auditable config' \
+  deploy_uninstall_without_config_rejects_live_container
+
+deploy_durable_delete_sync_failure_is_rejected() (
+  local fixture target
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  target="${fixture}/secret.env"
+  printf 'secret\n' > "$target"
+  sync() { return 1; }
+  durable_remove_deploy_file "$target"
+)
+
+assert_rejected \
+  'deploy durable config deletion reports a parent-directory sync failure' \
+  deploy_durable_delete_sync_failure_is_rejected
+
+install_durable_tree_sync_failure_is_rejected() (
+  local fixture target
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  target="${fixture}/new_api_tools"
+  mkdir -p "$target"
+  printf 'secret\n' > "${target}/.env.rollback"
+  sync() { return 1; }
+  durable_remove_install_tree "$target"
+)
+
+assert_rejected \
+  'installer durable project deletion reports a parent-directory sync failure' \
+  install_durable_tree_sync_failure_is_rejected
+
+deploy_generate_env_atomic_result() (
+  local mode="$1" fixture status target_kind tmp_count file_mode image password
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  ENV_FILE="${fixture}/.env"
+  SOURCE_SQL_DSN=''
+  DB_ENGINE='postgres'
+  DB_DNS='db.internal'
+  DB_PORT='5432'
+  DB_USER='newapi'
+  DB_PASSWORD='db-secret'
+  DB_NAME='newapi'
+  NEWAPI_CONTAINER='new-api'
+  NEWAPI_NETWORK='old-network'
+  ORIGINAL_NETWORK='bridge'
+  LOG_NETWORK=''
+  LOG_SQL_DSN_FINAL=''
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  NEWAPI_ADMIN_ACCESS_TOKEN=''
+  NEWAPI_ADMIN_USER_ID='0'
+  NEWAPI_REDIS_DISABLED=false
+  ADMIN_PASSWORD='admin-secret'
+  API_KEY='api-secret'
+  API_KEY_ROLE='admin'
+  FRONTEND_PORT='1145'
+  FRONTEND_BIND='127.0.0.1'
+  TRUSTED_PROXY_CIDRS='127.0.0.1/32,::1/128'
+  LOG_FRESHNESS_MAX_SECONDS='900'
+  USE_HOST_MODE=false
+  USE_BRIDGE_MODE=false
+  DEPLOY_ENV_GENERATED_THIS_RUN=false
+  unset NEWAPI_BASEURL OBSERVABILITY_TOKEN
+  log_info() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  docker_inspect_env_value() { return 1; }
+  openssl() { printf '%064d\n' 0; }
+  if [[ "$mode" == 'rename-fail' ]]; then
+    mv() { return 1; }
+  fi
+
+  set +e
+  (generate_env_file) >/dev/null 2>&1
+  status=$?
+  set -e
+  target_kind="$([[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] && printf regular || printf absent)"
+  tmp_count="$(find "$fixture" -maxdepth 1 -name '.env.tmp.*' -print | wc -l | tr -d '[:space:]')"
+  file_mode="$([[ -f "$ENV_FILE" ]] && stat -c '%a' "$ENV_FILE" || printf none)"
+  image="$(env_file_value "$ENV_FILE" NEWAPI_TOOLS_IMAGE)"
+  password="$(env_file_value "$ENV_FILE" ADMIN_PASSWORD)"
+  printf '%s|%s|%s|%s|%s|%s\n' \
+    "$status" "$target_kind" "$tmp_count" "$file_mode" "$image" "$password"
+)
+
+assert_eq \
+  'fresh deploy generation atomically publishes one complete mode-600 dotenv' \
+  "0|regular|0|600|${resolved_test_image}|admin-secret" \
+  deploy_generate_env_atomic_result success
+
+assert_eq \
+  'fresh deploy generation leaves no partial dotenv or temp file when rename fails' \
+  '1|absent|0|none||' \
+  deploy_generate_env_atomic_result rename-fail
+
+install_migration_rename_failure_preserves_old_dotenv() (
+  local fixture env_file before after status tmp_count
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  env_file="${fixture}/.env"
+  printf '%s\n' \
+    'NEWAPI_BASEURL=' \
+    'NEWAPI_CONTAINER=new-api-test' \
+    'NEWAPI_NETWORK_MODE=bridge' \
+    'ADMIN_PASSWORD=old-secret' > "$env_file"
+  chmod 640 "$env_file"
+  before="$(sha256sum "$env_file" | awk '{print $1}')"
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  migrate_image_env_file() { :; }
+  openssl() { printf '%064d\n' 0; }
+  docker() { return 1; }
+  mv() { return 1; }
+  set +e
+  (migrate_env_file "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  after="$(sha256sum "$env_file" | awk '{print $1}')"
+  tmp_count="$(find "$fixture" -maxdepth 1 -name '.env.tmp.*' -print | wc -l | tr -d '[:space:]')"
+  printf '%s|%s|%s|%s\n' \
+    "$status" \
+    "$([[ "$before" == "$after" ]] && printf unchanged || printf changed)" \
+    "$(stat -c '%a' "$env_file")" \
+    "$tmp_count"
+)
+
+assert_eq \
+  'installer migration never exposes a partially appended dotenv when rename fails' \
+  '1|unchanged|640|0' \
+  install_migration_rename_failure_preserves_old_dotenv
+
+install_safety_rewrite_rename_failure_preserves_old_dotenv() (
+  local fixture env_file before after status tmp_count
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  env_file="${fixture}/.env"
+  printf '%s\n' \
+    'NEWAPI_CONTAINER=new-api-test' \
+    'ADMIN_PASSWORD=old-secret' > "$env_file"
+  chmod 640 "$env_file"
+  before="$(sha256sum "$env_file" | awk '{print $1}')"
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  docker() { printf 'REDIS_CONN_STRING=\n'; }
+  mv() { return 1; }
+  set +e
+  (sync_newapi_mutation_safety_config "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  after="$(sha256sum "$env_file" | awk '{print $1}')"
+  tmp_count="$(find "$fixture" -maxdepth 1 -name '.env.tmp.*' -print | wc -l | tr -d '[:space:]')"
+  printf '%s|%s|%s|%s\n' \
+    "$status" \
+    "$([[ "$before" == "$after" ]] && printf unchanged || printf changed)" \
+    "$(stat -c '%a' "$env_file")" \
+    "$tmp_count"
+)
+
+assert_eq \
+  'installer safety synchronization keeps the old dotenv intact when atomic rename fails' \
+  '1|unchanged|640|0' \
+  install_safety_rewrite_rename_failure_preserves_old_dotenv
+
+project_lock_path_result() (
+  local fixture project absent_path existing_path relationship
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  absent_path="$(project_state_lock_path "$project")"
+  mkdir "$project"
+  existing_path="$(project_state_lock_path "$project")"
+  [[ "$absent_path" == "$existing_path" ]] && relationship='same' || relationship='different'
+  printf '%s|%s\n' "$relationship" "$(basename -- "$existing_path")"
+)
+
+assert_eq \
+  'first install and existing checkout resolve the same sibling state lock' \
+  'same|.new_api_tools.state.lock' \
+  project_lock_path_result
+
+project_lock_serialization_result() (
+  local fixture project ready release holder blocked_after_purge acquired_after_release
+  local lock_path lock_mode lock_empty
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  mkdir "$project"
+  ready="${fixture}/ready"
+  release="${fixture}/release"
+  mkfifo "$ready" "$release"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+
+  (
+    acquire_deploy_state_lock "$project"
+    printf 'ready\n' > "$ready"
+    read -r _ < "$release"
+  ) &
+  holder=$!
+  read -r _ < "$ready"
+
+  if (acquire_install_state_lock "$project") >/dev/null 2>&1; then
+    blocked_after_purge='not-blocked-before-purge'
+  else
+    blocked_after_purge='blocked-before-purge'
+  fi
+
+  rm -rf -- "$project"
+  if (acquire_install_state_lock "$project") >/dev/null 2>&1; then
+    blocked_after_purge="${blocked_after_purge},not-blocked-after-purge"
+  else
+    blocked_after_purge="${blocked_after_purge},blocked-after-purge"
+  fi
+
+  printf 'release\n' > "$release"
+  wait "$holder"
+  if (acquire_install_state_lock "$project") >/dev/null 2>&1; then
+    acquired_after_release='released'
+  else
+    acquired_after_release='still-blocked'
+  fi
+
+  lock_path="$(project_state_lock_path "$project")"
+  lock_mode="$(stat -c '%a' -- "$lock_path")"
+  [[ ! -s "$lock_path" ]] && lock_empty='empty' || lock_empty='not-empty'
+  printf '%s|%s|%s|%s\n' \
+    "$blocked_after_purge" "$acquired_after_release" "$lock_mode" "$lock_empty"
+)
+
+assert_eq \
+  'deploy/install mutual exclusion survives project purge and leaves a secret-free lock' \
+  'blocked-before-purge,blocked-after-purge|released|600|empty' \
+  project_lock_serialization_result
+
+project_lock_exec_handoff_result() (
+  local fixture project
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  mkdir "$project"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  acquire_install_state_lock "$project"
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    log_error() { :; }
+    acquire_deploy_state_lock "$2"
+    [[ "$DEPLOY_STATE_LOCK_FD" == "$NEWAPI_TOOLS_STATE_LOCK_FD" ]]
+    printf adopted
+  ' _ "${REPO_ROOT}/deploy.sh" "$project"
+)
+
+assert_eq \
+  'installer hands the held flock fd to exec deploy without a self-deadlock window' \
+  'adopted' \
+  project_lock_exec_handoff_result
+
+project_lock_crash_release_result() (
+  local fixture project ready crash holder result
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  ready="${fixture}/ready"
+  crash="${fixture}/crash"
+  mkfifo "$ready" "$crash"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+
+  (
+    acquire_deploy_state_lock "$project"
+    printf 'ready\n' > "$ready"
+    read -r _ < "$crash"
+    kill -KILL "$BASHPID"
+  ) &
+  holder=$!
+  read -r _ < "$ready"
+  printf 'crash\n' > "$crash"
+  wait "$holder" 2>/dev/null || true
+  if (acquire_install_state_lock "$project") >/dev/null 2>&1; then
+    result='released-after-crash'
+  else
+    result='still-locked-after-crash'
+  fi
+  printf '%s\n' "$result"
+)
+
+assert_eq \
+  'kernel releases the project state lock when the maintenance process crashes' \
+  'released-after-crash' \
+  project_lock_crash_release_result
+
+project_lock_symlink_result() (
+  local fixture project lock_path victim status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  mkdir "$project"
+  lock_path="$(project_state_lock_path "$project")"
+  victim="${fixture}/victim"
+  printf 'victim-content\n' > "$victim"
+  ln -s "$victim" "$lock_path"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  set +e
+  (acquire_deploy_state_lock "$project") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s\n' "$status" "$(<"$victim")"
+)
+
+assert_eq \
+  'project state lock refuses a symlink without touching its target' \
+  '1|victim-content' \
+  project_lock_symlink_result
+
+project_lock_mode_repair_result() (
+  local fixture project lock_path
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  mkdir "$project"
+  lock_path="$(project_state_lock_path "$project")"
+  : > "$lock_path"
+  chmod 666 "$lock_path"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  acquire_deploy_state_lock "$project"
+  printf '%s|%s\n' \
+    "$(stat -c '%a' -- "$lock_path")" \
+    "$([[ "$(stat -c '%u' -- "$lock_path")" == "$(id -u)" ]] && printf owner-ok || printf owner-bad)"
+)
+
+assert_eq \
+  'current-user world-writable state lock is repaired and verified as mode 600' \
+  '600|owner-ok' \
+  project_lock_mode_repair_result
+
+project_lock_foreign_owner_result() (
+  local fixture project lock_path status
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  project="${fixture}/new_api_tools"
+  mkdir "$project"
+  lock_path="$(project_state_lock_path "$project")"
+  : > "$lock_path"
+  chmod 600 "$lock_path"
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  state_lock_path_owner() { printf '%s\n' "$(( $(id -u) + 1 ))"; }
+  set +e
+  (acquire_install_state_lock "$project") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s\n' "$status" "$(stat -c '%a' -- "$lock_path")"
+)
+
+assert_eq \
+  'state lock reported as foreign-owned is rejected before opening' \
+  '1|600' \
+  project_lock_foreign_owner_result
+
+project_lock_entrypoint_wiring() {
+  local deploy_count install_count
+  deploy_count="$(grep -cF 'acquire_deploy_state_lock "$SCRIPT_DIR"' "${REPO_ROOT}/deploy.sh")"
+  install_count="$(grep -cF 'acquire_install_state_lock "${INSTALL_DIR}/${PROJECT_NAME}"' "${REPO_ROOT}/install.sh")"
+  printf '%s|%s\n' "$deploy_count" "$install_count"
+}
+
+assert_eq \
+  'mutating deploy and installer entrypoints acquire the shared project state lock' \
+  '2|1' \
+  project_lock_entrypoint_wiring
+
+unsafe_dotenv_write_paths() {
+  grep -En \
+    'cat[[:space:]]*>[[:space:]]*"\$ENV_FILE"|>>[[:space:]]*("\$(ENV_FILE|env_file)"|\.env)|sed[[:space:]]+-i[^#]*(ENV_FILE|env_file|\.env)|rm[[:space:]]+-f[[:space:]]+("\$(ENV_FILE|env_file)"|\.env)' \
+    "${REPO_ROOT}/deploy.sh" "${REPO_ROOT}/install.sh" || true
+}
+
+assert_eq \
+  'deploy and installer contain no truncate/append/sed/rm direct dotenv write path' \
+  '' \
+  unsafe_dotenv_write_paths
 
 deploy_existing_container_without_env_is_fail_closed() (
   local fixture order_file status

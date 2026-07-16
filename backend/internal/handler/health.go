@@ -28,10 +28,11 @@ type newAPIStatusClient interface {
 // HealthHandler owns liveness, readiness, dependency diagnostics, and the
 // version-gated NewAPI capability view for this control-plane process.
 type HealthHandler struct {
-	cfg       *config.Config
-	newAPI    newAPIStatusClient
-	toolStore *toolstore.Store
-	metrics   *observability.Registry
+	cfg              *config.Config
+	newAPI           newAPIStatusClient
+	toolStore        *toolstore.Store
+	metrics          *observability.Registry
+	dependencyProbes dependencyProbeCoordinator
 }
 
 type DependencyCheck struct {
@@ -42,6 +43,32 @@ type DependencyCheck struct {
 	LatencyMS  int64          `json:"latency_ms"`
 	Details    map[string]any `json:"details,omitempty"`
 	OK         bool           `json:"-"`
+}
+
+type dependencyProbe struct {
+	name       string
+	required   bool
+	diagnostic bool
+	check      func(context.Context) DependencyCheck
+}
+
+type dependencyProbeRun struct {
+	probe         dependencyProbe
+	done          chan struct{}
+	result        DependencyCheck
+	completed     bool
+	timedOut      bool
+	timeoutResult DependencyCheck
+}
+
+// dependencyProbeCoordinator bounds dependency work to one live goroutine per
+// probe name. A probe that ignores context cancellation remains the sole owner
+// for that name; later health requests reuse its timeout result instead of
+// leaking another goroutine. Once the probe actually returns, the name becomes
+// eligible for a fresh check.
+type dependencyProbeCoordinator struct {
+	mu     sync.Mutex
+	active map[string]*dependencyProbeRun
 }
 
 func NewHealthHandler(cfg *config.Config, client newAPIStatusClient, store *toolstore.Store, metrics *observability.Registry) *HealthHandler {
@@ -192,38 +219,143 @@ func (h *HealthHandler) DependencyHealth(c *gin.Context) {
 }
 
 func (h *HealthHandler) collectDependencyChecks(ctx context.Context) []DependencyCheck {
-	checks := make([]DependencyCheck, 0, 6)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	add := func(check DependencyCheck) {
-		mu.Lock()
-		checks = append(checks, check)
-		mu.Unlock()
-		h.metrics.SetDependency(check.Name, check.OK)
+	return collectDependencyCheckResults(ctx, h.metrics, &h.dependencyProbes, []dependencyProbe{
+		{name: "main_database", required: true, check: h.checkMainDatabase},
+		{name: "tool_store", required: true, check: h.checkToolStore},
+		{name: "log_database", check: h.checkLogDatabase},
+		{name: "log_freshness", diagnostic: true, check: h.checkLogFreshness},
+		{name: "newapi", check: h.checkNewAPI},
+		{name: "redis", check: h.checkRedis},
+	})
+}
+
+func collectDependencyCheckResults(
+	ctx context.Context,
+	metrics *observability.Registry,
+	coordinator *dependencyProbeCoordinator,
+	probes []dependencyProbe,
+) []DependencyCheck {
+	if metrics == nil {
+		metrics = observability.Default
 	}
-	run := func(name string, required, diagnostic bool, fn func(context.Context) DependencyCheck) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			started := time.Now()
-			check := fn(ctx)
-			check.Name = name
-			check.Required = required
-			check.Diagnostic = diagnostic
-			check.LatencyMS = time.Since(started).Milliseconds()
-			add(check)
-		}()
+	if coordinator == nil {
+		coordinator = &dependencyProbeCoordinator{}
 	}
 
-	run("main_database", true, false, h.checkMainDatabase)
-	run("tool_store", true, false, h.checkToolStore)
-	run("log_database", false, false, h.checkLogDatabase)
-	run("log_freshness", false, true, h.checkLogFreshness)
-	run("newapi", false, false, h.checkNewAPI)
-	run("redis", false, false, h.checkRedis)
-	wg.Wait()
+	unique := make([]dependencyProbe, 0, len(probes))
+	seen := make(map[string]struct{}, len(probes))
+	for _, probe := range probes {
+		if _, exists := seen[probe.name]; exists {
+			continue
+		}
+		seen[probe.name] = struct{}{}
+		unique = append(unique, probe)
+	}
+
+	collectionStarted := time.Now()
+	results := make(chan DependencyCheck, len(unique))
+	for _, probe := range unique {
+		run, cached := coordinator.acquire(ctx, probe)
+		if cached != nil {
+			results <- *cached
+			continue
+		}
+		go func(run *dependencyProbeRun) {
+			results <- coordinator.wait(ctx, run, collectionStarted)
+		}(run)
+	}
+
+	checks := make([]DependencyCheck, 0, len(unique))
+	for range unique {
+		check := <-results
+		checks = append(checks, check)
+		metrics.SetDependency(check.Name, check.OK)
+	}
 	sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	return checks
+}
+
+func (c *dependencyProbeCoordinator) acquire(ctx context.Context, probe dependencyProbe) (*dependencyProbeRun, *DependencyCheck) {
+	if err := ctx.Err(); err != nil {
+		check := dependencyProbeTimeout(probe, 0, err)
+		return nil, &check
+	}
+
+	c.mu.Lock()
+	if c.active == nil {
+		c.active = make(map[string]*dependencyProbeRun)
+	}
+	if run := c.active[probe.name]; run != nil {
+		if run.timedOut {
+			check := run.timeoutResult
+			c.mu.Unlock()
+			return nil, &check
+		}
+		c.mu.Unlock()
+		return run, nil
+	}
+	run := &dependencyProbeRun{probe: probe, done: make(chan struct{})}
+	c.active[probe.name] = run
+	c.mu.Unlock()
+
+	go c.execute(ctx, run)
+	return run, nil
+}
+
+func (c *dependencyProbeCoordinator) execute(ctx context.Context, run *dependencyProbeRun) {
+	started := time.Now()
+	check := run.probe.check(ctx)
+	check.Name = run.probe.name
+	check.Required = run.probe.required
+	check.Diagnostic = run.probe.diagnostic
+	check.LatencyMS = time.Since(started).Milliseconds()
+
+	c.mu.Lock()
+	run.result = check
+	run.completed = true
+	if c.active[run.probe.name] == run {
+		delete(c.active, run.probe.name)
+	}
+	c.mu.Unlock()
+	close(run.done)
+}
+
+func (c *dependencyProbeCoordinator) wait(ctx context.Context, run *dependencyProbeRun, collectionStarted time.Time) DependencyCheck {
+	select {
+	case <-run.done:
+		return run.result
+	case <-ctx.Done():
+		return c.timeout(run, collectionStarted, ctx.Err())
+	}
+}
+
+func (c *dependencyProbeCoordinator) timeout(run *dependencyProbeRun, collectionStarted time.Time, err error) DependencyCheck {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if run.completed {
+		return run.result
+	}
+	if !run.timedOut {
+		run.timedOut = true
+		run.timeoutResult = dependencyProbeTimeout(run.probe, time.Since(collectionStarted), err)
+	}
+	return run.timeoutResult
+}
+
+func dependencyProbeTimeout(probe dependencyProbe, elapsed time.Duration, err error) DependencyCheck {
+	details := map[string]any{"probe_state": "still_running"}
+	if err != nil {
+		details["error"] = err.Error()
+	}
+	return DependencyCheck{
+		Name:       probe.name,
+		Status:     "timeout",
+		Required:   probe.required,
+		Diagnostic: probe.diagnostic,
+		LatencyMS:  elapsed.Milliseconds(),
+		Details:    details,
+		OK:         false,
+	}
 }
 
 func (h *HealthHandler) checkMainDatabase(ctx context.Context) DependencyCheck {

@@ -375,6 +375,20 @@ func TestTopUpAggregateQueriesPropagateDatabaseErrors(t *testing.T) {
 	}
 }
 
+func TestNormalizeTopUpFinancialMonths(t *testing.T) {
+	for input, want := range map[int]int{
+		-1: defaultTopUpFinancialMonths,
+		0:  defaultTopUpFinancialMonths,
+		1:  1,
+		24: maxTopUpFinancialMonths,
+		25: defaultTopUpFinancialMonths,
+	} {
+		if got := normalizeTopUpFinancialMonths(input); got != want {
+			t.Fatalf("normalizeTopUpFinancialMonths(%d) = %d, want %d", input, got, want)
+		}
+	}
+}
+
 func TestTopUpFunnelPropagatesAverageCompletionQueryError(t *testing.T) {
 	clearTopUpAnalyticsCache(t)
 	t.Cleanup(func() { clearTopUpAnalyticsCache(t) })

@@ -129,17 +129,6 @@ func GetSuspiciousUsers(c *gin.Context) {
 
 // POST /api/ai-ban/assess
 func ManualAssess(c *gin.Context) {
-	var req struct {
-		UserID int64  `json:"user_id"`
-		Window string `json:"window"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	if req.Window == "" {
-		req.Window = "1h"
-	}
 	c.JSON(http.StatusNotImplemented, models.ErrorResp(
 		"NOT_IMPLEMENTED",
 		"AI user assessment is not implemented",

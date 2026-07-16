@@ -23,46 +23,56 @@ const legacyRedirects: Record<string, string> = {
   history: '/redemptions?view=history',
 }
 
-// Resolve and normalize both current and historical routes. Invalid history
-// entries are replaced so browser back/forward cannot leave the URL and UI out
-// of sync.
-const resolveTabFromLocation = (): TabType => {
+interface ResolvedRoute {
+  tab: TabType
+  replacePath?: string
+}
+
+// Resolve both current and historical routes without mutating browser history.
+// Normalization is applied from effects or navigation events so rendering stays
+// pure under React Strict Mode and concurrent rendering.
+const resolveRouteFromLocation = (): ResolvedRoute => {
   const pathname = window.location.pathname.replace(/^\/+/, '')
   const mainPath = pathname.split('/')[0]
 
   if (legacyRedirects[mainPath]) {
-    window.history.replaceState(null, '', legacyRedirects[mainPath])
-    return 'redemptions'
+    return { tab: 'redemptions', replacePath: legacyRedirects[mainPath] }
   }
 
   if (validTabs.includes(mainPath as TabType)) {
-    return mainPath as TabType
+    return { tab: mainPath as TabType }
   }
   // 兼容旧的 hash 路由，自动迁移。旧版也曾生成 #risk-ip。
   const hash = window.location.hash.replace(/^#\/?/, '')
   const normalizedHash = hash.startsWith('risk-') ? `risk/${hash.slice('risk-'.length)}` : hash
   const [hashMain, ...hashSubPath] = normalizedHash.split('/')
   if (legacyRedirects[hashMain]) {
-    window.history.replaceState(null, '', legacyRedirects[hashMain])
-    return 'redemptions'
+    return { tab: 'redemptions', replacePath: legacyRedirects[hashMain] }
   }
   if (validTabs.includes(hashMain as TabType)) {
     const subPath = hashSubPath.join('/')
     const newPath = subPath ? `/${hashMain}/${subPath}` : `/${hashMain}`
-    window.history.replaceState(null, '', newPath)
-    return hashMain as TabType
+    return { tab: hashMain as TabType, replacePath: newPath }
   }
 
-  window.history.replaceState(null, '', '/dashboard')
-  return 'dashboard'
+  return { tab: 'dashboard', replacePath: '/dashboard' }
 }
 
 function App() {
   const { isAuthenticated, token, login, logout } = useAuth()
-  const [activeTab, setActiveTab] = useState<TabType>(resolveTabFromLocation)
+  const [activeTab, setActiveTab] = useState<TabType>(() => resolveRouteFromLocation().tab)
   const [warmupState, setWarmupState] = useState<'checking' | 'warming' | 'ready'>('checking')
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
+
+  // Apply initial legacy/hash/invalid-route normalization after render. This
+  // effect is intentionally declared before the active-tab pushState effect.
+  useEffect(() => {
+    const route = resolveRouteFromLocation()
+    if (route.replacePath) {
+      window.history.replaceState(null, '', route.replacePath)
+    }
+  }, [])
 
   // 检查后端预热状态
   useEffect(() => {
@@ -123,7 +133,11 @@ function App() {
   // Listen for popstate (browser back/forward)
   useEffect(() => {
     const handlePopState = () => {
-      setActiveTab(resolveTabFromLocation())
+      const route = resolveRouteFromLocation()
+      if (route.replacePath) {
+        window.history.replaceState(null, '', route.replacePath)
+      }
+      setActiveTab(route.tab)
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)

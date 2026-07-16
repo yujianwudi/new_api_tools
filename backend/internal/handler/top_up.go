@@ -243,6 +243,16 @@ func exportTopUps(c *gin.Context, store *toolstore.Store) {
 			"top-up export intent audit", errors.New("tool store operation failed"))
 		return
 	}
+	recovery, err := createTopUpExportAuditRecovery(
+		c.Request.Context(), store, meta, filters,
+		gin.H{"expected_row_count": total, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv"},
+	)
+	if err != nil {
+		respondHandlerError(c, http.StatusServiceUnavailable, "AUDIT_STORE_UNAVAILABLE",
+			"Export was not started because the audit recovery record could not be persisted",
+			"top-up export pending audit recovery", errors.New("tool store operation failed"))
+		return
+	}
 
 	filename := fmt.Sprintf("top_ups_%s.csv", time.Now().Format("20060102_150405"))
 	c.Header("Content-Type", "text/csv; charset=utf-8")
@@ -283,17 +293,53 @@ func exportTopUps(c *gin.Context, store *toolstore.Store) {
 			errorCode = "EXPORT_CANCELLED"
 		}
 	}
-	auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
-	if err := appendTopUpExportAudit(
-		auditCtx, store, meta, "outcome", status, errorCode, filters,
-		gin.H{
-			"row_count": exportResult.RowsWritten, "expected_row_count": total,
-			"truncated": truncated, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv",
-		},
-	); err != nil {
-		log.Printf("top_ups export outcome audit failed request_id=%s", meta.RequestID)
+	outcomeResult := gin.H{
+		"row_count": exportResult.RowsWritten, "expected_row_count": total,
+		"truncated": truncated, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv",
 	}
+	// Persist the final export evidence in the pre-created recovery record
+	// before attempting the append-only outcome. This closes the crash window
+	// where the outcome append could fail and the process could stop before the
+	// pending record learned the actual row count and terminal status.
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+	pendingRecoveryErr := updateTopUpExportAuditRecovery(
+		recoveryCtx, store, recovery.ID, meta, status, errorCode, filters, outcomeResult, false,
+	)
+	recoveryCancel()
+
+	auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+	auditErr := appendTopUpExportAudit(
+		auditCtx, store, meta, "outcome", status, errorCode, filters,
+		outcomeResult,
+	)
 	auditCancel()
+
+	recoveryErr := pendingRecoveryErr
+	if auditErr == nil {
+		resolvedCtx, resolvedCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+		recoveryErr = updateTopUpExportAuditRecovery(
+			resolvedCtx, store, recovery.ID, meta, status, errorCode, filters, outcomeResult, true,
+		)
+		resolvedCancel()
+	} else if pendingRecoveryErr != nil {
+		// A transient failure while storing the final pending evidence must not
+		// be allowed to combine with the failed outcome append without one last
+		// detached retry. The original prebuilt snapshot still remains if the
+		// Tool Store itself is unavailable.
+		retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+		recoveryErr = updateTopUpExportAuditRecovery(
+			retryCtx, store, recovery.ID, meta, status, errorCode, filters, outcomeResult, false,
+		)
+		retryCancel()
+	}
+
+	if auditErr != nil && recoveryErr != nil {
+		log.Printf("top_ups export outcome audit failed; durable pending recovery could not retain final evidence request_id=%s", meta.RequestID)
+	} else if auditErr != nil {
+		log.Printf("top_ups export outcome audit queued for reconciliation request_id=%s", meta.RequestID)
+	} else if recoveryErr != nil {
+		log.Printf("top_ups export outcome audit persisted but pending recovery could not be resolved request_id=%s", meta.RequestID)
+	}
 	if exportErr != nil {
 		// 响应头已发出，无法切回 JSON。CSV 末尾追加注释会污染 Excel 解析，
 		// 这里仅 server log，前端通过文件最后一行可观察到截断。
@@ -343,4 +389,102 @@ func appendTopUpExportAudit(
 		IdempotencyKey: "export:" + meta.RequestID + ":" + phase,
 	})
 	return err
+}
+
+func createTopUpExportAuditRecovery(
+	ctx context.Context,
+	store *toolstore.Store,
+	meta controlplane.OperationMeta,
+	filters any,
+	result any,
+) (toolstore.ReconciliationRun, error) {
+	if store == nil {
+		return toolstore.ReconciliationRun{}, toolstore.ErrStoreClosed
+	}
+	summaryJSON, err := topUpExportAuditRecoverySummary(meta, "pending", "", "", filters, result, false)
+	if err != nil {
+		return toolstore.ReconciliationRun{}, err
+	}
+	now := time.Now().UTC()
+	run, err := store.CreateReconciliationRun(ctx, toolstore.ReconciliationRunInput{
+		RunKey: "top-up-export-audit:" + meta.RequestID,
+		Kind:   "top_up_export_audit_outcome", Status: toolstore.ReconciliationRunning,
+		WindowStart: now.Add(-time.Second), WindowEnd: now, StartedAt: now,
+		ScannedCount: 1, MatchedCount: 0, DiscrepancyCount: 1,
+		Currency: "XXX", SummaryJSON: json.RawMessage(summaryJSON),
+		ErrorCode:    "OPERATION_AUDIT_APPEND_PENDING",
+		ErrorMessage: "Top-up export outcome audit has not been finalized",
+	})
+	if err != nil {
+		return toolstore.ReconciliationRun{}, fmt.Errorf("persist top-up export pending audit recovery: %w", err)
+	}
+	return run, nil
+}
+
+func updateTopUpExportAuditRecovery(
+	ctx context.Context,
+	store *toolstore.Store,
+	runID int64,
+	meta controlplane.OperationMeta,
+	status toolstore.OperationStatus,
+	errorCode string,
+	filters any,
+	result any,
+	outcomePersisted bool,
+) error {
+	phase := "pending"
+	reconciliationStatus := toolstore.ReconciliationRunning
+	reconciliationErrorCode := "OPERATION_AUDIT_APPEND_PENDING"
+	reconciliationErrorMessage := "Top-up export outcome audit must be replayed from summary_json"
+	matchedCount := int64(0)
+	discrepancyCount := int64(1)
+	var finishedAt *time.Time
+	if outcomePersisted {
+		phase = "resolved"
+		reconciliationStatus = toolstore.ReconciliationSucceeded
+		reconciliationErrorCode = ""
+		reconciliationErrorMessage = ""
+		matchedCount = 1
+		discrepancyCount = 0
+		finished := time.Now().UTC()
+		finishedAt = &finished
+	}
+	summaryJSON, err := topUpExportAuditRecoverySummary(meta, phase, status, errorCode, filters, result, outcomePersisted)
+	if err != nil {
+		return err
+	}
+	_, err = store.UpdateReconciliationRun(ctx, toolstore.ReconciliationRunUpdate{
+		ID: runID, Status: reconciliationStatus, FinishedAt: finishedAt,
+		ScannedCount: 1, MatchedCount: matchedCount, DiscrepancyCount: discrepancyCount,
+		SummaryJSON: json.RawMessage(summaryJSON), ErrorCode: reconciliationErrorCode,
+		ErrorMessage: reconciliationErrorMessage,
+	})
+	if err != nil {
+		return fmt.Errorf("update top-up export pending audit recovery: %w", err)
+	}
+	return nil
+}
+
+func topUpExportAuditRecoverySummary(
+	meta controlplane.OperationMeta,
+	phase string,
+	status toolstore.OperationStatus,
+	errorCode string,
+	filters any,
+	result any,
+	outcomePersisted bool,
+) ([]byte, error) {
+	summaryJSON, err := json.Marshal(gin.H{
+		"request_id": meta.RequestID,
+		"actor":      meta.Actor, "source_ip": meta.SourceIP, "auth_method": meta.AuthMethod,
+		"action": "top_ups.export.outcome", "target_type": "financial_export", "target_id": meta.RequestID,
+		"reason": meta.Reason, "status": status, "error_code": errorCode,
+		"idempotency_key": "export:" + meta.RequestID + ":outcome",
+		"phase":           phase, "outcome_persisted": outcomePersisted,
+		"filters": filters, "result": result,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal top-up export audit recovery: %w", err)
+	}
+	return summaryJSON, nil
 }

@@ -4,8 +4,46 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8')
-const inlineScript = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
-  .map((match) => match[1])
+
+function isTagNameBoundary(source, index) {
+  const char = source[index]
+  return char === '>' || char === ' ' || char === '\t' || char === '\r' || char === '\n' || char === '\f'
+}
+
+function findTagStart(source, token, cursor) {
+  let index = source.indexOf(token, cursor)
+  while (index !== -1) {
+    if (isTagNameBoundary(source, index + token.length)) return index
+    index = source.indexOf(token, index + token.length)
+  }
+  return -1
+}
+
+function extractInlineScripts(source) {
+  const lowerSource = source.toLowerCase()
+  const scripts = []
+  let cursor = 0
+
+  while (cursor < source.length) {
+    const openStart = findTagStart(lowerSource, '<script', cursor)
+    if (openStart === -1) break
+    const openEnd = source.indexOf('>', openStart)
+    if (openEnd === -1) break
+    const closeStart = findTagStart(lowerSource, '</script', openEnd + 1)
+    if (closeStart === -1) break
+    const closeEnd = source.indexOf('>', closeStart)
+    if (closeEnd === -1) break
+
+    scripts.push(source.slice(openEnd + 1, closeStart))
+    cursor = closeEnd + 1
+  }
+
+  return scripts
+}
+
+assert.deepEqual(extractInlineScripts('<scripture>ignored</scripture>'), [])
+
+const inlineScript = extractInlineScripts(html)
   .find((script) => script.includes('function parseExpirationDays'))
 assert.ok(inlineScript, 'missing redemption generator inline script')
 new vm.Script(inlineScript, { filename: 'index.html:inline-script' })

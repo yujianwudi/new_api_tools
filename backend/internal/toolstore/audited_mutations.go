@@ -193,20 +193,10 @@ func (s *Store) CreateSupportNoteAudited(ctx context.Context, input SupportNoteI
 		if !supportNoteMatchesInput(created, input) {
 			return SupportNote{}, OperationAudit{}, replayConflict("support note create")
 		}
-		stored, err := getSupportNote(ctx, tx, created.ID)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return SupportNote{}, OperationAudit{}, replayConflict("support note create")
-			}
-			return SupportNote{}, OperationAudit{}, err
-		}
-		if !supportNoteMatchesInput(stored, input) {
-			return SupportNote{}, OperationAudit{}, replayConflict("support note create")
-		}
 		if err := tx.Commit(); err != nil {
 			return SupportNote{}, OperationAudit{}, fmt.Errorf("commit audited support note create replay: %w", err)
 		}
-		return stored, existingAudit, nil
+		return created, existingAudit, nil
 	}
 	if _, err := getSupportNoteByIdempotencyKey(ctx, tx, key); err == nil {
 		return SupportNote{}, OperationAudit{}, replayConflict("orphaned support note")

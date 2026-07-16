@@ -1,8 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '../lib/utils'
-import { chunkModelNames, normalizeModelStatusMaxBatch } from '../lib/modelStatusBatch'
-import { Loader2, Timer, Activity, Zap, Sun, Moon, Minimize2, Terminal, Leaf, Droplets, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, Layers, Tag, KeyRound, ChevronDown } from 'lucide-react'
+import {
+  chunkModelNames,
+  mapWithConcurrency,
+  MODEL_STATUS_BATCH_MAX_CONCURRENCY,
+  normalizeModelStatusMaxBatch,
+} from '../lib/modelStatusBatch'
+import { Loader2, RefreshCw, Activity, Zap, Sun, Moon, Minimize2, Terminal, Leaf, Droplets, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, Layers, Tag, KeyRound, ChevronDown } from 'lucide-react'
 import {
   OpenAI, Gemini, DeepSeek, SiliconCloud, Groq, Ollama, Claude, Mistral,
   Minimax, Baichuan, Moonshot, Spark, Qwen, Yi, Hunyuan, Stepfun, ZeroOne,
@@ -46,6 +51,11 @@ interface EmbedTokenGroup {
   models: string[]
   description?: string
   ratio?: number
+}
+
+interface EmbedTokenGroupSyncResult {
+  groups: EmbedTokenGroup[]
+  groupFilter: string
 }
 
 // Custom model group (loaded from backend)
@@ -878,6 +888,17 @@ interface ModelStatusEmbedProps {
 }
 
 const PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH = 50
+const TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES = 5
+
+function embedTokenGroupModelsForFilter(groups: EmbedTokenGroup[], filter: string): string[] {
+  if (!filter.startsWith('token:')) return []
+  const groupName = filter.slice(6)
+  return groups.find(group => group.group_name === groupName)?.models ?? []
+}
+
+function isEmbedAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
 
 export function ModelStatusEmbed({
   refreshInterval: defaultRefreshInterval = 60,
@@ -887,6 +908,7 @@ export function ModelStatusEmbed({
   const [maxBatch, setMaxBatch] = useState(PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [refreshInterval, setRefreshInterval] = useState(defaultRefreshInterval)
   const [countdown, setCountdown] = useState(defaultRefreshInterval)
@@ -898,6 +920,10 @@ export function ModelStatusEmbed({
   const [siteTitle, setSiteTitle] = useState('')
   const statusRequestIdRef = useRef(0)
   const statusRequestControllerRef = useRef<AbortController | null>(null)
+  const tokenGroupRequestIdRef = useRef(0)
+  const tokenGroupRequestControllerRef = useRef<AbortController | null>(null)
+  const groupFilterRef = useRef(groupFilter)
+  const automaticStatusRefreshCountRef = useRef(0)
 
   // Tooltip state - lifted to parent to avoid z-index/transform issues
   const [hoveredSlot, setHoveredSlot] = useState<SlotStatus | null>(null)
@@ -925,7 +951,7 @@ export function ModelStatusEmbed({
       }
       setMaxBatch(normalizeModelStatusMaxBatch(data.max_batch, PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH))
       if (data.success) {
-        if (Array.isArray(data.data)) {
+        if (Array.isArray(data.data) && data.data.every((model: unknown) => typeof model === 'string')) {
           setSelectedModels(data.data)
         }
         if (data.time_window) {
@@ -951,48 +977,79 @@ export function ModelStatusEmbed({
         if (data.site_title) {
           setSiteTitle(data.site_title)
         }
-        // 加载令牌分组
-        try {
-          const tgResponse = await fetch(`${apiUrl}/api/model-status/embed/token-groups`, { signal })
-          const tgData = await tgResponse.json()
-          if (tgResponse.ok && tgData.success && Array.isArray(tgData.data)) {
-            setTokenGroups(tgData.data)
-          }
-        } catch (error) {
-          if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return []
-          // 令牌分组加载失败不影响主流程
-        }
         return data.data || []
       }
     } catch (error) {
-      if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return []
+      if (signal.aborted || isEmbedAbortError(error)) return []
       console.error('Failed to load config from backend:', error)
     }
     return []
   }, [apiUrl])
 
+  const fetchTokenGroups = useCallback(async (): Promise<EmbedTokenGroupSyncResult | null | undefined> => {
+    const requestId = ++tokenGroupRequestIdRef.current
+    tokenGroupRequestControllerRef.current?.abort()
+    const controller = new AbortController()
+    tokenGroupRequestControllerRef.current = controller
+
+    try {
+      const response = await fetch(`${apiUrl}/api/model-status/embed/token-groups`, {
+        signal: controller.signal,
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success || !Array.isArray(data.data)) {
+        throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
+      }
+      if (requestId !== tokenGroupRequestIdRef.current) return undefined
+
+      const groups = data.data as EmbedTokenGroup[]
+      setTokenGroups(groups)
+
+      let nextGroupFilter = groupFilterRef.current
+      if (nextGroupFilter.startsWith('token:') && !groups.some(group => `token:${group.group_name}` === nextGroupFilter)) {
+        nextGroupFilter = 'all'
+        groupFilterRef.current = nextGroupFilter
+        setGroupFilter(nextGroupFilter)
+      }
+
+      return { groups, groupFilter: nextGroupFilter }
+    } catch (error) {
+      if (controller.signal.aborted || requestId !== tokenGroupRequestIdRef.current || isEmbedAbortError(error)) {
+        return undefined
+      }
+      console.error('Failed to fetch token groups:', error)
+      return null
+    } finally {
+      if (requestId === tokenGroupRequestIdRef.current && tokenGroupRequestControllerRef.current === controller) {
+        tokenGroupRequestControllerRef.current = null
+      }
+    }
+  }, [apiUrl])
+
   useEffect(() => {
     const controller = new AbortController()
     void loadConfig(controller.signal)
+    void fetchTokenGroups()
     return () => controller.abort()
-  }, [loadConfig])
+  }, [fetchTokenGroups, loadConfig])
+
+  useEffect(() => {
+    groupFilterRef.current = groupFilter
+  }, [groupFilter])
 
   useEffect(() => () => {
     statusRequestIdRef.current += 1
     statusRequestControllerRef.current?.abort()
+    tokenGroupRequestIdRef.current += 1
+    tokenGroupRequestControllerRef.current?.abort()
   }, [])
 
   // Fetch model statuses
   // Embed page always uses cache to reduce database load
-  const fetchModelStatuses = useCallback(async () => {
+  const fetchModelStatuses = useCallback(async (tokenGroupModelsOverride?: readonly string[]) => {
     // 选中某个密钥分组时，自动把分组下全部模型并入请求集合，
     // 用户无需手工把每个模型加进监控列表也能看到分组下的状态。
-    const tokenGroupModels = (() => {
-      if (!groupFilter.startsWith('token:')) return [] as string[]
-      const name = groupFilter.slice(6)
-      const tg = tokenGroups.find(g => g.group_name === name)
-      return tg ? tg.models : []
-    })()
+    const tokenGroupModels = tokenGroupModelsOverride ?? embedTokenGroupModelsForFilter(tokenGroups, groupFilter)
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
     const requestId = ++statusRequestIdRef.current
     statusRequestControllerRef.current?.abort()
@@ -1007,25 +1064,29 @@ export function ModelStatusEmbed({
     const controller = new AbortController()
     statusRequestControllerRef.current = controller
     try {
-      const chunkResults = await Promise.all(chunkModelNames(fetchSet, maxBatch).map(async modelNames => {
-        const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${timeWindow}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(modelNames),
-          signal: controller.signal,
-        })
-        const data = await response.json()
-        if (!response.ok || !data.success) {
-          throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
-        }
-        if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
-        return data.data as ModelStatus[]
-      }))
+      const chunkResults = await mapWithConcurrency(
+        chunkModelNames(fetchSet, maxBatch),
+        MODEL_STATUS_BATCH_MAX_CONCURRENCY,
+        async modelNames => {
+          const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${timeWindow}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(modelNames),
+            signal: controller.signal,
+          })
+          const data = await response.json()
+          if (!response.ok || !data.success) {
+            throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
+          }
+          if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
+          return data.data as ModelStatus[]
+        },
+      )
       if (requestId !== statusRequestIdRef.current) return
       setModelStatuses(chunkResults.flat())
       setLastUpdate(new Date())
     } catch (error) {
-      if (controller.signal.aborted || requestId !== statusRequestIdRef.current || (error instanceof DOMException && error.name === 'AbortError')) return
+      if (controller.signal.aborted || requestId !== statusRequestIdRef.current || isEmbedAbortError(error)) return
       controller.abort()
       console.error('Failed to fetch model statuses:', error)
     } finally {
@@ -1036,8 +1097,36 @@ export function ModelStatusEmbed({
     }
   }, [apiUrl, selectedModels, timeWindow, groupFilter, tokenGroups, maxBatch])
 
+  const refreshStatusesWithLatestTokenGroups = useCallback(async () => {
+    const tokenGroupSync = await fetchTokenGroups()
+    if (tokenGroupSync === undefined) return
+    const tokenGroupModels = tokenGroupSync === null
+      ? undefined
+      : embedTokenGroupModelsForFilter(tokenGroupSync.groups, tokenGroupSync.groupFilter)
+    await fetchModelStatuses(tokenGroupModels)
+  }, [fetchModelStatuses, fetchTokenGroups])
+
+  const runAutomaticRefresh = useCallback(async () => {
+    automaticStatusRefreshCountRef.current += 1
+    if (automaticStatusRefreshCountRef.current % TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES === 0) {
+      await refreshStatusesWithLatestTokenGroups()
+      return
+    }
+    await fetchModelStatuses()
+  }, [fetchModelStatuses, refreshStatusesWithLatestTokenGroups])
+
+  const handleManualRefresh = useCallback(async () => {
+    setRefreshing(true)
+    setCountdown(refreshInterval)
+    try {
+      await refreshStatusesWithLatestTokenGroups()
+    } finally {
+      setRefreshing(false)
+    }
+  }, [refreshInterval, refreshStatusesWithLatestTokenGroups])
+
   useEffect(() => {
-    fetchModelStatuses()
+    void fetchModelStatuses()
   }, [fetchModelStatuses])
 
   // Auto refresh with visibility change handling
@@ -1051,7 +1140,7 @@ export function ModelStatusEmbed({
     const timer = setInterval(() => {
       setCountdown(prev => {
         if (prev <= 1) {
-          fetchModelStatuses()
+          void runAutomaticRefresh()
           lastRefreshTime = Date.now()
           return refreshInterval
         }
@@ -1065,7 +1154,7 @@ export function ModelStatusEmbed({
         const elapsed = Math.floor((Date.now() - lastRefreshTime) / 1000)
         if (elapsed >= refreshInterval) {
           // Enough time has passed, refresh immediately
-          fetchModelStatuses()
+          void runAutomaticRefresh()
           lastRefreshTime = Date.now()
           setCountdown(refreshInterval)
         } else {
@@ -1081,7 +1170,12 @@ export function ModelStatusEmbed({
       clearInterval(timer)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [refreshInterval, fetchModelStatuses])
+  }, [refreshInterval, runAutomaticRefresh])
+
+  const handleGroupFilterChange = useCallback((filter: string) => {
+    groupFilterRef.current = filter
+    setGroupFilter(filter)
+  }, [])
 
   // Handler for hover
   const handleSlotHover = (slot: SlotStatus, rect: DOMRect) => {
@@ -1140,14 +1234,24 @@ export function ModelStatusEmbed({
             </p>
           </div>
 
-          {/* Countdown */}
-          {refreshInterval > 0 && (
-            <div className={styles.countdownBox}>
-              <Timer className="h-4 w-4 opacity-60" />
-              <span className={styles.countdownText}>{formatCountdown(countdown)}</span>
-              {theme !== 'minimal' && <span className={styles.countdownLabel}>后刷新</span>}
-            </div>
-          )}
+          {/* Countdown and manual refresh */}
+          <button
+            type="button"
+            className={cn(
+              styles.countdownBox,
+              'cursor-pointer transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-60',
+            )}
+            onClick={() => void handleManualRefresh()}
+            disabled={refreshing}
+            aria-label="立即刷新模型状态和令牌分组"
+            title="立即刷新模型状态和令牌分组"
+          >
+            <RefreshCw className={cn('h-4 w-4 opacity-60', refreshing && 'animate-spin')} />
+            <span className={styles.countdownText}>
+              {refreshInterval > 0 ? formatCountdown(countdown) : '刷新'}
+            </span>
+            {refreshInterval > 0 && theme !== 'minimal' && <span className={styles.countdownLabel}>后刷新</span>}
+          </button>
         </div>
 
         {/* Stats Overview Bar */}
@@ -1234,7 +1338,7 @@ export function ModelStatusEmbed({
             )}>
               <Tag className="h-4 w-4 opacity-50 flex-shrink-0" />
               <button
-                onClick={() => setGroupFilter('all')}
+                onClick={() => handleGroupFilterChange('all')}
                 className={cn(
                   "inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-full border transition-all whitespace-nowrap flex-shrink-0",
                   groupFilter === 'all'
@@ -1273,7 +1377,7 @@ export function ModelStatusEmbed({
                 return (
                   <button
                     key={group.id}
-                    onClick={() => setGroupFilter(group.id)}
+                    onClick={() => handleGroupFilterChange(group.id)}
                     className={cn(
                       "inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-full border transition-all whitespace-nowrap flex-shrink-0",
                       isActive
@@ -1300,7 +1404,7 @@ export function ModelStatusEmbed({
                     groups={tokenGroups}
                     countMap={groupCountMap}
                     value={groupFilter}
-                    onChange={setGroupFilter}
+                    onChange={handleGroupFilterChange}
                     styles={styles}
                   />
                 </>

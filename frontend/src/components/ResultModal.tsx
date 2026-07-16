@@ -95,7 +95,7 @@ export function ResultModal({ result, onClose }: ResultModalProps) {
                 <p className={`${auditUncertain ? 'text-amber-50' : 'text-green-100'} text-sm`}>已生成 {result.count} 个兑换码</p>
               </div>
             </div>
-            <button onClick={onClose} className="text-white hover:bg-white/20 rounded-full p-2 transition-colors">
+            <button aria-label="关闭" onClick={onClose} className="text-white hover:bg-white/20 rounded-full p-2 transition-colors">
               <X className="h-5 w-5" />
             </button>
           </div>

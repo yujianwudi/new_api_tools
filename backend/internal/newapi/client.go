@@ -283,6 +283,14 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, admi
 	if err != nil {
 		return fmt.Errorf("read NewAPI response: %w", err)
 	}
+	if resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusTooEarly ||
+		resp.StatusCode == http.StatusTooManyRequests {
+		// Retry-oriented responses are not proof that a non-idempotent upstream
+		// mutation was rejected before commit. Keep them outside APIError so the
+		// control plane requires reconciliation instead of allowing a retry.
+		return fmt.Errorf("NewAPI returned non-authoritative status %d", resp.StatusCode)
+	}
 	if int64(len(data)) > c.maxBodyBytes {
 		if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
 			return newAPIRejection(resp.StatusCode, "")

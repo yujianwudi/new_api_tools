@@ -65,7 +65,7 @@ func TestSanitizeModelNamesBoundsAndDeduplicates(t *testing.T) {
 }
 
 func TestSanitizeSelectedModelNamesAllowsExplicitEmptyAndBounds(t *testing.T) {
-	empty, message := sanitizeSelectedModelNames(nil)
+	empty, message := sanitizeSelectedModelNames([]string{})
 	if message != "" || empty == nil || len(empty) != 0 {
 		t.Fatalf("explicit empty selection was not preserved: models=%#v message=%q", empty, message)
 	}
@@ -168,6 +168,15 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 	}
 	if persisted := readConfig("/api/model-status/config/selected"); len(persisted.Data) != 2 {
 		t.Fatalf("rejected selection overwrote the last valid config: %#v", persisted)
+	}
+	for _, invalidPayload := range []string{`{}`, `{"models":null}`} {
+		recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", invalidPayload)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("missing/null models payload %s was accepted: status=%d body=%s", invalidPayload, recorder.Code, recorder.Body.String())
+		}
+		if persisted := readConfig("/api/model-status/config/selected"); len(persisted.Data) != 2 {
+			t.Fatalf("missing/null models payload %s overwrote the last valid config: %#v", invalidPayload, persisted)
+		}
 	}
 
 	recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", `{"models":[]}`)
