@@ -657,19 +657,24 @@ func TestUserMutationCancellationPersistsUncertainOutcome(t *testing.T) {
 
 func TestUserMutationAppliesServiceDeadlineToCapabilityAndWriteCalls(t *testing.T) {
 	t.Run("capability detection", func(t *testing.T) {
+		var statusReached atomic.Bool
 		upstream := &fakeUpstream{version: "v1.0.0-rc.21"}
 		upstream.onStatusContext = func(ctx context.Context) error {
+			statusReached.Store(true)
 			<-ctx.Done()
 			return ctx.Err()
 		}
 		service, _, _ := setupMutationService(t, upstream)
-		service.userMutationTimeout = 25 * time.Millisecond
-		service.outcomeAuditTimeout = 10 * time.Millisecond
+		service.userMutationTimeout = 250 * time.Millisecond
+		service.outcomeAuditTimeout = 50 * time.Millisecond
 
 		started := time.Now()
 		_, err := service.MutateUser(context.Background(), testMeta(), UserMutationRequest{UserID: 7, Action: "disable"})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("capability timeout error = %v, want deadline exceeded", err)
+		}
+		if !statusReached.Load() {
+			t.Fatal("capability deadline expired before reaching the Status callback")
 		}
 		if elapsed := time.Since(started); elapsed > time.Second {
 			t.Fatalf("capability timeout took %s, service deadline was not enforced", elapsed)
@@ -677,19 +682,24 @@ func TestUserMutationAppliesServiceDeadlineToCapabilityAndWriteCalls(t *testing.
 	})
 
 	t.Run("user write", func(t *testing.T) {
+		var manageReached atomic.Bool
 		upstream := &fakeUpstream{version: "v1.0.0-rc.21"}
 		upstream.onManageContext = func(ctx context.Context, _ newapi.ManageUserRequest) error {
+			manageReached.Store(true)
 			<-ctx.Done()
 			return ctx.Err()
 		}
 		service, _, _ := setupMutationService(t, upstream)
-		service.userMutationTimeout = 25 * time.Millisecond
-		service.outcomeAuditTimeout = 10 * time.Millisecond
+		service.userMutationTimeout = 250 * time.Millisecond
+		service.outcomeAuditTimeout = 50 * time.Millisecond
 
 		started := time.Now()
 		_, err := service.MutateUser(context.Background(), testMeta(), UserMutationRequest{UserID: 7, Action: "disable"})
 		if !errors.Is(err, ErrOperationUncertain) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("write timeout error = %v, want uncertain deadline exceeded", err)
+		}
+		if !manageReached.Load() {
+			t.Fatal("user mutation deadline expired before reaching the ManageUser callback")
 		}
 		if elapsed := time.Since(started); elapsed > time.Second {
 			t.Fatalf("write timeout took %s, service deadline was not enforced", elapsed)

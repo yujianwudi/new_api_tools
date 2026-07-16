@@ -234,23 +234,14 @@ func exportTopUps(c *gin.Context, store *toolstore.Store) {
 
 	meta := operationMeta(c, "top-up CSV export")
 	filters := topUpExportAuditFilters(params)
-	if err := appendTopUpExportAudit(
-		c.Request.Context(), store, meta, "intent", toolstore.OperationSucceeded, "", filters,
-		gin.H{"expected_row_count": total, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv"},
-	); err != nil {
-		respondHandlerError(c, http.StatusServiceUnavailable, "AUDIT_STORE_UNAVAILABLE",
-			"Export was not started because the audit store is unavailable",
-			"top-up export intent audit", errors.New("tool store operation failed"))
-		return
-	}
-	recovery, err := createTopUpExportAuditRecovery(
+	recovery, err := createTopUpExportAuditIntentAndRecovery(
 		c.Request.Context(), store, meta, filters,
 		gin.H{"expected_row_count": total, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv"},
 	)
 	if err != nil {
 		respondHandlerError(c, http.StatusServiceUnavailable, "AUDIT_STORE_UNAVAILABLE",
-			"Export was not started because the audit recovery record could not be persisted",
-			"top-up export pending audit recovery", errors.New("tool store operation failed"))
+			"Export was not started because its audit evidence could not be persisted",
+			"top-up export intent and pending audit recovery", errors.New("tool store operation failed"))
 		return
 	}
 
@@ -372,26 +363,41 @@ func appendTopUpExportAudit(
 	if store == nil {
 		return toolstore.ErrStoreClosed
 	}
+	auditInput, err := topUpExportAuditInput(meta, phase, status, errorCode, filters, result)
+	if err != nil {
+		return err
+	}
+	_, err = store.AppendOperationAudit(ctx, auditInput)
+	return err
+}
+
+func topUpExportAuditInput(
+	meta controlplane.OperationMeta,
+	phase string,
+	status toolstore.OperationStatus,
+	errorCode string,
+	filters any,
+	result any,
+) (toolstore.OperationAuditInput, error) {
 	beforeJSON, err := json.Marshal(filters)
 	if err != nil {
-		return fmt.Errorf("marshal top-up export filters: %w", err)
+		return toolstore.OperationAuditInput{}, fmt.Errorf("marshal top-up export filters: %w", err)
 	}
 	afterJSON, err := json.Marshal(result)
 	if err != nil {
-		return fmt.Errorf("marshal top-up export result: %w", err)
+		return toolstore.OperationAuditInput{}, fmt.Errorf("marshal top-up export result: %w", err)
 	}
-	_, err = store.AppendOperationAudit(ctx, toolstore.OperationAuditInput{
+	return toolstore.OperationAuditInput{
 		RequestID: meta.RequestID, Actor: meta.Actor, SourceIP: meta.SourceIP,
 		AuthMethod: meta.AuthMethod, Action: "top_ups.export." + phase,
 		TargetType: "financial_export", TargetID: meta.RequestID,
 		Reason: meta.Reason, BeforeJSON: json.RawMessage(beforeJSON), AfterJSON: json.RawMessage(afterJSON),
 		Status: status, ErrorCode: errorCode,
 		IdempotencyKey: "export:" + meta.RequestID + ":" + phase,
-	})
-	return err
+	}, nil
 }
 
-func createTopUpExportAuditRecovery(
+func createTopUpExportAuditIntentAndRecovery(
 	ctx context.Context,
 	store *toolstore.Store,
 	meta controlplane.OperationMeta,
@@ -401,12 +407,18 @@ func createTopUpExportAuditRecovery(
 	if store == nil {
 		return toolstore.ReconciliationRun{}, toolstore.ErrStoreClosed
 	}
+	auditInput, err := topUpExportAuditInput(
+		meta, "intent", toolstore.OperationSucceeded, "", filters, result,
+	)
+	if err != nil {
+		return toolstore.ReconciliationRun{}, err
+	}
 	summaryJSON, err := topUpExportAuditRecoverySummary(meta, "pending", "", "", filters, result, false)
 	if err != nil {
 		return toolstore.ReconciliationRun{}, err
 	}
 	now := time.Now().UTC()
-	run, err := store.CreateReconciliationRun(ctx, toolstore.ReconciliationRunInput{
+	_, run, err := store.AppendOperationAuditWithReconciliationRun(ctx, auditInput, toolstore.ReconciliationRunInput{
 		RunKey: "top-up-export-audit:" + meta.RequestID,
 		Kind:   "top_up_export_audit_outcome", Status: toolstore.ReconciliationRunning,
 		WindowStart: now.Add(-time.Second), WindowEnd: now, StartedAt: now,
@@ -416,7 +428,7 @@ func createTopUpExportAuditRecovery(
 		ErrorMessage: "Top-up export outcome audit has not been finalized",
 	})
 	if err != nil {
-		return toolstore.ReconciliationRun{}, fmt.Errorf("persist top-up export pending audit recovery: %w", err)
+		return toolstore.ReconciliationRun{}, fmt.Errorf("persist top-up export intent and pending audit recovery: %w", err)
 	}
 	return run, nil
 }

@@ -223,6 +223,59 @@ func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
 	}
 }
 
+func TestTopUpExportRollsBackIntentWhenInitialRecoveryFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, storePath := installTopUpExportFixture(t)
+	rawStore, err := sqlx.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open raw tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = rawStore.Close() })
+	if _, err := rawStore.Exec(`CREATE TRIGGER fail_top_up_export_recovery_insert
+		BEFORE INSERT ON reconciliation_runs
+		WHEN NEW.kind = 'top_up_export_audit_outcome'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected recovery insert failure');
+		END`); err != nil {
+		t.Fatalf("install recovery insert failure: %v", err)
+	}
+
+	admin := topUpExportRouter(store, auth.RoleAdmin)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/top-ups/export?status=success", nil)
+	request.RemoteAddr = "192.0.2.48:12345"
+	admin.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("export status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if disposition := recorder.Header().Get("Content-Disposition"); disposition != "" {
+		t.Fatalf("failed export started a CSV attachment: %q", disposition)
+	}
+	if contentType := recorder.Header().Get("Content-Type"); strings.Contains(contentType, "text/csv") {
+		t.Fatalf("failed export started a CSV stream: %q", contentType)
+	}
+	if expectedRows := recorder.Header().Get("X-Export-Expected-Rows"); expectedRows != "" {
+		t.Fatalf("failed export exposed CSV stream metadata: %q", expectedRows)
+	}
+
+	audits, err := store.ListOperationAudits(context.Background(), toolstore.OperationAuditFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list export audits: %v", err)
+	}
+	if len(audits.Items) != 0 {
+		t.Fatalf("recovery failure left orphaned export intent audits: %+v", audits.Items)
+	}
+	runs, err := store.ListReconciliationRuns(context.Background(), toolstore.ReconciliationRunFilter{
+		Kind: "top_up_export_audit_outcome", Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list audit recovery records: %v", err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("recovery failure left partial reconciliation rows: %+v", runs.Items)
+	}
+}
+
 func TestTopUpExportPersistsReconcileableRecordWhenOutcomeAuditFails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store, storePath := installTopUpExportFixture(t)

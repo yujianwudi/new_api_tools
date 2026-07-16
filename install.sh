@@ -440,6 +440,31 @@ install_rollback_snapshot_path() {
   printf '%s.rollback\n' "$1"
 }
 
+install_rollback_compose_marker_path() {
+  printf '%s.rollback.compose\n' "$1"
+}
+
+install_rollback_compose_snapshot_path() {
+  local env_file="$1" name="$2"
+  printf '%s.%s\n' "$(install_rollback_compose_marker_path "$env_file")" "$name"
+}
+
+install_rollback_compose_files() {
+  printf '%s\n' \
+    'docker-compose.yml' \
+    'docker-compose.host.yml' \
+    'docker-compose.logdb.yml'
+}
+
+install_rollback_compose_state_key() {
+  case "$1" in
+    docker-compose.yml) printf 'COMPOSE_BASE\n' ;;
+    docker-compose.host.yml) printf 'COMPOSE_HOST\n' ;;
+    docker-compose.logdb.yml) printf 'COMPOSE_LOGDB\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 normalize_install_rollback_env_content() {
   local content="$1" image="$2" project_name="$3"
   is_immutable_newapi_tools_image "$image" || return 1
@@ -460,10 +485,9 @@ persist_install_rollback_snapshot() {
   atomic_write_install_dotenv "$snapshot_file" "$content"
 }
 
-load_install_rollback_snapshot() {
-  local env_file="$1" snapshot_file mode snapshot_fd fd_path
+load_install_mode600_file() {
+  local snapshot_file="$1" mode snapshot_fd fd_path
   local path_identity fd_identity status
-  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
   [[ -f "$snapshot_file" && ! -L "$snapshot_file" && -r "$snapshot_file" ]] || return 1
   exec {snapshot_fd}< "$snapshot_file" || return 1
   fd_path="/proc/${BASHPID}/fd/${snapshot_fd}"
@@ -483,6 +507,118 @@ load_install_rollback_snapshot() {
   return "$status"
 }
 
+load_install_rollback_snapshot() {
+  load_install_mode600_file "$(install_rollback_snapshot_path "$1")"
+}
+
+validate_install_rollback_compose_bundle() {
+  local env_file="$1" marker marker_content name key state snapshot_file
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    state="$(env_content_value "$marker_content" "$key")"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    case "$state" in
+      present)
+        load_install_mode600_file "$snapshot_file" >/dev/null || return 1
+        ;;
+      absent)
+        [[ ! -e "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(install_rollback_compose_files)
+  [[ "$(env_content_value "$marker_content" 'COMPOSE_BASE')" == "present" ]]
+}
+
+discard_install_rollback_compose_bundle() {
+  local env_file="$1" marker name snapshot_file
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  durable_remove_install_file "$marker" || return 1
+  while IFS= read -r name; do
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    durable_remove_install_file "$snapshot_file" || return 1
+  done < <(install_rollback_compose_files)
+}
+
+persist_install_rollback_compose_bundle() {
+  local env_file="$1" project_dir="$2" marker marker_content=""
+  local name key source_file snapshot_file state
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    source_file="${project_dir}/${name}"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    state=absent
+    if [[ -e "$source_file" || -L "$source_file" ]]; then
+      [[ -f "$source_file" && ! -L "$source_file" ]] || return 1
+      atomic_write_install_dotenv "$snapshot_file" "$(<"$source_file")" || return 1
+      state=present
+    else
+      durable_remove_install_file "$snapshot_file" || return 1
+    fi
+    marker_content+="${key}=${state}"$'\n'
+  done < <(install_rollback_compose_files)
+  [[ "$(env_content_value "$marker_content" 'COMPOSE_BASE')" == "present" ]] || return 1
+  atomic_write_install_dotenv "$marker" "${marker_content%$'\n'}" || return 1
+  validate_install_rollback_compose_bundle "$env_file"
+}
+
+restore_install_rollback_compose_bundle() {
+  local env_file="$1" project_dir="$2" marker marker_content name key state snapshot_file target
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  [[ -e "$marker" || -L "$marker" ]] || return 0
+  validate_install_rollback_compose_bundle "$env_file" || return 1
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    state="$(env_content_value "$marker_content" "$key")"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    target="${project_dir}/${name}"
+    if [[ "$state" == "present" ]]; then
+      atomic_write_install_dotenv "$target" "$(load_install_mode600_file "$snapshot_file")" || return 1
+    else
+      durable_remove_install_file "$target" || return 1
+    fi
+  done < <(install_rollback_compose_files)
+}
+
+build_install_rollback_compose_args() {
+  local env_file="$1" project_dir="$2" output_name="$3" marker marker_content rollback_content
+  local state network_value log_network
+  local -n output_ref="$output_name"
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    build_install_compose_args "$env_file" "$project_dir" "$output_name"
+    return
+  fi
+  validate_install_rollback_compose_bundle "$env_file" || return 1
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  rollback_content="$(load_install_rollback_snapshot "$env_file")" || return 1
+  output_ref=(--env-file "$(install_rollback_snapshot_path "$env_file")")
+  output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.yml')")
+
+  # File existence is not activation state: release checkouts normally contain
+  # both optional overlays. Recreate the old file set from the authoritative
+  # rollback dotenv exactly as setup_compose_files selected it at deployment.
+  network_value="$(env_content_value "$rollback_content" 'NEWAPI_NETWORK')"
+  if printf '%s\n' "$rollback_content" | grep -qE '^NEWAPI_NETWORK=' &&
+    [[ -z "$network_value" ]]; then
+    state="$(env_content_value "$marker_content" 'COMPOSE_HOST')"
+    [[ "$state" == "present" ]] || return 1
+    output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.host.yml')")
+  fi
+
+  log_network="$(env_content_value "$rollback_content" 'LOG_NETWORK')"
+  if [[ -n "$log_network" && "$log_network" != "$network_value" ]]; then
+    state="$(env_content_value "$marker_content" 'COMPOSE_LOGDB')"
+    if [[ "$state" == "present" ]]; then
+      output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.logdb.yml')")
+    fi
+  fi
+}
+
 restore_install_rollback_snapshot() {
   local env_file="$1" content
   content="$(load_install_rollback_snapshot "$env_file")" || return 1
@@ -499,6 +635,20 @@ remove_install_rollback_snapshot() {
   if ! sync -f "$parent"; then
     persist_install_rollback_snapshot "$env_file" "$INSTALL_ROLLBACK_ENV_CONTENT" || true
     return 1
+  fi
+}
+
+commit_install_rollback_transaction() {
+  local env_file="$1"
+  remove_install_rollback_snapshot "$env_file" || return 1
+  INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  INSTALL_ROLLBACK_ENV_CONTENT=""
+  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  if ! discard_install_rollback_compose_bundle "$env_file"; then
+    # The authoritative .env rollback marker is already durably gone, so a
+    # leftover mode-600 Compose copy is inert. Do not roll back a healthy
+    # candidate after its commit point; the next transaction will replace it.
+    log_warn "部署已提交，但无法清理非活动 Compose 回滚副本"
   fi
 }
 
@@ -870,6 +1020,7 @@ restore_install_previous_configuration() {
   INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$rollback_project"
   NEWAPI_TOOLS_IMAGE="$rollback_image"
   export NEWAPI_TOOLS_IMAGE
+  restore_install_rollback_compose_bundle "$env_file" "$project_dir" || return 1
   setup_compose_files "$project_dir"
 }
 
@@ -908,19 +1059,42 @@ recover_preexisting_install_rollback_snapshot() {
 }
 
 prepare_install_rollback_transaction() {
-  local env_file="$1" project_dir="$2" snapshot_file content
+  local env_file="$1" project_dir="$2" snapshot_file compose_marker content
+  local snapshot_was_present=false
   snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  compose_marker="$(install_rollback_compose_marker_path "$env_file")"
   if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" &&
         "$INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING" != "true" &&
         ( -e "$snapshot_file" || -L "$snapshot_file" ) ]]; then
     content="$(load_install_rollback_snapshot "$env_file")" ||
       die "安装回滚快照在更新前变得不可读"
     INSTALL_ROLLBACK_ENV_CONTENT="$content"
+    if [[ -e "$compose_marker" || -L "$compose_marker" ]]; then
+      validate_install_rollback_compose_bundle "$env_file" ||
+        die "安装 Compose 回滚快照在更新前变得不可读"
+    else
+      persist_install_rollback_compose_bundle "$env_file" "$project_dir" ||
+        die "无法持久化旧 Compose 清单回滚快照"
+    fi
     return 0
   fi
+  [[ -e "$snapshot_file" || -L "$snapshot_file" ]] && snapshot_was_present=true
   capture_install_rollback_env "$env_file"
   recover_preexisting_install_rollback_snapshot "$env_file" "$project_dir" ||
     die "无法恢复上次中断的安装事务；快照已保留"
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    if [[ "$snapshot_was_present" != "true" ]]; then
+      discard_install_rollback_compose_bundle "$env_file" ||
+        die "无法清理非活动 Compose 回滚副本"
+    fi
+    if [[ -e "$compose_marker" || -L "$compose_marker" ]]; then
+      validate_install_rollback_compose_bundle "$env_file" ||
+        die "安装 Compose 回滚快照不可读"
+    else
+      persist_install_rollback_compose_bundle "$env_file" "$project_dir" ||
+        die "无法持久化旧 Compose 清单回滚快照"
+    fi
+  fi
 }
 
 # Restart an existing installation as a transaction. The .env file keeps the
@@ -932,6 +1106,7 @@ restart_install_services_transactionally() {
   shift 2
 
   local candidate_image="$NEWAPI_TOOLS_IMAGE" rollback_image container_names project_name=""
+  local rollback_env_file="$env_file"
   local rollback_content="" rollback_config_restored=true candidate_healthy=false rollback_healthy=false
   local -a candidate_compose_args=() rollback_compose_args=()
   if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
@@ -942,6 +1117,7 @@ restart_install_services_transactionally() {
     [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
       die "安装回滚快照缺少有效 Compose project"
     INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$project_name"
+    rollback_env_file="$(install_rollback_snapshot_path "$env_file")"
   else
     rollback_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
     INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
@@ -963,10 +1139,16 @@ restart_install_services_transactionally() {
 
   setup_compose_files "$project_dir"
   build_install_compose_args "$env_file" "$project_dir" candidate_compose_args
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    build_install_rollback_compose_args "$env_file" "$project_dir" rollback_compose_args ||
+      die "无法构建旧 Compose 清单回滚参数"
+  else
+    rollback_compose_args=("${candidate_compose_args[@]}")
+  fi
 
   log_info "重启服务并等待候选版本健康..."
-  if ! run_install_compose "$env_file" "$project_dir" "$candidate_image" \
-    "${candidate_compose_args[@]}" down; then
+  if ! run_install_compose "$rollback_env_file" "$project_dir" "$rollback_image" \
+    "${rollback_compose_args[@]}" down; then
     log_error "停止现有服务返回失败；按可能已部分删除处理并立即重建旧服务"
     if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
       restore_install_previous_configuration "$env_file" "$project_dir" ||
@@ -976,6 +1158,7 @@ restart_install_services_transactionally() {
       export NEWAPI_TOOLS_IMAGE
       setup_compose_files "$project_dir"
     fi
+    rollback_env_file="$env_file"
     build_install_compose_args "$env_file" "$project_dir" rollback_compose_args
     if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" \
       "${rollback_compose_args[@]}"; then
@@ -998,9 +1181,7 @@ restart_install_services_transactionally() {
       NEWAPI_TOOLS_IMAGE="$candidate_image"
       export NEWAPI_TOOLS_IMAGE
       if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" != "true" ]] ||
-        remove_install_rollback_snapshot "$env_file"; then
-        INSTALL_ROLLBACK_ENV_AVAILABLE=false
-        INSTALL_ROLLBACK_ENV_CONTENT=""
+        commit_install_rollback_transaction "$env_file"; then
         log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
         return 0
       fi
@@ -1061,15 +1242,15 @@ setup_compose_files() {
   [[ -f "$env_file" ]] || return 0
 
   local -a compose_files=("$base")
+  local newapi_network=""
 
   # 必须显式存在 NEWAPI_NETWORK 行才判断；行缺失视为老版 .env，让 base compose 走默认 fallback
   # 注意：set -e + pipefail 下，grep 无匹配会让 pipe 退出码为 1 → 整个脚本死掉，必须 || true 兜底。
   if grep -qE '^NEWAPI_NETWORK=' "$env_file" 2>/dev/null; then
-    local nw
-    nw="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
+    newapi_network="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
 
     # NEWAPI_NETWORK= （空值）→ deploy.sh 在 host 模式下生成的标记
-    if [[ -z "$nw" ]]; then
+    if [[ -z "$newapi_network" ]]; then
       [[ -f "$host_overlay" ]] ||
         die "host 模式需要 ${host_overlay}，缺少该叠加层时无法安全移除基础 external network 配置"
       require_docker_compose_v224 "host 网络叠加层 ${host_overlay} 的 !reset 语法"
@@ -1079,12 +1260,14 @@ setup_compose_files() {
 
   local log_network
   log_network="$(env_file_value "$env_file" 'LOG_NETWORK')"
-  if [[ -n "$log_network" ]]; then
+  if [[ -n "$log_network" && "$log_network" != "$newapi_network" ]]; then
     if [[ -f "$log_overlay" ]]; then
       compose_files+=("$log_overlay")
     else
       log_warn "LOG_NETWORK=${log_network}，但未找到 ${log_overlay}；更新后将仅尝试运行时接入该网络"
     fi
+  elif [[ -n "$log_network" ]]; then
+    log_info "日志库与主库同在网络 '${log_network}'，无需额外日志库叠加层"
   fi
 
   if (( ${#compose_files[@]} > 1 )); then
@@ -1456,6 +1639,8 @@ check_existing_installation() {
     capture_install_rollback_env "${target_dir}/.env"
     recover_preexisting_install_rollback_snapshot "${target_dir}/.env" "$target_dir" ||
       die "无法在进入管理菜单前恢复上次中断的安装事务"
+    commit_install_rollback_transaction "${target_dir}/.env" ||
+      die "旧部署已恢复，但无法在进入管理菜单前提交并清理回滚快照"
   fi
 
   log_info "检测到已安装的服务: $target_dir"
@@ -1918,6 +2103,12 @@ do_update_interactive() {
   local project_dir="$1"
   cd "$project_dir"
 
+  # Capture the old dotenv and exact Compose bundle before checkout replaces
+  # tracked manifests. A failed candidate must restart the old image with the
+  # manifests it was actually deployed from.
+  PROJECT_DIR="$project_dir"
+  prepare_install_rollback_transaction "${project_dir}/.env" "$project_dir"
+
   # 更新代码
   if [[ -d ".git" ]]; then
     log_info "同步代码到固定版本 ${INSTALL_REF}..."
@@ -1925,8 +2116,6 @@ do_update_interactive() {
   fi
 
   # 下载 GeoIP 数据库
-  PROJECT_DIR="$project_dir"
-  prepare_install_rollback_transaction "${project_dir}/.env" "$project_dir"
   download_geoip_database
 
   # 迁移旧版 .env（补充 Go 版本所需字段）
@@ -2078,6 +2267,13 @@ do_reconfigure_interactive() {
       die "无法原子持久化重新配置备份"
     log_info "已备份旧配置文件"
   fi
+
+  # deploy.sh intentionally rejects a live container without an authoritative
+  # old dotenv. Establish its immutable image/project rollback identity before
+  # removing .env to enter the configuration wizard.
+  capture_install_rollback_env "${project_dir}/.env"
+  [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] ||
+    die "无法在重新配置前建立权威 .env 回滚快照"
 
   # 删除旧配置以触发重新配置
   durable_remove_install_file "${project_dir}/.env" ||

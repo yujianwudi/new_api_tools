@@ -55,6 +55,7 @@ type dependencyProbe struct {
 type dependencyProbeRun struct {
 	probe         dependencyProbe
 	done          chan struct{}
+	expired       chan struct{}
 	result        DependencyCheck
 	completed     bool
 	timedOut      bool
@@ -67,8 +68,9 @@ type dependencyProbeRun struct {
 // leaking another goroutine. Once the probe actually returns, the name becomes
 // eligible for a fresh check.
 type dependencyProbeCoordinator struct {
-	mu     sync.Mutex
-	active map[string]*dependencyProbeRun
+	mu           sync.Mutex
+	active       map[string]*dependencyProbeRun
+	probeTimeout time.Duration
 }
 
 func NewHealthHandler(cfg *config.Config, client newAPIStatusClient, store *toolstore.Store, metrics *observability.Registry) *HealthHandler {
@@ -294,16 +296,27 @@ func (c *dependencyProbeCoordinator) acquire(ctx context.Context, probe dependen
 		c.mu.Unlock()
 		return run, nil
 	}
-	run := &dependencyProbeRun{probe: probe, done: make(chan struct{})}
+	run := &dependencyProbeRun{probe: probe, done: make(chan struct{}), expired: make(chan struct{})}
 	c.active[probe.name] = run
 	c.mu.Unlock()
 
-	go c.execute(ctx, run)
+	go c.execute(run)
 	return run, nil
 }
 
-func (c *dependencyProbeCoordinator) execute(ctx context.Context, run *dependencyProbeRun) {
+func (c *dependencyProbeCoordinator) execute(run *dependencyProbeRun) {
+	// The shared probe must not inherit the first waiter's cancellation. Each
+	// request keeps its own context only while waiting for this run, while the
+	// coordinator gives the underlying dependency call one bounded lifetime.
 	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeoutDuration())
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	timer := time.AfterFunc(time.Until(deadline), func() {
+		c.expire(run, time.Since(started))
+	})
+	defer timer.Stop()
+
 	check := run.probe.check(ctx)
 	check.Name = run.probe.name
 	check.Required = run.probe.required
@@ -320,26 +333,57 @@ func (c *dependencyProbeCoordinator) execute(ctx context.Context, run *dependenc
 	close(run.done)
 }
 
+func (c *dependencyProbeCoordinator) timeoutDuration() time.Duration {
+	if c.probeTimeout > 0 {
+		return c.probeTimeout
+	}
+	return dependencyCheckTimeout
+}
+
+func (c *dependencyProbeCoordinator) expire(run *dependencyProbeRun, elapsed time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if run.completed || run.timedOut {
+		return
+	}
+	run.timedOut = true
+	run.timeoutResult = dependencyProbeTimeout(run.probe, elapsed, context.DeadlineExceeded)
+	close(run.expired)
+}
+
 func (c *dependencyProbeCoordinator) wait(ctx context.Context, run *dependencyProbeRun, collectionStarted time.Time) DependencyCheck {
 	select {
 	case <-run.done:
-		return run.result
+		return c.completedResult(run)
+	case <-run.expired:
+		return c.completedResult(run)
 	case <-ctx.Done():
 		return c.timeout(run, collectionStarted, ctx.Err())
 	}
 }
 
+func (c *dependencyProbeCoordinator) completedResult(run *dependencyProbeRun) DependencyCheck {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if run.timedOut {
+		return run.timeoutResult
+	}
+	return run.result
+}
+
 func (c *dependencyProbeCoordinator) timeout(run *dependencyProbeRun, collectionStarted time.Time, err error) DependencyCheck {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if run.timedOut {
+		return run.timeoutResult
+	}
 	if run.completed {
 		return run.result
 	}
-	if !run.timedOut {
-		run.timedOut = true
-		run.timeoutResult = dependencyProbeTimeout(run.probe, time.Since(collectionStarted), err)
-	}
-	return run.timeoutResult
+	// Request cancellation and shorter upstream deadlines belong only to this
+	// waiter. The coordinator's own expiry timer is the sole authority allowed
+	// to poison/cache a shared run.
+	return dependencyProbeTimeout(run.probe, time.Since(collectionStarted), err)
 }
 
 func dependencyProbeTimeout(probe dependencyProbe, elapsed time.Duration, err error) DependencyCheck {

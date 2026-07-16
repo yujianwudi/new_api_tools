@@ -156,6 +156,14 @@ interface TokenGroupSyncResult {
   groupFilter: string
 }
 
+function isTokenGroup(value: unknown): value is TokenGroup {
+  if (typeof value !== 'object' || value === null) return false
+  const group = value as Record<string, unknown>
+  return typeof group.group_name === 'string' && group.group_name.trim().length > 0
+    && typeof group.model_count === 'number' && Number.isInteger(group.model_count) && group.model_count >= 0
+    && Array.isArray(group.models) && group.models.every(model => typeof model === 'string')
+}
+
 // Custom user-defined model group
 interface CustomModelGroup {
   id: string
@@ -733,7 +741,10 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
           '自定义排序',
           'PUT',
         )
-        if (!orderSaved) return false
+        if (!orderSaved) {
+          await reloadAuthoritativeSortConfig(mutationId)
+          return false
+        }
         customOrderChanged = true
       }
 
@@ -744,16 +755,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       )
       if (!modeSaved) {
         if (customOrderChanged) {
-          const compensationSaved = await saveConfigMutation(
+          await saveConfigMutation(
             '/api/model-status/config/custom-order',
             { custom_order: previousPersistedOrder },
             '自定义排序回滚',
             'PUT',
           )
-          if (!compensationSaved) {
-            await reloadAuthoritativeSortConfig(mutationId)
-          }
         }
+        await reloadAuthoritativeSortConfig(mutationId)
         return false
       }
 
@@ -852,7 +861,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         signal: controller.signal,
       })
       const data = await requireSuccessfulResponse(response)
-      if (!Array.isArray(data.data)) {
+      if (!Array.isArray(data.data) || !data.data.every(isTokenGroup)) {
         throw new Error('Invalid token group response')
       }
 

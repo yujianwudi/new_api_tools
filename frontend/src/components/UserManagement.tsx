@@ -54,6 +54,7 @@ import {
   fetchOperationReconciliation,
   getPendingMutation,
   idempotencyHeader,
+  indexPendingMutationsByOperation,
   listPendingMutations,
   operationReconciliationAction,
   operationReconciliationDecision,
@@ -177,13 +178,35 @@ export function UserManagement() {
   // 删除类高风险操作的二次确认输入
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
   const [deleteReason, setDeleteReason] = useState('')
-  const [pendingDeleteMutation, setPendingDeleteMutation] = useState<DeleteUserPendingMutation | null>(() => (
-    listPendingMutations().find(item => item.targetType === 'user') ?? null
-  ))
+  const [deleteUserTarget, setDeleteUserTarget] = useState<{ userId: number; username: string; activityLevel: string } | null>(null)
+  const [pendingDeleteMutations, setPendingDeleteMutations] = useState<Map<string, DeleteUserPendingMutation>>(
+    () => indexPendingMutationsByOperation<DeleteUserPendingMutation>(listPendingMutations(), 'user'),
+  )
   const [deleteReleaseCandidate, setDeleteReleaseCandidate] = useState<OperationReleaseCandidate | null>(null)
   const [deleteReconciling, setDeleteReconciling] = useState(false)
+  const pendingDeleteMutation = deleteUserTarget
+    ? pendingDeleteMutations.get(userMutationOperationIdentifier(deleteUserTarget.userId)) ?? null
+    : null
+  const pendingDeleteNotice = pendingDeleteMutations.values().next().value ?? null
   const deletePayloadLocked = pendingDeleteMutation !== null
   const deleteReconciliationRequired = pendingDeleteMutation?.reconciliationRequired === true
+
+  const rememberPendingDeleteMutation = (pending: DeleteUserPendingMutation) => {
+    setPendingDeleteMutations(current => {
+      const next = new Map(current)
+      next.set(pending.operationIdentifier, pending)
+      return next
+    })
+  }
+
+  const forgetPendingDeleteMutation = (pending: DeleteUserPendingMutation) => {
+    setPendingDeleteMutations(current => {
+      if (!current.has(pending.operationIdentifier)) return current
+      const next = new Map(current)
+      next.delete(pending.operationIdentifier)
+      return next
+    })
+  }
 
   // 用户分析弹窗状态
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
@@ -380,12 +403,11 @@ export function UserManagement() {
   }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, showToast])
 
   // 单个用户删除状态
-  const [deleteUserTarget, setDeleteUserTarget] = useState<{ userId: number; username: string; activityLevel: string } | null>(null)
   const [deleteMode, setDeleteMode] = useState<'soft' | 'hard'>('soft')
 
   const openPendingMutationDialog = (pending: DeleteUserPendingMutation, username?: string) => {
     const userId = Number(pending.targetId)
-    setPendingDeleteMutation(pending)
+    rememberPendingDeleteMutation(pending)
     setDeleteReleaseCandidate(current => operationReleaseCandidateMatches(current, pending) ? current : null)
     setDeleteUserTarget({
       userId: Number.isSafeInteger(userId) && userId > 0 ? userId : 0,
@@ -412,6 +434,7 @@ export function UserManagement() {
       return
     }
     const userToDelete = users.find(u => u.id === userId)
+    setDeleteReleaseCandidate(null)
     setDeleteUserTarget({ userId, username, activityLevel: userToDelete?.activity_level || '' })
     setDeleteMode('soft')
     setDeleteConfirmText('')
@@ -461,7 +484,7 @@ export function UserManagement() {
       return
     }
 
-    setPendingDeleteMutation(pending)
+    rememberPendingDeleteMutation(pending)
     setDeleteReleaseCandidate(null)
     setDeleting(true)
     try {
@@ -476,7 +499,11 @@ export function UserManagement() {
       const data = await response.json()
       if (data.success) {
         const lockCleared = clearPendingMutation(pending)
-        setPendingDeleteMutation(lockCleared ? null : (getPendingMutation(pending.operationIdentifier) ?? pending))
+        if (lockCleared) {
+          forgetPendingDeleteMutation(pending)
+        } else {
+          rememberPendingDeleteMutation(getPendingMutation(pending.operationIdentifier) ?? pending)
+        }
         if (lockCleared) setDeleteReleaseCandidate(null)
         showToast(
           lockCleared ? 'success' : 'error',
@@ -551,12 +578,12 @@ export function UserManagement() {
         return
       }
       if (!clearPendingMutation(pending)) {
-        setPendingDeleteMutation(getPendingMutation(pending.operationIdentifier) ?? pending)
+        rememberPendingDeleteMutation(getPendingMutation(pending.operationIdentifier) ?? pending)
         showToast('error', '审计已确认终态，但浏览器未能安全清理本地锁；请勿重试并再次对账')
         return
       }
       setDeleteReleaseCandidate(null)
-      setPendingDeleteMutation(listPendingMutations().find(item => item.targetType === 'user') ?? null)
+      forgetPendingDeleteMutation(pending)
       setConfirmDialog(prev => ({ ...prev, isOpen: false }))
       setDeleteConfirmText('')
       setDeleteReason('')
@@ -784,21 +811,21 @@ export function UserManagement() {
         </Button>
       </div>
 
-      {pendingDeleteMutation && (
+      {pendingDeleteNotice && (
         <div className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
             <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
             <div>
               <p className="font-medium text-foreground">用户操作待审计对账</p>
               <p className="text-sm text-muted-foreground">
-                {pendingDeleteMutation.action} · 用户 #{pendingDeleteMutation.targetId}。刷新页面不会解除该锁，只有 Tool Store 的明确终态才能解锁。
+                {pendingDeleteNotice.action} · 用户 #{pendingDeleteNotice.targetId}。刷新页面不会解除该锁，只有 Tool Store 的明确终态才能解锁。
               </p>
             </div>
           </div>
           <Button
             variant="outline"
             size="sm"
-            onClick={() => openPendingMutationDialog(pendingDeleteMutation)}
+            onClick={() => openPendingMutationDialog(pendingDeleteNotice)}
             disabled={deleting || deleteReconciling}
           >
             <RefreshCw className="mr-2 h-4 w-4" />

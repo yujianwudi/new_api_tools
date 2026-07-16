@@ -33,6 +33,44 @@ assert_no_temp_files() {
 # directly without requiring a Docker daemon.
 source "$repo_root/setup-log-db.sh"
 
+lock_project="$fixture/lock-project"
+mkdir "$lock_project"
+lock_path="$(setup_project_state_lock_path "$lock_project")"
+assert_eq '.lock-project.state.lock' "$(basename -- "$lock_path")" \
+  'setup state lock did not use the shared sibling path contract'
+lock_victim="$fixture/lock-victim"
+printf 'victim-content\n' > "$lock_victim"
+ln -s "$lock_victim" "$lock_path"
+if (
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  acquire_setup_state_lock "$lock_project"
+) >/dev/null 2>&1; then
+  fail 'setup state lock accepted a symlink'
+fi
+assert_eq 'victim-content' "$(<"$lock_victim")" \
+  'setup state lock symlink rejection modified its victim'
+rm -f -- "$lock_path"
+: > "$lock_path"
+chmod 666 "$lock_path"
+(
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  log_error() { :; }
+  acquire_setup_state_lock "$lock_project"
+) || fail 'setup state lock rejected a current-user regular file'
+assert_eq '600' "$(stat -c '%a' -- "$lock_path")" \
+  'setup state lock did not repair mode to 600'
+assert_eq "$(id -u)" "$(stat -c '%u' -- "$lock_path")" \
+  'setup state lock changed or failed to verify its owner'
+if (
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+  setup_state_lock_path_owner() { printf '%s\n' "$(( $(id -u) + 1 ))"; }
+  log_error() { :; }
+  acquire_setup_state_lock "$lock_project"
+) >/dev/null 2>&1; then
+  fail 'setup state lock accepted a file reported as foreign-owned'
+fi
+
 if ! (
   docker() {
     [[ "$1" == "compose" && "$2" == "version" ]] || return 1
@@ -79,6 +117,15 @@ fi
 if detect_dsn_format 'host=db hostaddr=127.0.0.1 dbname=logs' >/dev/null 2>&1; then
   fail 'PostgreSQL hostaddr routing override was accepted'
 fi
+for nested_dbname in \
+  'host=db port=5432 dbname=host=evil.example' \
+  'host=db port=5432 dbname=postgresql://evil.example/logs' \
+  'host=db port=5432 dbname=POSTGRES://evil.example/logs'
+do
+  if detect_dsn_format "$nested_dbname" >/dev/null 2>&1; then
+    fail "PostgreSQL keyword dbname nested connection string was accepted: $nested_dbname"
+  fi
+done
 
 mysql_url='mysql://ops:p%7C%26%5C@127.0.0.1:3306/logs?charset=utf8mb4&parseTime=true'
 assert_eq 'mysql_url' "$(detect_dsn_format "$mysql_url")" 'MySQL URL format was not detected'
@@ -194,6 +241,36 @@ fi
 assert_eq 'old-move' "$(<"$move_failure")" \
   'rename failure replaced the old target'
 assert_no_temp_files "$move_failure"
+
+ownership_failure="$fixture/ownership-failure.env"
+printf 'old-ownership\n' > "$ownership_failure"
+ownership_before="$(stat -c '%u:%g' -- "$ownership_failure")"
+if (
+  chown() { return 1; }
+  atomic_write_setup_file "$ownership_failure" 'new-ownership'
+); then
+  fail 'ownership preservation failure was reported as success'
+fi
+assert_eq 'old-ownership' "$(<"$ownership_failure")" \
+  'ownership preservation failure replaced the old target'
+assert_eq "$ownership_before" "$(stat -c '%u:%g' -- "$ownership_failure")" \
+  'ownership preservation failure changed the old target owner or group'
+assert_no_temp_files "$ownership_failure"
+
+primary_gid="$(id -g)"
+secondary_gid="$(id -G | tr ' ' '\n' | awk -v primary="$primary_gid" '$0 != primary { print; exit }')"
+if [[ -n "$secondary_gid" ]]; then
+  ownership_target="$fixture/ownership-target.env"
+  printf 'old-owner\n' > "$ownership_target"
+  chgrp "$secondary_gid" "$ownership_target"
+  ownership_before="$(stat -c '%u:%g' -- "$ownership_target")"
+  atomic_write_setup_file "$ownership_target" 'new-owner' ||
+    fail 'atomic replacement could not preserve an existing owner and group'
+  assert_eq "$ownership_before" "$(stat -c '%u:%g' -- "$ownership_target")" \
+    'atomic replacement changed the existing target owner or group'
+  assert_mode_600 "$ownership_target"
+  assert_no_temp_files "$ownership_target"
+fi
 
 race_target="$fixture/race-target.env"
 race_victim="$fixture/race-victim.env"
@@ -422,8 +499,8 @@ commit_log_db_configuration "$special_dsn" 'new-api_default' ||
   fail 'switching the log database onto the main network failed'
 [[ ! -e "$override" && ! -L "$override" ]] ||
   fail 'old generated override survived the switch to the main network'
-assert_eq 'new-api_default' "$(read_env_value LOG_NETWORK)" \
-  'main-network transition did not persist the resolved LOG_NETWORK'
+assert_eq '' "$(read_env_value LOG_NETWORK)" \
+  'main-network transition persisted a duplicate LOG_NETWORK instead of using the base attachment'
 
 printf 'services:\n  custom: {}\n' > "$override"
 chmod 600 "$override"
@@ -463,7 +540,11 @@ grep -Fq "if: github.ref_type == 'tag'" "$workflow" ||
   fail 'release tag identity gate is not tag-only'
 grep -Fq '[[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]' "$workflow" ||
   fail 'release tag gate does not require strict semantic syntax'
-grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main' "$workflow" ||
+grep -Fq 'tag_commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}" 2>/dev/null)"' "$workflow" ||
+  fail 'release tag gate does not peel the annotated tag to its commit'
+grep -Fq '[[ "$tag_commit" == "$GITHUB_SHA" ]]' "$workflow" ||
+  fail 'release tag gate does not bind the tag target to the workflow commit'
+grep -Fq 'git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main' "$workflow" ||
   fail 'release tag gate does not require origin/main ancestry'
 grep -Fq 'git cat-file -t "refs/tags/${tag}"' "$workflow" ||
   fail 'release tag gate does not require an annotated tag object'
@@ -489,5 +570,33 @@ for bad_tag in v0.5 v0.5.1-rc1 0.5.1 vx.y.z 'v1.2.3/extra' v01.2.3 v1.02.3 v1.2.
     fail "strict release regex accepted $bad_tag"
   fi
 done
+
+release_tag_identity_matches() {
+  local repository="$1" tag="$2" github_sha="$3" tag_commit
+  [[ "$(git -C "$repository" cat-file -t "refs/tags/${tag}" 2>/dev/null)" == 'tag' ]] ||
+    return 1
+  tag_commit="$(git -C "$repository" rev-parse --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" ||
+    return 1
+  [[ "$tag_commit" == "$github_sha" ]]
+}
+
+tag_gate_repo="$fixture/tag-gate-repo"
+git init -q -b main "$tag_gate_repo"
+git -C "$tag_gate_repo" config user.name 'tag gate test'
+git -C "$tag_gate_repo" config user.email 'tag-gate@example.invalid'
+printf 'first\n' > "$tag_gate_repo/state"
+git -C "$tag_gate_repo" add state
+git -C "$tag_gate_repo" commit -qm 'first'
+tag_target="$(git -C "$tag_gate_repo" rev-parse HEAD)"
+git -C "$tag_gate_repo" tag -a v1.2.3 -m 'release' "$tag_target"
+printf 'second\n' >> "$tag_gate_repo/state"
+git -C "$tag_gate_repo" commit -qam 'second'
+different_main_commit="$(git -C "$tag_gate_repo" rev-parse HEAD)"
+
+release_tag_identity_matches "$tag_gate_repo" v1.2.3 "$tag_target" ||
+  fail 'annotated tag target did not match its workflow commit'
+if release_tag_identity_matches "$tag_gate_repo" v1.2.3 "$different_main_commit"; then
+  fail 'release tag gate accepted a different origin/main commit as GITHUB_SHA'
+fi
 
 printf 'setup-log-db safety tests passed\n'

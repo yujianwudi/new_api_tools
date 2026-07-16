@@ -328,6 +328,19 @@ export function listPendingMutations(): PendingMutationRecord[] {
   return readPendingMutations().map(pending => ({ ...pending }))
 }
 
+export function indexPendingMutationsByOperation<Pending extends PendingMutationRecord>(
+  pendingMutations: readonly Pending[],
+  targetType?: string,
+): Map<string, Pending> {
+  const pendingByOperation = new Map<string, Pending>()
+  for (const pending of pendingMutations) {
+    if (targetType === undefined || pending.targetType === targetType) {
+      pendingByOperation.set(pending.operationIdentifier, pending)
+    }
+  }
+  return pendingByOperation
+}
+
 export function getPendingMutation(operationIdentifier: string): PendingMutationRecord | null {
   const identifier = normalizeOperationIdentifier(operationIdentifier)
   const pending = readPendingMutations().find(item => item.operationIdentifier === identifier)

@@ -58,6 +58,16 @@ interface EmbedTokenGroupSyncResult {
   groupFilter: string
 }
 
+function isEmbedTokenGroup(value: unknown): value is EmbedTokenGroup {
+  if (typeof value !== 'object' || value === null) return false
+  const group = value as Record<string, unknown>
+  return typeof group.group_name === 'string' && group.group_name.trim().length > 0
+    && typeof group.model_count === 'number' && Number.isInteger(group.model_count) && group.model_count >= 0
+    && Array.isArray(group.models) && group.models.every(model => typeof model === 'string')
+    && (group.description === undefined || typeof group.description === 'string')
+    && (group.ratio === undefined || (typeof group.ratio === 'number' && Number.isFinite(group.ratio)))
+}
+
 // Custom model group (loaded from backend)
 interface EmbedCustomGroup {
   id: string
@@ -997,7 +1007,7 @@ export function ModelStatusEmbed({
         signal: controller.signal,
       })
       const data = await response.json()
-      if (!response.ok || !data.success || !Array.isArray(data.data)) {
+      if (!response.ok || !data.success || !Array.isArray(data.data) || !data.data.every(isEmbedTokenGroup)) {
         throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
       }
       if (requestId !== tokenGroupRequestIdRef.current) return undefined

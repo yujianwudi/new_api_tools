@@ -619,6 +619,8 @@ export function Analytics() {
         const elapsed = Date.now() - batchRun.startTime
         showToast('info', `批处理已运行 ${Math.max(1, Math.floor(elapsed / 60000))} 分钟，自动停止。可再次点击继续处理。`)
         void Promise.all([fetchSyncStatus(), fetchAnalytics()])
+      } else {
+        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       }
     } finally {
       if (cleanupAnalyticsBatchRun(batchRunRef, batchRun, timeout => window.clearTimeout(timeout))) {

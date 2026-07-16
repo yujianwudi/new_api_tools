@@ -31,6 +31,8 @@ TOOLS_CONTAINER="newapi-tools"
 # ENV_FILE / COMPOSE_FILE 在 resolve_project_dir() 中确定（支持 curl 直跑）
 ENV_FILE=""
 COMPOSE_FILE=""
+SETUP_STATE_LOCK_FD=""
+SETUP_STATE_LOCK_PATH=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -40,6 +42,96 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die()         { log_error "$*"; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少必要命令: $1"; }
+
+# Use the same sibling lock path and security contract as install.sh and
+# deploy.sh. setup-log-db.sh mutates the same dotenv/Compose state and must be
+# serialized with both entrypoints for its full write/recreate transaction.
+setup_project_state_lock_path() {
+  local project_dir="$1" resolved parent base
+  [[ -n "$project_dir" && "$project_dir" != "/" ]] || return 1
+  if [[ -d "$project_dir" ]]; then
+    resolved="$(cd -- "$project_dir" && pwd -P)" || return 1
+    parent="$(dirname -- "$resolved")"
+    base="$(basename -- "$resolved")"
+  else
+    parent="$(dirname -- "$project_dir")"
+    base="$(basename -- "$project_dir")"
+    [[ -d "$parent" ]] || return 1
+    parent="$(cd -- "$parent" && pwd -P)" || return 1
+  fi
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != "/" ]] || return 1
+  printf '%s/.%s.state.lock\n' "$parent" "$base"
+}
+
+setup_state_lock_fd_matches_path() {
+  local fd="$1" path="$2" fd_path fd_identity path_identity
+  [[ "$fd" =~ ^[0-9]+$ && -f "$path" && ! -L "$path" ]] || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  [[ -e "$fd_path" ]] || return 1
+  fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null)" || return 1
+  [[ "$fd_identity" == "$path_identity" ]]
+}
+
+setup_state_lock_current_uid() { id -u; }
+setup_state_lock_path_owner() { stat -c '%u' -- "$1" 2>/dev/null; }
+
+setup_state_lock_fd_is_secure() {
+  local fd="$1" path="$2" fd_path owner mode
+  setup_state_lock_fd_matches_path "$fd" "$path" || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  owner="$(stat -Lc '%u' -- "$fd_path" 2>/dev/null)" || return 1
+  mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(setup_state_lock_current_uid)" && "$mode" == "600" ]]
+}
+
+acquire_setup_state_lock() {
+  local project_dir="$1" lock_path inherited_fd inherited_path old_umask
+  lock_path="$(setup_project_state_lock_path "$project_dir")" ||
+    die "无法确定日志库配置状态锁路径"
+
+  inherited_fd="${NEWAPI_TOOLS_STATE_LOCK_FD:-}"
+  inherited_path="${NEWAPI_TOOLS_STATE_LOCK_PATH:-}"
+  if [[ "$inherited_path" == "$lock_path" ]] &&
+    setup_state_lock_fd_is_secure "$inherited_fd" "$lock_path"; then
+    flock -n "$inherited_fd" || die "继承的日志库配置状态锁已失效"
+    SETUP_STATE_LOCK_FD="$inherited_fd"
+    SETUP_STATE_LOCK_PATH="$lock_path"
+    return 0
+  fi
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    [[ -f "$lock_path" && ! -L "$lock_path" ]] ||
+      die "日志库配置状态锁不是安全的常规文件：${lock_path}"
+    [[ "$(setup_state_lock_path_owner "$lock_path")" == "$(setup_state_lock_current_uid)" ]] ||
+      die "日志库配置状态锁不属于当前用户：${lock_path}"
+  fi
+  old_umask="$(umask)"
+  umask 077
+  if ! exec {SETUP_STATE_LOCK_FD}>>"$lock_path"; then
+    umask "$old_umask"
+    die "无法打开日志库配置状态锁：${lock_path}"
+  fi
+  umask "$old_umask"
+  setup_state_lock_fd_matches_path "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁在打开时发生替换：${lock_path}"
+  [[ "$(stat -Lc '%u' -- "/proc/${BASHPID}/fd/${SETUP_STATE_LOCK_FD}" 2>/dev/null)" == \
+    "$(setup_state_lock_current_uid)" ]] ||
+    die "日志库配置状态锁打开后不属于当前用户：${lock_path}"
+  chmod 600 "/proc/${BASHPID}/fd/${SETUP_STATE_LOCK_FD}" ||
+    die "无法收紧日志库配置状态锁权限：${lock_path}"
+  setup_state_lock_fd_is_secure "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁权限或身份无效：${lock_path}"
+  flock -n "$SETUP_STATE_LOCK_FD" ||
+    die "另一个安装、部署、卸载或日志库配置进程正在操作该项目：${lock_path}"
+  setup_state_lock_fd_matches_path "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁在加锁时发生替换：${lock_path}"
+
+  SETUP_STATE_LOCK_PATH="$lock_path"
+  export NEWAPI_TOOLS_STATE_LOCK_FD="$SETUP_STATE_LOCK_FD"
+  export NEWAPI_TOOLS_STATE_LOCK_PATH="$SETUP_STATE_LOCK_PATH"
+}
 
 detect_docker_compose() {
   local output version
@@ -328,6 +420,10 @@ dsn_postgres_keyword_component() {
         ;;
       dbname)
         [[ "$seen_dbname" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 dbname"; return 1; }
+        if [[ "$value" == *=* || "${value,,}" == postgres://* || "${value,,}" == postgresql://* ]]; then
+          dsn_parse_error "PostgreSQL keyword DSN 的 dbname 不能嵌套连接串"
+          return 1
+        fi
         seen_dbname=true; dbname="$value"
         ;;
     esac
@@ -571,6 +667,21 @@ setup_target_matches_identity() {
   [[ "$current" == "$expected" ]]
 }
 
+setup_target_metadata() {
+  local target="$1"
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  stat -Lc '%d:%i %u:%g' -- "$target" 2>/dev/null
+}
+
+setup_target_matches_metadata() {
+  local target="$1" expected_identity="$2" expected_ownership="$3"
+  local metadata current_identity current_ownership
+  metadata="$(setup_target_metadata "$target")" || return 1
+  read -r current_identity current_ownership <<< "$metadata"
+  [[ "$current_identity" == "$expected_identity" &&
+    "$current_ownership" == "$expected_ownership" ]]
+}
+
 SETUP_FILE_CONTENT=""
 SETUP_FILE_IDENTITY=""
 load_setup_file_image() {
@@ -595,6 +706,7 @@ load_setup_file_image() {
 
 atomic_write_setup_file() {
   local target="$1" content="$2" expected_identity="${3:-}" parent tmp mode
+  local metadata current_identity target_ownership="" final_ownership
   parent="$(dirname "$target")"
   [[ -d "$parent" ]] || return 1
   if [[ -z "$expected_identity" ]]; then
@@ -606,21 +718,56 @@ atomic_write_setup_file() {
   elif ! setup_target_matches_identity "$target" "$expected_identity"; then
     return 1
   fi
+  if [[ "$expected_identity" != "absent" ]]; then
+    metadata="$(setup_target_metadata "$target")" || return 1
+    read -r current_identity target_ownership <<< "$metadata"
+    [[ "$current_identity" == "$expected_identity" ]] || return 1
+  fi
 
   tmp="$(umask 077; mktemp "${target}.tmp.XXXXXX")" || return 1
-  if ! printf '%s\n' "$content" > "$tmp" ||
-    ! chmod 600 "$tmp" ||
-    ! sync -f "$tmp" ||
-    ! setup_target_matches_identity "$target" "$expected_identity" ||
-    ! mv -Tf -- "$tmp" "$target" ||
-    ! sync -f "$parent"; then
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if [[ -n "$target_ownership" ]] && {
+    ! setup_target_matches_metadata "$target" "$expected_identity" "$target_ownership" ||
+      ! chown -- "$target_ownership" "$tmp"
+  }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  # Apply the final mode after ownership. Some filesystems/ACL layers adjust
+  # permission bits during chown; doing chmod last keeps the replacement at
+  # the required 0600 on every supported host.
+  if ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! sync -f "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if [[ -n "$target_ownership" ]]; then
+    setup_target_matches_metadata "$target" "$expected_identity" "$target_ownership" || {
+      rm -f -- "$tmp"
+      return 1
+    }
+  elif ! setup_target_matches_identity "$target" "$expected_identity"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! mv -Tf -- "$tmp" "$target" || ! sync -f "$parent"; then
     rm -f -- "$tmp"
     return 1
   fi
 
   [[ -f "$target" && ! -L "$target" ]] || return 1
   mode="$(stat -c '%a' -- "$target" 2>/dev/null)" || return 1
-  [[ "$mode" == "600" ]]
+  [[ "$mode" == "600" ]] || return 1
+  if [[ -n "$target_ownership" ]]; then
+    final_ownership="$(stat -c '%u:%g' -- "$target" 2>/dev/null)" || return 1
+    [[ "$final_ownership" == "$target_ownership" ]]
+  fi
 }
 
 LOG_ENV_ATTEMPT_CONTENT=""
@@ -817,6 +964,14 @@ remove_generated_log_network_override() {
 
 commit_log_db_configuration() {
   local dsn="$1" persisted_log_network="${2:-}"
+  local main_network
+  main_network="$(read_env_value NEWAPI_NETWORK)"
+  if [[ -n "$persisted_log_network" && "$persisted_log_network" == "$main_network" ]]; then
+    # The base Compose manifest already attaches newapi-tools to the main
+    # NewAPI network. Persisting the same network as LOG_NETWORK would make a
+    # later installer attach that external network under a second logical name.
+    persisted_log_network=""
+  fi
   LOG_ENV_ATTEMPT_CONTENT=""
   LOG_ENV_ATTEMPT_READY=false
   LOG_OVERRIDE_ATTEMPT_CONTENT=""
@@ -913,6 +1068,10 @@ main() {
   need_cmd docker
   detect_docker_compose
   resolve_project_dir
+  if [[ "$MODE" != "--print" ]]; then
+    need_cmd flock
+    acquire_setup_state_lock "$PROJECT_DIR"
+  fi
 
   echo ""
   echo -e "${BLUE}========================================${NC}"

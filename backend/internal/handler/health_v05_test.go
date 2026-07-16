@@ -93,7 +93,7 @@ func TestDependencyHealthTreatsStalenessAsDiagnostic(t *testing.T) {
 }
 
 func TestCollectDependencyChecksEnforcesDeadlineWhenProbeIgnoresCancellation(t *testing.T) {
-	coordinator := &dependencyProbeCoordinator{}
+	coordinator := &dependencyProbeCoordinator{probeTimeout: 25 * time.Millisecond}
 	release := make(chan struct{})
 	releaseProbe := func() {
 		select {
@@ -113,7 +113,7 @@ func TestCollectDependencyChecksEnforcesDeadlineWhenProbeIgnoresCancellation(t *
 		}
 		return DependencyCheck{Status: "healthy", OK: true}
 	}}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	started := time.Now()
@@ -213,6 +213,107 @@ func TestDependencyProbeCoordinatorSingleFlightsConcurrentRequests(t *testing.T)
 	if starts.Load() != 2 {
 		t.Fatalf("dependency starts after fresh probe = %d, want 2", starts.Load())
 	}
+}
+
+func TestDependencyProbeCoordinatorDoesNotLetFirstWaiterCancelSharedProbe(t *testing.T) {
+	coordinator := &dependencyProbeCoordinator{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var starts atomic.Int32
+	probe := dependencyProbe{name: "shared-cancellation", check: func(ctx context.Context) DependencyCheck {
+		if starts.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+			return DependencyCheck{Status: "healthy", OK: true}
+		case <-ctx.Done():
+			return DependencyCheck{Status: "cancelled", Details: map[string]any{"error": ctx.Err().Error()}}
+		}
+	}}
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	first, cached := coordinator.acquire(firstCtx, probe)
+	if cached != nil || first == nil {
+		t.Fatalf("first probe acquire = run:%p cached:%#v", first, cached)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared dependency probe did not start")
+	}
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSecond()
+	second, cached := coordinator.acquire(secondCtx, probe)
+	if cached != nil || second != first {
+		t.Fatalf("second waiter did not join shared probe: first=%p second=%p cached=%#v", first, second, cached)
+	}
+
+	cancelFirst()
+	if check := coordinator.wait(firstCtx, first, time.Now()); check.Status != "timeout" {
+		t.Fatalf("cancelled first waiter = %#v, want request-local timeout", check)
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("shared dependency probe starts = %d, want 1", starts.Load())
+	}
+	lateCtx, cancelLate := context.WithTimeout(context.Background(), time.Second)
+	defer cancelLate()
+	late, cached := coordinator.acquire(lateCtx, probe)
+	if cached != nil || late != first {
+		t.Fatalf("first waiter cancellation poisoned shared probe: first=%p late=%p cached=%#v", first, late, cached)
+	}
+
+	close(release)
+	if check := coordinator.wait(secondCtx, second, time.Now()); check.Status != "healthy" || !check.OK {
+		t.Fatalf("active second waiter inherited first cancellation: %#v", check)
+	}
+	if check := coordinator.wait(lateCtx, late, time.Now()); check.Status != "healthy" || !check.OK {
+		t.Fatalf("late waiter inherited first cancellation: %#v", check)
+	}
+	waitForDependencyProbeIdle(t, coordinator, probe.name)
+}
+
+func TestDependencyProbeCoordinatorDoesNotLetShortWaiterDeadlinePoisonSharedProbe(t *testing.T) {
+	coordinator := &dependencyProbeCoordinator{probeTimeout: time.Second}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	probe := dependencyProbe{name: "shared-short-deadline", check: func(ctx context.Context) DependencyCheck {
+		close(started)
+		select {
+		case <-release:
+			return DependencyCheck{Status: "healthy", OK: true}
+		case <-ctx.Done():
+			return DependencyCheck{Status: "cancelled", Details: map[string]any{"error": ctx.Err().Error()}}
+		}
+	}}
+
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelShort()
+	run, cached := coordinator.acquire(shortCtx, probe)
+	if cached != nil || run == nil {
+		t.Fatalf("short waiter acquire = run:%p cached:%#v", run, cached)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared dependency probe did not start")
+	}
+	if check := coordinator.wait(shortCtx, run, time.Now()); check.Status != "timeout" {
+		t.Fatalf("short waiter result = %#v, want request-local timeout", check)
+	}
+
+	lateCtx, cancelLate := context.WithTimeout(context.Background(), time.Second)
+	defer cancelLate()
+	late, cached := coordinator.acquire(lateCtx, probe)
+	if cached != nil || late != run {
+		t.Fatalf("short waiter deadline poisoned shared probe: first=%p late=%p cached=%#v", run, late, cached)
+	}
+	close(release)
+	if check := coordinator.wait(lateCtx, late, time.Now()); check.Status != "healthy" || !check.OK {
+		t.Fatalf("late waiter inherited short deadline: %#v", check)
+	}
+	waitForDependencyProbeIdle(t, coordinator, probe.name)
 }
 
 func waitForDependencyProbeIdle(t *testing.T, coordinator *dependencyProbeCoordinator, name string) {

@@ -81,9 +81,17 @@ jobs:
             echo "release tag must be annotated: $tag" >&2
             exit 1
           }
+          tag_commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}" 2>/dev/null)" || {
+            echo "release tag does not peel to a commit: $tag" >&2
+            exit 1
+          }
+          [[ "$tag_commit" == "$GITHUB_SHA" ]] || {
+            echo "release tag $tag resolves to $tag_commit, not workflow commit $GITHUB_SHA" >&2
+            exit 1
+          }
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
-            echo "release tag commit is not reachable from origin/main: $GITHUB_SHA" >&2
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            echo "release tag commit is not reachable from origin/main: $tag_commit" >&2
             exit 1
           }
 

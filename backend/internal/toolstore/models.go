@@ -225,9 +225,10 @@ type SupportNoteFilter struct {
 }
 
 type SupportNotePage struct {
-	Items      []SupportNote
-	NextCursor int64
-	HasMore    bool
+	Items         []SupportNote
+	NextCursor    int64
+	NextCreatedAt time.Time
+	HasMore       bool
 }
 
 // PriceSnapshot stores both the source decimal and its exact scaled integer.

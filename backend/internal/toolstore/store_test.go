@@ -633,6 +633,67 @@ func TestOperationAuditAppendOnlyIdempotencyAndCursor(t *testing.T) {
 	}
 }
 
+func TestOperationAuditAndReconciliationTransactionRetryAndConflictSemantics(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	auditInput := OperationAuditInput{
+		RequestID: "atomic-audit-request", Actor: "admin", SourceIP: "203.0.113.9", AuthMethod: "jwt",
+		Action: "top_ups.export.intent", TargetType: "financial_export", TargetID: "atomic-audit-request",
+		BeforeJSON: json.RawMessage(`{"status":"success"}`), AfterJSON: json.RawMessage(`{"expected_row_count":2}`),
+		Status: OperationSucceeded, IdempotencyKey: "export:atomic-audit-request:intent",
+	}
+	runInput := ReconciliationRunInput{
+		RunKey: "top-up-export-audit:atomic-audit-request", Kind: "top_up_export_audit_outcome",
+		Status: ReconciliationRunning, WindowStart: testNow.Add(-time.Second), WindowEnd: testNow,
+		StartedAt: testNow, ScannedCount: 1, DiscrepancyCount: 1, Currency: "XXX",
+		SummaryJSON: json.RawMessage(`{"phase":"pending"}`), ErrorCode: "OPERATION_AUDIT_APPEND_PENDING",
+	}
+
+	firstAudit, firstRun, err := store.AppendOperationAuditWithReconciliationRun(ctx, auditInput, runInput)
+	if err != nil {
+		t.Fatalf("first atomic append: %v", err)
+	}
+	retryAudit, retryRun, err := store.AppendOperationAuditWithReconciliationRun(ctx, auditInput, runInput)
+	if err != nil {
+		t.Fatalf("idempotent atomic retry: %v", err)
+	}
+	if retryAudit.ID != firstAudit.ID || retryRun.ID != firstRun.ID {
+		t.Fatalf("atomic retry IDs = audit:%d run:%d, want audit:%d run:%d",
+			retryAudit.ID, retryRun.ID, firstAudit.ID, firstRun.ID)
+	}
+
+	conflictingRun := runInput
+	conflictingRun.Kind = "different_reconciliation_kind"
+	if _, _, err := store.AppendOperationAuditWithReconciliationRun(ctx, auditInput, conflictingRun); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting reconciliation retry error = %v, want ErrConflict", err)
+	}
+	conflictingAudit := auditInput
+	conflictingAudit.Action = "top_ups.export.different"
+	newRun := runInput
+	newRun.RunKey = "top-up-export-audit:must-not-be-created"
+	if _, _, err := store.AppendOperationAuditWithReconciliationRun(ctx, conflictingAudit, newRun); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting audit retry error = %v, want ErrConflict", err)
+	}
+
+	var auditCount, runCount, forbiddenRunCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_audit
+		WHERE idempotency_key = ?`, auditInput.IdempotencyKey).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reconciliation_runs
+		WHERE run_key = ?`, runInput.RunKey).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reconciliation_runs
+		WHERE run_key = ?`, newRun.RunKey).Scan(&forbiddenRunCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 || runCount != 1 || forbiddenRunCount != 0 {
+		t.Fatalf("atomic retry/conflict rows = audit:%d run:%d forbidden_run:%d, want 1/1/0",
+			auditCount, runCount, forbiddenRunCount)
+	}
+}
+
 func TestCreatedAtOrderedListsUseTupleCursorWithoutChangingDefaultIDOrder(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
@@ -751,7 +812,15 @@ func TestCreatedAtOrderedListsUseTupleCursorWithoutChangingDefaultIDOrder(t *tes
 		}
 		item := page.Items[0]
 		noteTupleIDs = append(noteTupleIDs, item.ID)
-		noteBefore, noteBeforeID = item.CreatedAt, item.ID
+		if page.HasMore {
+			if page.NextCursor != item.ID || !page.NextCreatedAt.Equal(item.CreatedAt) {
+				t.Fatalf("created_at support note cursor = (%s, %d), want (%s, %d)",
+					page.NextCreatedAt, page.NextCursor, item.CreatedAt, item.ID)
+			}
+		} else if page.NextCursor != 0 || !page.NextCreatedAt.IsZero() {
+			t.Fatalf("terminal support note cursor = (%s, %d), want zero values", page.NextCreatedAt, page.NextCursor)
+		}
+		noteBefore, noteBeforeID = page.NextCreatedAt, page.NextCursor
 	}
 	assertIDs("created_at support note", noteTupleIDs, tupleWant)
 }

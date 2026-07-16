@@ -19,6 +19,34 @@ func (s *Store) AppendOperationAudit(ctx context.Context, input OperationAuditIn
 	return s.appendOperationAudit(ctx, s.db, input)
 }
 
+// AppendOperationAuditWithReconciliationRun atomically persists an immutable
+// operation audit and its reconciliation fallback. Neither record is visible
+// unless both writes and the transaction commit succeed.
+func (s *Store) AppendOperationAuditWithReconciliationRun(
+	ctx context.Context,
+	auditInput OperationAuditInput,
+	runInput ReconciliationRunInput,
+) (OperationAudit, ReconciliationRun, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return OperationAudit{}, ReconciliationRun{}, fmt.Errorf("begin operation audit and reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	audit, err := s.appendOperationAudit(ctx, tx, auditInput)
+	if err != nil {
+		return OperationAudit{}, ReconciliationRun{}, err
+	}
+	run, err := s.createReconciliationRun(ctx, tx, runInput)
+	if err != nil {
+		return OperationAudit{}, ReconciliationRun{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OperationAudit{}, ReconciliationRun{}, fmt.Errorf("commit operation audit and reconciliation: %w", err)
+	}
+	return audit, run, nil
+}
+
 // ClaimOperationAudit atomically inserts an immutable operation record and
 // reports whether this caller inserted it. Callers must continue the protected
 // side effect only when claimed is true; an existing matching row is returned

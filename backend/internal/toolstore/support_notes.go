@@ -247,7 +247,11 @@ func (s *Store) ListSupportNotes(ctx context.Context, filter SupportNoteFilter) 
 		return SupportNotePage{}, fmt.Errorf("iterate support notes: %w", err)
 	}
 	items, cursor, more := pageResult(items, limit, func(item SupportNote) int64 { return item.ID })
-	return SupportNotePage{Items: items, NextCursor: cursor, HasMore: more}, nil
+	page := SupportNotePage{Items: items, NextCursor: cursor, HasMore: more}
+	if more && filter.OrderByCreatedAt {
+		page.NextCreatedAt = items[len(items)-1].CreatedAt
+	}
+	return page, nil
 }
 
 func scanSupportNote(row rowScanner) (SupportNote, error) {

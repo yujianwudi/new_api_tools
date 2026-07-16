@@ -252,6 +252,32 @@ assert.equal(
   'a stale K1 candidate must never advance K2 directly to clear',
 )
 
+const pendingUserA = { ...replacementSnapshot, operationIdentifier: 'control-plane.user:42', targetId: '42' }
+const pendingUserB = {
+  ...replacementSnapshot,
+  operationIdentifier: 'control-plane.user:43',
+  key: '00000000-0000-4000-8000-000000000043',
+  targetId: '43',
+}
+const onlyUserA = pendingIdempotency.indexPendingMutationsByOperation([pendingUserA], 'user')
+assert.equal(
+  onlyUserA.get(pendingIdempotency.userMutationOperationIdentifier(43)),
+  undefined,
+  'a durable pending mutation for user A must not lock user B',
+)
+const pendingUsersByOperation = pendingIdempotency.indexPendingMutationsByOperation(
+  [pendingUserA, pendingUserB],
+  'user',
+)
+assert.equal(
+  pendingUsersByOperation.get(pendingIdempotency.userMutationOperationIdentifier(42))?.key,
+  pendingUserA.key,
+)
+assert.equal(
+  pendingUsersByOperation.get(pendingIdempotency.userMutationOperationIdentifier(43))?.key,
+  pendingUserB.key,
+)
+
 const failedBeginStorage = new FaultInjectingStorage()
 failedBeginStorage.ignoredSetKeys.add(PENDING_MUTATION_STORAGE_KEY)
 const failedBeginIdempotency = loadTypeScriptModule('frontend/src/lib/idempotency.ts', {
@@ -425,7 +451,8 @@ assert.match(monitor, /requireSuccessfulResponse\(response\)/)
 assert.match(monitor, /statusRequestControllerRef\.current\?\.abort\(\)/)
 assert.match(monitor, /\/api\/model-status\/config\/custom-order/)
 assert.match(monitor, /custom_order: previousPersistedOrder/)
-assert.match(monitor, /if \(!compensationSaved\) \{\s*await reloadAuthoritativeSortConfig\(mutationId\)/)
+assert.match(monitor, /if \(!orderSaved\) \{\s*await reloadAuthoritativeSortConfig\(mutationId\)\s*return false/)
+assert.match(monitor, /if \(!modeSaved\) \{[\s\S]*?await reloadAuthoritativeSortConfig\(mutationId\)\s*return false/)
 assert.match(monitor, /setSortMode\(mode\)\s*setCustomOrder\(authoritativeOrder\)/)
 assert.match(monitor, /setSortReconciliationRequired\(true\)/)
 assert.match(monitor, /if \(sortReconciliationRequired\) \{/)
@@ -439,6 +466,8 @@ assert.match(monitor, /modelsChanged \|\| tokenGroupSwitched \|\| tokenGroupMode
 assert.match(monitor, /const tokenGroupRequestIdRef = useRef\(0\)/)
 assert.match(monitor, /tokenGroupRequestControllerRef\.current\?\.abort\(\)/)
 assert.match(monitor, /requestId !== tokenGroupRequestIdRef\.current/)
+assert.match(monitor, /data\.data\.every\(isTokenGroup\)/)
+assert.match(monitor, /Array\.isArray\(group\.models\) && group\.models\.every\(model => typeof model === 'string'\)/)
 assert.match(monitor, /TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES = 5/)
 assert.match(monitor, /refreshStatusesWithLatestTokenGroups\(true\)/)
 assert.match(monitor, /nextGroupFilter = 'all'/)
@@ -454,6 +483,8 @@ assert.match(embed, /setModelStatuses\(chunkResults\.flat\(\)\)/)
 assert.match(embed, /const tokenGroupRequestIdRef = useRef\(0\)/)
 assert.match(embed, /tokenGroupRequestControllerRef\.current\?\.abort\(\)/)
 assert.match(embed, /requestId !== tokenGroupRequestIdRef\.current/)
+assert.match(embed, /data\.data\.every\(isEmbedTokenGroup\)/)
+assert.match(embed, /Array\.isArray\(group\.models\) && group\.models\.every\(model => typeof model === 'string'\)/)
 assert.match(embed, /TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES = 5/)
 assert.match(embed, /refreshStatusesWithLatestTokenGroups/)
 assert.match(embed, /nextGroupFilter = 'all'/)
@@ -462,6 +493,7 @@ const analytics = read('frontend/src/components/Analytics.tsx')
 assert.match(analytics, /replaceAnalyticsBatchRun\(batchRunRef, batchRun/)
 assert.match(analytics, /cleanupAnalyticsBatchRun\(batchRunRef, batchRun/)
 assert.match(analytics, /if \(batchRunRef\.current !== batchRun\) return/)
+assert.match(analytics, /else \{\s*void Promise\.all\(\[fetchSyncStatus\(\), fetchAnalytics\(\)\]\)\s*\}/)
 
 const authContext = read('frontend/src/contexts/AuthContext.tsx')
 assert.match(authContext, /clearReusableIdempotencyKeys\(\)/)
@@ -521,6 +553,9 @@ assert.match(userManagement, /确认解除本地锁/)
 assert.match(userManagement, /operationReleaseCandidateMatches\(deleteReleaseCandidate, pending\)/)
 assert.match(userManagement, /bindOperationReleaseCandidate\(pending, reconciliation\)/)
 assert.match(userManagement, /setDeleteReleaseCandidate\(current => operationReleaseCandidateMatches\(current, pending\)/)
+assert.match(userManagement, /indexPendingMutationsByOperation<DeleteUserPendingMutation>\(listPendingMutations\(\), 'user'\)/)
+assert.match(userManagement, /pendingDeleteMutations\.get\(userMutationOperationIdentifier\(deleteUserTarget\.userId\)\) \?\? null/)
+assert.doesNotMatch(userManagement, /listPendingMutations\(\)\.find\(item => item\.targetType === 'user'\) \?\? null/)
 assert.doesNotMatch(userManagement, /使用原内容重试|Tool Store 未发现该操作意图，已安全释放/)
 
 const topUps = read('frontend/src/components/TopUps.tsx')
