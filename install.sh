@@ -5,7 +5,7 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 安装入口:
-#   按 README.md / RELEASE_0.5.0.md 中的固定 commit URL + SHA-256 校验步骤下载后执行。
+#   按 README.md / 当前发行说明中的固定 commit URL + SHA-256 校验步骤下载后执行。
 #   不要从 tag/main URL 通过 curl process substitution 直接运行本脚本。
 #
 # 功能:
@@ -31,7 +31,7 @@ die() { log_error "$*"; exit 1; }
 REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
-INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.5.0}"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.5.1}"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
 INSTALL_COMMIT=""
@@ -39,6 +39,100 @@ NEWAPI_TOOLS_IMAGE_DERIVED=false
 NEWAPI_TOOLS_EXPECTED_REVISION=""
 REINSTALL=false
 INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
+INSTALL_ROLLBACK_ENV_AVAILABLE=false
+INSTALL_ROLLBACK_ENV_CONTENT=""
+INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+INSTALL_STATE_LOCK_FD=""
+INSTALL_STATE_LOCK_PATH=""
+
+# The lock is project-scoped but stored beside the project directory. It must
+# survive a purge and must be available before a first-install target exists.
+project_state_lock_path() {
+  local project_dir="$1" resolved parent base
+  [[ -n "$project_dir" && "$project_dir" != "/" ]] || return 1
+  if [[ -d "$project_dir" ]]; then
+    resolved="$(cd -- "$project_dir" && pwd -P)" || return 1
+    parent="$(dirname -- "$resolved")"
+    base="$(basename -- "$resolved")"
+  else
+    parent="$(dirname -- "$project_dir")"
+    base="$(basename -- "$project_dir")"
+    [[ -d "$parent" ]] || return 1
+    parent="$(cd -- "$parent" && pwd -P)" || return 1
+  fi
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != "/" ]] || return 1
+  printf '%s/.%s.state.lock\n' "$parent" "$base"
+}
+
+state_lock_fd_matches_path() {
+  local fd="$1" path="$2" fd_path fd_identity path_identity
+  [[ "$fd" =~ ^[0-9]+$ && -f "$path" && ! -L "$path" ]] || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  [[ -e "$fd_path" ]] || return 1
+  fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null)" || return 1
+  [[ "$fd_identity" == "$path_identity" ]]
+}
+
+state_lock_current_uid() { id -u; }
+state_lock_path_owner() { stat -c '%u' -- "$1" 2>/dev/null; }
+
+state_lock_fd_is_secure() {
+  local fd="$1" path="$2" fd_path owner mode
+  state_lock_fd_matches_path "$fd" "$path" || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  owner="$(stat -Lc '%u' -- "$fd_path" 2>/dev/null)" || return 1
+  mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(state_lock_current_uid)" && "$mode" == "600" ]]
+}
+
+acquire_install_state_lock() {
+  local project_dir="$1" lock_path inherited_fd inherited_path old_umask
+  lock_path="$(project_state_lock_path "$project_dir")" ||
+    die "无法确定安装状态锁路径"
+
+  inherited_fd="${NEWAPI_TOOLS_STATE_LOCK_FD:-}"
+  inherited_path="${NEWAPI_TOOLS_STATE_LOCK_PATH:-}"
+  if [[ "$inherited_path" == "$lock_path" ]] &&
+    state_lock_fd_is_secure "$inherited_fd" "$lock_path"; then
+    flock -n "$inherited_fd" || die "继承的安装状态锁已失效"
+    INSTALL_STATE_LOCK_FD="$inherited_fd"
+    INSTALL_STATE_LOCK_PATH="$lock_path"
+    return 0
+  fi
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    [[ -f "$lock_path" && ! -L "$lock_path" ]] ||
+      die "安装状态锁不是安全的常规文件：${lock_path}"
+    [[ "$(state_lock_path_owner "$lock_path")" == "$(state_lock_current_uid)" ]] ||
+      die "安装状态锁不属于当前用户：${lock_path}"
+  fi
+  old_umask="$(umask)"
+  umask 077
+  if ! exec {INSTALL_STATE_LOCK_FD}>>"$lock_path"; then
+    umask "$old_umask"
+    die "无法打开安装状态锁：${lock_path}"
+  fi
+  umask "$old_umask"
+  state_lock_fd_matches_path "$INSTALL_STATE_LOCK_FD" "$lock_path" ||
+    die "安装状态锁在打开时发生替换：${lock_path}"
+  [[ "$(stat -Lc '%u' -- "/proc/${BASHPID}/fd/${INSTALL_STATE_LOCK_FD}" 2>/dev/null)" == \
+    "$(state_lock_current_uid)" ]] ||
+    die "安装状态锁打开后不属于当前用户：${lock_path}"
+  chmod 600 "/proc/${BASHPID}/fd/${INSTALL_STATE_LOCK_FD}" ||
+    die "无法收紧安装状态锁权限：${lock_path}"
+  state_lock_fd_is_secure "$INSTALL_STATE_LOCK_FD" "$lock_path" ||
+    die "安装状态锁权限或身份无效：${lock_path}"
+  flock -n "$INSTALL_STATE_LOCK_FD" ||
+    die "另一个安装、部署或卸载进程正在操作该项目：${lock_path}"
+  state_lock_fd_matches_path "$INSTALL_STATE_LOCK_FD" "$lock_path" ||
+    die "安装状态锁在加锁时发生替换：${lock_path}"
+
+  INSTALL_STATE_LOCK_PATH="$lock_path"
+  export NEWAPI_TOOLS_STATE_LOCK_FD="$INSTALL_STATE_LOCK_FD"
+  export NEWAPI_TOOLS_STATE_LOCK_PATH="$INSTALL_STATE_LOCK_PATH"
+}
 
 validate_newapi_tools_image() {
   local image="${1:-}"
@@ -301,6 +395,22 @@ env_file_value() {
   printf '%s\n' "$value"
 }
 
+env_content_value() {
+  local content="$1" key="$2" value
+  value="$(printf '%s\n' "$content" | awk -v k="$key" '
+    index($0, k "=") == 1 { value = substr($0, length(k)+2); found = 1 }
+    END { if (found) print value }
+  ')"
+  value="${value%$'\r'}"
+  if [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\'/\'}"
+  elif [[ ${#value} -ge 2 && "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s\n' "$value"
+}
+
 dotenv_quote() {
   local value="${1-}" escaped
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "环境变量值不能包含换行"
@@ -308,20 +418,324 @@ dotenv_quote() {
   printf "'%s'" "$escaped"
 }
 
+atomic_write_install_dotenv() {
+  local target="$1" content="$2" tmp mode parent
+  parent="$(dirname "$target")"
+  [[ ! -d "$target" ]] || return 1
+  tmp="$(umask 077; mktemp "${target}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$content" > "$tmp" ||
+    ! chmod 600 "$tmp" ||
+    ! sync -f "$tmp" ||
+    ! mv -Tf -- "$tmp" "$target" ||
+    ! sync -f "$parent"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  mode="$(stat -c '%a' -- "$target" 2>/dev/null)" || return 1
+  [[ "$mode" == "600" ]]
+}
+
+install_rollback_snapshot_path() {
+  printf '%s.rollback\n' "$1"
+}
+
+install_rollback_compose_marker_path() {
+  printf '%s.rollback.compose\n' "$1"
+}
+
+install_rollback_compose_snapshot_path() {
+  local env_file="$1" name="$2"
+  printf '%s.%s\n' "$(install_rollback_compose_marker_path "$env_file")" "$name"
+}
+
+install_rollback_compose_files() {
+  printf '%s\n' \
+    'docker-compose.yml' \
+    'docker-compose.host.yml' \
+    'docker-compose.logdb.yml'
+}
+
+install_rollback_compose_state_key() {
+  case "$1" in
+    docker-compose.yml) printf 'COMPOSE_BASE\n' ;;
+    docker-compose.host.yml) printf 'COMPOSE_HOST\n' ;;
+    docker-compose.logdb.yml) printf 'COMPOSE_LOGDB\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_install_rollback_env_content() {
+  local content="$1" image="$2" project_name="$3"
+  is_immutable_newapi_tools_image "$image" || return 1
+  [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || return 1
+  printf '%s\n' "$content" |
+    awk '
+      index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
+      index($0, "COMPOSE_PROJECT_NAME=") == 1 { next }
+      { print }
+    '
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$image")"
+  printf 'COMPOSE_PROJECT_NAME=%s\n' "$(dotenv_quote "$project_name")"
+}
+
+persist_install_rollback_snapshot() {
+  local env_file="$1" content="$2" snapshot_file
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  atomic_write_install_dotenv "$snapshot_file" "$content"
+}
+
+load_install_mode600_file() {
+  local snapshot_file="$1" mode snapshot_fd fd_path
+  local path_identity fd_identity status
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" && -r "$snapshot_file" ]] || return 1
+  exec {snapshot_fd}< "$snapshot_file" || return 1
+  fd_path="/proc/${BASHPID}/fd/${snapshot_fd}"
+  if [[ ! -e "$fd_path" ]] ||
+    ! path_identity="$(stat -Lc '%d:%i' -- "$snapshot_file" 2>/dev/null)" ||
+    ! fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" ||
+    [[ "$path_identity" != "$fd_identity" ]] ||
+    [[ -L "$snapshot_file" ]] ||
+    ! mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" ||
+    [[ "$mode" != "600" ]]; then
+    exec {snapshot_fd}<&-
+    return 1
+  fi
+  cat <&"$snapshot_fd"
+  status=$?
+  exec {snapshot_fd}<&-
+  return "$status"
+}
+
+load_install_rollback_snapshot() {
+  load_install_mode600_file "$(install_rollback_snapshot_path "$1")"
+}
+
+validate_install_rollback_compose_bundle() {
+  local env_file="$1" marker marker_content name key state snapshot_file
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    state="$(env_content_value "$marker_content" "$key")"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    case "$state" in
+      present)
+        load_install_mode600_file "$snapshot_file" >/dev/null || return 1
+        ;;
+      absent)
+        [[ ! -e "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(install_rollback_compose_files)
+  [[ "$(env_content_value "$marker_content" 'COMPOSE_BASE')" == "present" ]]
+}
+
+discard_install_rollback_compose_bundle() {
+  local env_file="$1" marker name snapshot_file
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  durable_remove_install_file "$marker" || return 1
+  while IFS= read -r name; do
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    durable_remove_install_file "$snapshot_file" || return 1
+  done < <(install_rollback_compose_files)
+}
+
+persist_install_rollback_compose_bundle() {
+  local env_file="$1" project_dir="$2" marker marker_content=""
+  local name key source_file snapshot_file state
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    source_file="${project_dir}/${name}"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    state=absent
+    if [[ -e "$source_file" || -L "$source_file" ]]; then
+      [[ -f "$source_file" && ! -L "$source_file" ]] || return 1
+      atomic_write_install_dotenv "$snapshot_file" "$(<"$source_file")" || return 1
+      state=present
+    else
+      durable_remove_install_file "$snapshot_file" || return 1
+    fi
+    marker_content+="${key}=${state}"$'\n'
+  done < <(install_rollback_compose_files)
+  [[ "$(env_content_value "$marker_content" 'COMPOSE_BASE')" == "present" ]] || return 1
+  atomic_write_install_dotenv "$marker" "${marker_content%$'\n'}" || return 1
+  validate_install_rollback_compose_bundle "$env_file"
+}
+
+restore_install_rollback_compose_bundle() {
+  local env_file="$1" project_dir="$2" marker marker_content name key state snapshot_file target
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  [[ -e "$marker" || -L "$marker" ]] || return 0
+  validate_install_rollback_compose_bundle "$env_file" || return 1
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    state="$(env_content_value "$marker_content" "$key")"
+    snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    target="${project_dir}/${name}"
+    if [[ "$state" == "present" ]]; then
+      atomic_write_install_dotenv "$target" "$(load_install_mode600_file "$snapshot_file")" || return 1
+    else
+      durable_remove_install_file "$target" || return 1
+    fi
+  done < <(install_rollback_compose_files)
+}
+
+build_install_rollback_compose_args() {
+  local env_file="$1" project_dir="$2" output_name="$3" marker marker_content rollback_content
+  local state network_value log_network
+  local -n output_ref="$output_name"
+  marker="$(install_rollback_compose_marker_path "$env_file")"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    build_install_compose_args "$env_file" "$project_dir" "$output_name"
+    return
+  fi
+  validate_install_rollback_compose_bundle "$env_file" || return 1
+  marker_content="$(load_install_mode600_file "$marker")" || return 1
+  rollback_content="$(load_install_rollback_snapshot "$env_file")" || return 1
+  output_ref=(--env-file "$(install_rollback_snapshot_path "$env_file")")
+  output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.yml')")
+
+  # File existence is not activation state: release checkouts normally contain
+  # both optional overlays. Recreate the old file set from the authoritative
+  # rollback dotenv exactly as setup_compose_files selected it at deployment.
+  network_value="$(env_content_value "$rollback_content" 'NEWAPI_NETWORK')"
+  if printf '%s\n' "$rollback_content" | grep -qE '^NEWAPI_NETWORK=' &&
+    [[ -z "$network_value" ]]; then
+    state="$(env_content_value "$marker_content" 'COMPOSE_HOST')"
+    [[ "$state" == "present" ]] || return 1
+    output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.host.yml')")
+  fi
+
+  log_network="$(env_content_value "$rollback_content" 'LOG_NETWORK')"
+  if [[ -n "$log_network" && "$log_network" != "$network_value" ]]; then
+    state="$(env_content_value "$marker_content" 'COMPOSE_LOGDB')"
+    if [[ "$state" == "present" ]]; then
+      output_ref+=(-f "$(install_rollback_compose_snapshot_path "$env_file" 'docker-compose.logdb.yml')")
+    fi
+  fi
+}
+
+restore_install_rollback_snapshot() {
+  local env_file="$1" content
+  content="$(load_install_rollback_snapshot "$env_file")" || return 1
+  atomic_write_install_dotenv "$env_file" "$content"
+}
+
+remove_install_rollback_snapshot() {
+  local env_file="$1" snapshot_file parent
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  parent="$(dirname "$snapshot_file")"
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  rm -f -- "$snapshot_file" || return 1
+  [[ ! -e "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  if ! sync -f "$parent"; then
+    persist_install_rollback_snapshot "$env_file" "$INSTALL_ROLLBACK_ENV_CONTENT" || true
+    return 1
+  fi
+}
+
+commit_install_rollback_transaction() {
+  local env_file="$1"
+  remove_install_rollback_snapshot "$env_file" || return 1
+  INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  INSTALL_ROLLBACK_ENV_CONTENT=""
+  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  if ! discard_install_rollback_compose_bundle "$env_file"; then
+    # The authoritative .env rollback marker is already durably gone, so a
+    # leftover mode-600 Compose copy is inert. Do not roll back a healthy
+    # candidate after its commit point; the next transaction will replace it.
+    log_warn "部署已提交，但无法清理非活动 Compose 回滚副本"
+  fi
+}
+
+durable_remove_install_tree() {
+  local target="$1" parent base parent_abs resolved_target
+  [[ -n "$target" && "$target" != "/" ]] || return 1
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != "/" ]] || return 1
+  parent_abs="$(cd -- "$parent" && pwd -P)" || return 1
+  resolved_target="${parent_abs}/${base}"
+  [[ "$resolved_target" != "/" ]] || return 1
+  if [[ -e "$resolved_target" || -L "$resolved_target" ]]; then
+    rm -rf -- "$resolved_target" || return 1
+  fi
+  [[ ! -e "$resolved_target" && ! -L "$resolved_target" ]] || return 1
+  sync -f "$parent_abs" || return 1
+}
+
+durable_remove_install_file() {
+  local target="$1" parent removed=false
+  parent="$(dirname -- "$target")"
+  [[ ! -d "$target" || -L "$target" ]] || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    rm -f -- "$target" || return 1
+    removed=true
+  fi
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  if [[ "$removed" == "true" ]]; then
+    sync -f "$parent" || return 1
+  fi
+}
+
+comment_and_replace_install_env_key() {
+  local env_file="$1" key="$2" value="$3" comment_prefix="$4" content
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 1
+  content="$(
+    awk -v k="$key" -v prefix="$comment_prefix" '
+      index($0, k "=") == 1 { print prefix $0; next }
+      { print }
+    ' "$env_file"
+    printf '%s=%s\n' "$key" "$value"
+  )"
+  atomic_write_install_dotenv "$env_file" "$content"
+}
+
+append_install_env_content_line() {
+  local content="$1" line="$2"
+  [[ -z "$content" ]] || printf '%s\n' "$content"
+  printf '%s\n' "$line"
+}
+
+replace_install_env_content_optional() {
+  local content="$1" key="$2" value="${3-}"
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  printf '%s\n' "$content" | awk -v k="$key" 'index($0, k "=") == 1 { next } { print }'
+  if [[ -n "$value" ]]; then
+    printf '%s=%s\n' "$key" "$(dotenv_quote "$value")"
+  fi
+}
+
+stop_install_project_for_removal() {
+  local project_dir="$1" env_file="${1}/.env" image
+  local -a compose_args=()
+  [[ -f "$env_file" && ! -L "$env_file" && -f "${project_dir}/docker-compose.yml" ]] || return 1
+  setup_compose_files "$project_dir"
+  build_install_compose_args "$env_file" "$project_dir" compose_args
+  image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+  run_install_compose "$env_file" "$project_dir" "$image" "${compose_args[@]}" down -v
+}
+
 # Replace an exact dotenv key atomically. An empty value removes the key so an
 # unavailable auto-detection is not persisted as if it were configured.
 replace_optional_env_value() {
-  local env_file="$1" key="$2" value="${3-}" tmp
+  local env_file="$1" key="$2" value="${3-}" content
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "无效的环境变量名称：${key}"
-  [[ -f "$env_file" ]] || die "无法更新配置：${env_file} 不存在"
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "无法更新配置：${env_file} 不存在或不是安全的常规文件"
 
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  awk -v k="$key" 'index($0, k "=") == 1 { next } { print }' "$env_file" > "$tmp"
-  if [[ -n "$value" ]]; then
-    printf '%s=%s\n' "$key" "$(dotenv_quote "$value")" >> "$tmp"
-  fi
-  chmod 600 "$tmp"
-  mv "$tmp" "$env_file"
+  content="$(
+    awk -v k="$key" 'index($0, k "=") == 1 { next } { print }' "$env_file"
+    if [[ -n "$value" ]]; then
+      printf '%s=%s\n' "$key" "$(dotenv_quote "$value")"
+    fi
+  )"
+  atomic_write_install_dotenv "$env_file" "$content"
 }
 
 legacy_image_version_to_reference() {
@@ -350,7 +764,7 @@ migrate_image_env_file() {
     if [[ -n "$existing_image" ]]; then
       selected_image="$existing_image"
     else
-      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.5.0"
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.5.1"
     fi
   fi
   validate_newapi_tools_image "$selected_image"
@@ -368,7 +782,7 @@ migrate_image_env_file() {
     fi
   fi
   # Before pulling a candidate, every existing installation must have an
-  # immutable rollback anchor that the v0.5.0 image-policy can restart. A
+  # immutable rollback anchor that the current image-policy can restart. A
   # mutable current tag (including a legacy NEWAPI_TOOLS_VERSION or a same-tag
   # update) is resolved only from the already-local image. Zero or multiple
   # same-repository RepoDigests fail closed before any pull/down operation.
@@ -386,31 +800,27 @@ migrate_image_env_file() {
     persisted_image="$rollback_anchor"
   fi
 
-  local tmp
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  awk '
-    index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
-    index($0, "NEWAPI_TOOLS_VERSION=") == 1 {
-      print "# Deprecated by install.sh: " $0
-      next
-    }
-    { print }
-  ' "$env_file" > "$tmp"
-  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$persisted_image")" >> "$tmp"
-  chmod 600 "$tmp"
+  local content
+  content="$(
+    awk '
+      index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
+      index($0, "NEWAPI_TOOLS_VERSION=") == 1 {
+        print "# Deprecated by install.sh: " $0
+        next
+      }
+      { print }
+    ' "$env_file"
+    printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$persisted_image")"
+  )"
+  atomic_write_install_dotenv "$env_file" "$content" ||
+    die "无法原子持久化部署镜像配置"
 
-  if cmp -s "$env_file" "$tmp"; then
-    rm -f "$tmp"
-    chmod 600 "$env_file"
-  else
-    mv "$tmp" "$env_file"
-    if [[ -n "$legacy_version" ]]; then
-      log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为不可变回滚镜像 ${persisted_image}"
-    elif [[ -n "$rollback_anchor" && "$rollback_anchor" != "$current_image" ]]; then
-      log_info "已将现有镜像固定为升级回滚锚点 ${rollback_anchor}"
-    else
-      log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${persisted_image}"
-    fi
+  if [[ -n "$legacy_version" ]]; then
+    log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为不可变回滚镜像 ${persisted_image}"
+  elif [[ -n "$rollback_anchor" && "$rollback_anchor" != "$current_image" ]]; then
+    log_info "已将现有镜像固定为升级回滚锚点 ${rollback_anchor}"
+  elif [[ "$persisted_image" != "$current_image" ]]; then
+    log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${persisted_image}"
   fi
 
   NEWAPI_TOOLS_IMAGE="$selected_image"
@@ -510,6 +920,183 @@ start_install_services_and_wait() {
   verify_install_application_health "$health_mode"
 }
 
+build_install_compose_args() {
+  local env_file="$1" project_dir="$2" output_name="$3"
+  local -n output_ref="$output_name"
+  output_ref=(--env-file "$env_file")
+  if [[ -z "${COMPOSE_FILE:-}" ]]; then
+    output_ref+=(-f "${project_dir}/docker-compose.yml")
+  fi
+}
+
+capture_install_rollback_env() {
+  local env_file="$1" snapshot_file old_content rollback_reference
+  local legacy_version rollback_project rollback_image normalized_content
+  local container_names has_existing_container=false
+  INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  INSTALL_ROLLBACK_ENV_CONTENT=""
+  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    old_content="$(load_install_rollback_snapshot "$env_file")" ||
+      die "检测到不可读取、不安全或权限不是 0600 的安装回滚快照 ${snapshot_file}"
+    rollback_reference="$(env_content_value "$old_content" 'NEWAPI_TOOLS_IMAGE')"
+    rollback_project="$(env_content_value "$old_content" 'COMPOSE_PROJECT_NAME')"
+    is_immutable_newapi_tools_image "$rollback_reference" ||
+      die "安装回滚快照未固定到不可变 OCI digest"
+    [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "安装回滚快照缺少有效的 Compose project"
+    INSTALL_ROLLBACK_ENV_CONTENT="$old_content"
+    INSTALL_ROLLBACK_ENV_AVAILABLE=true
+    INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=true
+    log_warn "检测到上次未提交完成的安装事务；将先恢复权威旧部署"
+    return 0
+  fi
+
+  container_names="$(list_install_container_names)" ||
+    die "无法可靠枚举现有 Docker 容器；拒绝建立安装回滚事务"
+  if printf '%s\n' "$container_names" | grep -Fxq 'newapi-tools'; then
+    has_existing_container=true
+  elif [[ ! -e "$env_file" && ! -L "$env_file" ]]; then
+    return 0
+  fi
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "检测到已有安装配置，但缺少安全的旧 .env"
+  old_content="$(<"$env_file")"
+
+  rollback_reference="$(env_content_value "$old_content" 'NEWAPI_TOOLS_IMAGE')"
+  if [[ -z "$rollback_reference" ]]; then
+    legacy_version="$(env_content_value "$old_content" 'NEWAPI_TOOLS_VERSION')"
+    if [[ -n "$legacy_version" ]]; then
+      rollback_reference="$(legacy_image_version_to_reference "$legacy_version")"
+    fi
+  fi
+  if [[ -z "$rollback_reference" && "$has_existing_container" != "true" ]]; then
+    # A copied .env.example with empty persistent image keys is still fresh;
+    # the first candidate may be supplied only through the process environment.
+    return 0
+  fi
+  [[ -n "$rollback_reference" ]] ||
+    die "现有安装缺少 NEWAPI_TOOLS_IMAGE/NEWAPI_TOOLS_VERSION"
+  validate_newapi_tools_image "$rollback_reference"
+  if [[ "$has_existing_container" == "true" ]]; then
+    rollback_project="$(resolve_install_running_compose_project 'newapi-tools' "$env_file")" ||
+      die "无法固定现有安装的 Compose project 身份"
+    rollback_image="$(resolve_install_running_image_digest 'newapi-tools' "$rollback_reference")" ||
+      die "无法把现有安装固定为唯一 OCI digest"
+  else
+    rollback_project="$(env_content_value "$old_content" 'COMPOSE_PROJECT_NAME')"
+    [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "旧 .env 对应的容器不存在，且缺少有效的显式 COMPOSE_PROJECT_NAME；拒绝猜测回滚项目"
+    if is_immutable_newapi_tools_image "$rollback_reference"; then
+      rollback_image="$rollback_reference"
+    elif ! rollback_image="$(resolve_install_image_digest "$rollback_reference" "")"; then
+      die "旧 .env 对应的容器不存在，且可变镜像无法从本地唯一固定为同仓库 OCI digest"
+    fi
+  fi
+  normalized_content="$(normalize_install_rollback_env_content \
+    "$old_content" "$rollback_image" "$rollback_project")" ||
+    die "无法生成完整安装回滚配置"
+  persist_install_rollback_snapshot "$env_file" "$normalized_content" ||
+    die "无法原子持久化安装回滚快照"
+  atomic_write_install_dotenv "$env_file" "$normalized_content" ||
+    die "无法在升级前持久化旧安装身份"
+
+  INSTALL_ROLLBACK_ENV_CONTENT="$normalized_content"
+  INSTALL_ROLLBACK_ENV_AVAILABLE=true
+  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$rollback_project"
+}
+
+restore_install_previous_configuration() {
+  local env_file="$1" project_dir="$2" content rollback_image rollback_project
+  [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] || return 1
+  content="$(load_install_rollback_snapshot "$env_file")" || return 1
+  rollback_image="$(env_content_value "$content" 'NEWAPI_TOOLS_IMAGE')"
+  rollback_project="$(env_content_value "$content" 'COMPOSE_PROJECT_NAME')"
+  is_immutable_newapi_tools_image "$rollback_image" || return 1
+  [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || return 1
+  atomic_write_install_dotenv "$env_file" "$content" || return 1
+  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$rollback_project"
+  NEWAPI_TOOLS_IMAGE="$rollback_image"
+  export NEWAPI_TOOLS_IMAGE
+  restore_install_rollback_compose_bundle "$env_file" "$project_dir" || return 1
+  setup_compose_files "$project_dir"
+}
+
+recover_preexisting_install_rollback_snapshot() {
+  local env_file="$1" project_dir="$2" candidate_image="${NEWAPI_TOOLS_IMAGE:-}" rollback_image
+  local candidate_was_set=false
+  local -a compose_args=()
+  [[ "$INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING" == "true" ]] || return 0
+  [[ -n "${NEWAPI_TOOLS_IMAGE+x}" ]] && candidate_was_set=true
+  restore_install_previous_configuration "$env_file" "$project_dir" || return 1
+  rollback_image="$NEWAPI_TOOLS_IMAGE"
+  build_install_compose_args "$env_file" "$project_dir" compose_args
+  log_warn "正在从中断安装事务恢复旧部署 ${rollback_image}"
+  if ! run_install_compose "$env_file" "$project_dir" "$rollback_image" \
+    "${compose_args[@]}" down; then
+    log_error "清理中断安装事务当前容器失败；仍将尝试重建旧服务"
+  fi
+  if ! start_install_services_and_wait "$env_file" "$project_dir" rollback \
+    "$rollback_image" "${compose_args[@]}"; then
+    if [[ "$candidate_was_set" == "true" ]]; then
+      NEWAPI_TOOLS_IMAGE="$candidate_image"
+      export NEWAPI_TOOLS_IMAGE
+    else
+      unset NEWAPI_TOOLS_IMAGE
+    fi
+    return 1
+  fi
+  if [[ "$candidate_was_set" == "true" ]]; then
+    NEWAPI_TOOLS_IMAGE="$candidate_image"
+    export NEWAPI_TOOLS_IMAGE
+  else
+    unset NEWAPI_TOOLS_IMAGE
+  fi
+  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  log_success "已恢复并验证中断事务前的旧安装"
+}
+
+prepare_install_rollback_transaction() {
+  local env_file="$1" project_dir="$2" snapshot_file compose_marker content
+  local snapshot_was_present=false
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  compose_marker="$(install_rollback_compose_marker_path "$env_file")"
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" &&
+        "$INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING" != "true" &&
+        ( -e "$snapshot_file" || -L "$snapshot_file" ) ]]; then
+    content="$(load_install_rollback_snapshot "$env_file")" ||
+      die "安装回滚快照在更新前变得不可读"
+    INSTALL_ROLLBACK_ENV_CONTENT="$content"
+    if [[ -e "$compose_marker" || -L "$compose_marker" ]]; then
+      validate_install_rollback_compose_bundle "$env_file" ||
+        die "安装 Compose 回滚快照在更新前变得不可读"
+    else
+      persist_install_rollback_compose_bundle "$env_file" "$project_dir" ||
+        die "无法持久化旧 Compose 清单回滚快照"
+    fi
+    return 0
+  fi
+  [[ -e "$snapshot_file" || -L "$snapshot_file" ]] && snapshot_was_present=true
+  capture_install_rollback_env "$env_file"
+  recover_preexisting_install_rollback_snapshot "$env_file" "$project_dir" ||
+    die "无法恢复上次中断的安装事务；快照已保留"
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    if [[ "$snapshot_was_present" != "true" ]]; then
+      discard_install_rollback_compose_bundle "$env_file" ||
+        die "无法清理非活动 Compose 回滚副本"
+    fi
+    if [[ -e "$compose_marker" || -L "$compose_marker" ]]; then
+      validate_install_rollback_compose_bundle "$env_file" ||
+        die "安装 Compose 回滚快照不可读"
+    else
+      persist_install_rollback_compose_bundle "$env_file" "$project_dir" ||
+        die "无法持久化旧 Compose 清单回滚快照"
+    fi
+  fi
+}
+
 # Restart an existing installation as a transaction. The .env file keeps the
 # previous immutable image until the candidate is healthy; only then is the
 # candidate digest committed. Any failed candidate start (or failed commit)
@@ -519,35 +1106,69 @@ restart_install_services_transactionally() {
   shift 2
 
   local candidate_image="$NEWAPI_TOOLS_IMAGE" rollback_image container_names project_name=""
-  rollback_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+  local rollback_env_file="$env_file"
+  local rollback_content="" rollback_config_restored=true candidate_healthy=false rollback_healthy=false
+  local -a candidate_compose_args=() rollback_compose_args=()
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    rollback_content="$(load_install_rollback_snapshot "$env_file")" ||
+      die "持久化安装回滚快照不可读；拒绝切换服务"
+    rollback_image="$(env_content_value "$rollback_content" 'NEWAPI_TOOLS_IMAGE')"
+    project_name="$(env_content_value "$rollback_content" 'COMPOSE_PROJECT_NAME')"
+    [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "安装回滚快照缺少有效 Compose project"
+    INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$project_name"
+    rollback_env_file="$(install_rollback_snapshot_path "$env_file")"
+  else
+    rollback_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+    INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
+  fi
   is_immutable_newapi_tools_image "$candidate_image" ||
     die "候选镜像尚未固定为不可变 OCI digest；拒绝切换服务"
   is_immutable_newapi_tools_image "$rollback_image" ||
     die "现有服务缺少不可变回滚镜像；拒绝切换服务"
 
-  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
   if ! container_names="$(list_install_container_names)"; then
     die "无法可靠枚举现有 Docker 容器；拒绝在部署身份未知时切换服务"
   fi
-  if printf '%s\n' "$container_names" | grep -Fxq 'newapi-tools'; then
+  if [[ -z "$project_name" ]] && printf '%s\n' "$container_names" | grep -Fxq 'newapi-tools'; then
     project_name="$(resolve_install_running_compose_project 'newapi-tools' "$env_file")" ||
       die "无法建立可信的旧 Compose project 身份；拒绝切换服务"
     INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$project_name"
     replace_optional_env_value "$env_file" 'COMPOSE_PROJECT_NAME' "$project_name"
   fi
 
+  setup_compose_files "$project_dir"
+  build_install_compose_args "$env_file" "$project_dir" candidate_compose_args
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    build_install_rollback_compose_args "$env_file" "$project_dir" rollback_compose_args ||
+      die "无法构建旧 Compose 清单回滚参数"
+  else
+    rollback_compose_args=("${candidate_compose_args[@]}")
+  fi
+
   log_info "重启服务并等待候选版本健康..."
-  if ! run_install_compose "$env_file" "$project_dir" "$candidate_image" "$@" down; then
+  if ! run_install_compose "$rollback_env_file" "$project_dir" "$rollback_image" \
+    "${rollback_compose_args[@]}" down; then
     log_error "停止现有服务返回失败；按可能已部分删除处理并立即重建旧服务"
-    setup_compose_files "$project_dir"
-    if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" "$@"; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      restore_install_previous_configuration "$env_file" "$project_dir" ||
+        die "初次停止失败，且无法恢复完整旧安装配置"
+    else
+      NEWAPI_TOOLS_IMAGE="$rollback_image"
+      export NEWAPI_TOOLS_IMAGE
+      setup_compose_files "$project_dir"
+    fi
+    rollback_env_file="$env_file"
+    build_install_compose_args "$env_file" "$project_dir" rollback_compose_args
+    if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" \
+      "${rollback_compose_args[@]}"; then
       die "候选版本尚未启动；初次停止失败后已恢复旧镜像 ${rollback_image}"
     fi
     die "初次停止失败，且旧镜像 ${rollback_image} 无法恢复健康；请立即检查 docker compose ps/logs"
   fi
 
-  local candidate_healthy=false
-  if start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" "$@"; then
+  if start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" \
+    "${candidate_compose_args[@]}"; then
     candidate_healthy=true
   else
     log_error "候选服务无法启动、恢复运行时网络或通过内容健康检查，将执行回滚"
@@ -559,31 +1180,42 @@ restart_install_services_transactionally() {
     if (migrate_image_env_file "$env_file" "$candidate_image" true); then
       NEWAPI_TOOLS_IMAGE="$candidate_image"
       export NEWAPI_TOOLS_IMAGE
-      log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
-      return 0
+      if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" != "true" ]] ||
+        commit_install_rollback_transaction "$env_file"; then
+        log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+        return 0
+      fi
+      candidate_healthy=false
+      log_error "候选镜像已提交，但无法持久清理安装回滚快照，将执行回滚"
     fi
-    log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
+    [[ "$candidate_healthy" == "false" ]] ||
+      log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
   fi
 
-  NEWAPI_TOOLS_IMAGE="$rollback_image"
-  export NEWAPI_TOOLS_IMAGE
-
-  local rollback_config_restored=true
-  if ! (migrate_image_env_file "$env_file" "$rollback_image" true); then
-    rollback_config_restored=false
-    log_error "无法持久化恢复回滚镜像配置"
+  if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    if ! restore_install_previous_configuration "$env_file" "$project_dir"; then
+      rollback_config_restored=false
+      log_error "无法恢复持久化的完整旧安装配置"
+    fi
+  else
+    NEWAPI_TOOLS_IMAGE="$rollback_image"
+    export NEWAPI_TOOLS_IMAGE
+    if ! (migrate_image_env_file "$env_file" "$rollback_image" true); then
+      rollback_config_restored=false
+      log_error "无法持久化恢复回滚镜像配置"
+    fi
+    setup_compose_files "$project_dir"
   fi
 
-  # Re-read overlays after restoring the old dotenv file. COMPOSE_FILE and
-  # runtime network attachments may differ from the candidate deployment.
-  setup_compose_files "$project_dir"
+  build_install_compose_args "$env_file" "$project_dir" rollback_compose_args
 
-  if ! run_install_compose "$env_file" "$project_dir" "$rollback_image" "$@" down; then
+  if ! run_install_compose "$env_file" "$project_dir" "$rollback_image" \
+    "${rollback_compose_args[@]}" down; then
     log_error "清理失败的候选服务时发生错误；仍将尝试重建旧服务"
   fi
 
-  local rollback_healthy=false
-  if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" "$@"; then
+  if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" \
+    "${rollback_compose_args[@]}"; then
     rollback_healthy=true
   fi
 
@@ -610,15 +1242,15 @@ setup_compose_files() {
   [[ -f "$env_file" ]] || return 0
 
   local -a compose_files=("$base")
+  local newapi_network=""
 
   # 必须显式存在 NEWAPI_NETWORK 行才判断；行缺失视为老版 .env，让 base compose 走默认 fallback
   # 注意：set -e + pipefail 下，grep 无匹配会让 pipe 退出码为 1 → 整个脚本死掉，必须 || true 兜底。
   if grep -qE '^NEWAPI_NETWORK=' "$env_file" 2>/dev/null; then
-    local nw
-    nw="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
+    newapi_network="$(env_file_value "$env_file" 'NEWAPI_NETWORK')"
 
     # NEWAPI_NETWORK= （空值）→ deploy.sh 在 host 模式下生成的标记
-    if [[ -z "$nw" ]]; then
+    if [[ -z "$newapi_network" ]]; then
       [[ -f "$host_overlay" ]] ||
         die "host 模式需要 ${host_overlay}，缺少该叠加层时无法安全移除基础 external network 配置"
       require_docker_compose_v224 "host 网络叠加层 ${host_overlay} 的 !reset 语法"
@@ -628,7 +1260,7 @@ setup_compose_files() {
 
   local log_network
   log_network="$(env_file_value "$env_file" 'LOG_NETWORK')"
-  if [[ -n "$log_network" ]]; then
+  if [[ -n "$log_network" && "$log_network" != "$newapi_network" ]]; then
     if [[ -f "$log_overlay" ]]; then
       compose_files+=("$log_overlay")
     else
@@ -744,9 +1376,13 @@ check_requirements() {
 
   command -v git >/dev/null 2>&1 || missing+=("git")
   command -v docker >/dev/null 2>&1 || missing+=("docker")
+  command -v flock >/dev/null 2>&1 || missing+=("flock")
+  command -v id >/dev/null 2>&1 || missing+=("id")
   command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
+  command -v stat >/dev/null 2>&1 || missing+=("stat")
+  command -v sync >/dev/null 2>&1 || missing+=("sync")
 
-  # v0.5.0 基础 Compose 使用不可变镜像策略门禁，并与 host overlay 统一要求 v2.24+。
+  # 当前基础 Compose 使用不可变镜像策略门禁，并与 host overlay 统一要求 v2.24+。
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
     DOCKER_COMPOSE_V2_VERSION="$(get_docker_compose_v2_version)"
@@ -758,7 +1394,7 @@ check_requirements() {
     die "缺少必要命令: ${missing[*]}"
   fi
 
-  require_docker_compose_v224 "v0.5.0 不可变镜像策略门禁"
+  require_docker_compose_v224 "当前不可变镜像策略门禁"
 
   log_success "环境检查通过 (使用 $DOCKER_COMPOSE)"
 }
@@ -831,19 +1467,23 @@ sync_newapi_mutation_safety_config() {
     fi
   fi
 
-  if grep -q '^NEWAPI_REDIS_DISABLED=' "$env_file" 2>/dev/null; then
-    sed -i.bak "s|^NEWAPI_REDIS_DISABLED=.*|NEWAPI_REDIS_DISABLED=${redis_disabled}|" "$env_file" && rm -f "${env_file}.bak"
-  else
-    echo "NEWAPI_REDIS_DISABLED=${redis_disabled}" >> "$env_file"
-  fi
+  local content has_hard_delete=false has_batch_delete=false
+  grep -q '^ALLOW_UNSAFE_HARD_DELETE=' "$env_file" 2>/dev/null && has_hard_delete=true
+  grep -q '^ALLOW_UNSAFE_BATCH_DELETE=' "$env_file" 2>/dev/null && has_batch_delete=true
+  content="$(
+    awk 'index($0, "NEWAPI_REDIS_DISABLED=") == 1 { next } { print }' "$env_file"
+    printf 'NEWAPI_REDIS_DISABLED=%s\n' "$redis_disabled"
+    [[ "$has_hard_delete" == "true" ]] || printf 'ALLOW_UNSAFE_HARD_DELETE=false\n'
+    [[ "$has_batch_delete" == "true" ]] || printf 'ALLOW_UNSAFE_BATCH_DELETE=false\n'
+  )"
+  atomic_write_install_dotenv "$env_file" "$content" ||
+    die "无法原子持久化 NewAPI 写操作安全设置"
 
-  if ! grep -q '^ALLOW_UNSAFE_HARD_DELETE=' "$env_file" 2>/dev/null; then
-    echo "ALLOW_UNSAFE_HARD_DELETE=false" >> "$env_file"
+  if [[ "$has_hard_delete" != "true" ]]; then
     log_info "已加入安全默认值 ALLOW_UNSAFE_HARD_DELETE=false"
   fi
 
-  if ! grep -q '^ALLOW_UNSAFE_BATCH_DELETE=' "$env_file" 2>/dev/null; then
-    echo "ALLOW_UNSAFE_BATCH_DELETE=false" >> "$env_file"
+  if [[ "$has_batch_delete" != "true" ]]; then
     log_info "已加入安全默认值 ALLOW_UNSAFE_BATCH_DELETE=false"
   fi
 
@@ -989,6 +1629,17 @@ check_existing_installation() {
 
   # 设置 PROJECT_DIR 供后续函数使用
   PROJECT_DIR="$target_dir"
+
+  # Recover an interrupted update before exposing restart/start actions in the
+  # management menu. The snapshot remains active until a later update commits.
+  local rollback_snapshot="${target_dir}/.env.rollback"
+  if [[ -e "$rollback_snapshot" || -L "$rollback_snapshot" ]]; then
+    capture_install_rollback_env "${target_dir}/.env"
+    recover_preexisting_install_rollback_snapshot "${target_dir}/.env" "$target_dir" ||
+      die "无法在进入管理菜单前恢复上次中断的安装事务"
+    commit_install_rollback_transaction "${target_dir}/.env" ||
+      die "旧部署已恢复，但无法在进入管理菜单前提交并清理回滚快照"
+  fi
 
   log_info "检测到已安装的服务: $target_dir"
 
@@ -1350,8 +2001,11 @@ NGINX
     return 0
   fi
 
-  sed -i.bak 's|^FRONTEND_BIND=|# Disabled by install.sh: FRONTEND_BIND=|g' "$env_file" 2>/dev/null && rm -f "${env_file}.bak"
-  echo "FRONTEND_BIND=${target}" >> "$env_file"
+  comment_and_replace_install_env_key "$env_file" 'FRONTEND_BIND' "$target" \
+    '# Disabled by install.sh: ' || {
+    log_error "无法原子持久化 FRONTEND_BIND 设置"
+    return 1
+  }
   log_success "已写入 FRONTEND_BIND=${target}"
 
   setup_compose_files "$project_dir"
@@ -1424,8 +2078,11 @@ do_toggle_bind_mode_interactive() {
   fi
 
   # 注释掉所有旧的 SERVER_HOST 行（保留追溯），追加新值到末尾
-  sed -i.bak 's|^SERVER_HOST=|# Disabled by install.sh: SERVER_HOST=|g' "$env_file" 2>/dev/null && rm -f "${env_file}.bak"
-  echo "SERVER_HOST=${target}" >> "$env_file"
+  comment_and_replace_install_env_key "$env_file" 'SERVER_HOST' "$target" \
+    '# Disabled by install.sh: ' || {
+    log_error "无法原子持久化 SERVER_HOST 设置"
+    return 1
+  }
   log_success "已写入 SERVER_HOST=${target}"
 
   # 重启容器使配置生效（环境变量只在容器启动时读取）
@@ -1444,6 +2101,12 @@ do_update_interactive() {
   local project_dir="$1"
   cd "$project_dir"
 
+  # Capture the old dotenv and exact Compose bundle before checkout replaces
+  # tracked manifests. A failed candidate must restart the old image with the
+  # manifests it was actually deployed from.
+  PROJECT_DIR="$project_dir"
+  prepare_install_rollback_transaction "${project_dir}/.env" "$project_dir"
+
   # 更新代码
   if [[ -d ".git" ]]; then
     log_info "同步代码到固定版本 ${INSTALL_REF}..."
@@ -1451,7 +2114,6 @@ do_update_interactive() {
   fi
 
   # 下载 GeoIP 数据库
-  PROJECT_DIR="$project_dir"
   download_geoip_database
 
   # 迁移旧版 .env（补充 Go 版本所需字段）
@@ -1470,12 +2132,21 @@ do_update_interactive() {
   log_info "拉取最新镜像..."
   if ! run_install_compose "${project_dir}/.env" "$project_dir" "$NEWAPI_TOOLS_IMAGE" \
     pull --include-deps newapi-tools; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      restore_install_previous_configuration "${project_dir}/.env" "$project_dir" ||
+        log_error "高危：候选拉取失败后无法恢复完整旧安装配置"
+    fi
     die "拉取 newapi-tools 及其策略门禁/Redis 依赖镜像失败；当前运行中的服务保持不变"
   fi
   # Resolve the just-pulled tag to an immutable RepoDigest and validate the
   # derived image revision before stopping the currently running service.
-  pin_install_image_after_pull "${project_dir}/.env" ||
+  if ! pin_install_image_after_pull "${project_dir}/.env"; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      restore_install_previous_configuration "${project_dir}/.env" "$project_dir" ||
+        log_error "高危：候选镜像验证失败后无法恢复完整旧安装配置"
+    fi
     die "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
+  fi
 
   restart_install_services_transactionally "${project_dir}/.env" "$project_dir"
 
@@ -1586,15 +2257,25 @@ do_reconfigure_interactive() {
   log_info "重新配置服务..."
 
   # 备份旧配置
-  if [[ -f ".env" ]]; then
+  if [[ -e ".env" || -L ".env" ]]; then
+    [[ -f ".env" && ! -L ".env" ]] ||
+      die "重新配置拒绝读取不安全的 .env"
     local env_backup=".env.backup.$(date +%Y%m%d_%H%M%S)"
-    (umask 077; cp .env "$env_backup")
-    chmod 600 "$env_backup"
+    atomic_write_install_dotenv "$env_backup" "$(<.env)" ||
+      die "无法原子持久化重新配置备份"
     log_info "已备份旧配置文件"
   fi
 
+  # deploy.sh intentionally rejects a live container without an authoritative
+  # old dotenv. Establish its immutable image/project rollback identity before
+  # removing .env to enter the configuration wizard.
+  capture_install_rollback_env "${project_dir}/.env"
+  [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] ||
+    die "无法在重新配置前建立权威 .env 回滚快照"
+
   # 删除旧配置以触发重新配置
-  rm -f .env
+  durable_remove_install_file "${project_dir}/.env" ||
+    die "无法持久删除旧 .env；重新配置未启动"
 
   # 运行部署脚本
   if [[ "$NEWAPI_TOOLS_IMAGE_DERIVED" == "true" ]]; then
@@ -1638,12 +2319,16 @@ do_purge_interactive() {
 
   log_warn "正在完全卸载..."
 
-  # 停止并删除容器和 volumes
-  $DOCKER_COMPOSE down -v 2>/dev/null || true
+  # Stop services successfully before deleting the only durable configuration
+  # and rollback snapshot. A failed cleanup must never be reported as success.
+  stop_install_project_for_removal "$project_dir" ||
+    die "卸载服务清理失败；项目配置与回滚快照已保留"
 
   # 删除相关镜像
   log_info "删除相关镜像..."
-  docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'new_api_tools|newapi-tools' | xargs -r docker rmi -f 2>/dev/null || true
+  docker images --format '{{.Repository}}:{{.Tag}}' |
+    grep -E '^(ghcr\.io/(yujianwudi|james-6-23)/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' |
+    xargs -r docker rmi -f 2>/dev/null || true
 
   # 删除网络
   docker network rm newapi-tools-network 2>/dev/null || true
@@ -1656,7 +2341,8 @@ do_purge_interactive() {
 
   # 删除项目目录
   log_info "删除项目目录..."
-  rm -rf "$dir_to_remove"
+  durable_remove_install_tree "$dir_to_remove" ||
+    die "服务已清理，但无法持久删除项目目录；卸载未完成"
 
   log_success "完全卸载完成"
 }
@@ -1697,7 +2383,8 @@ do_full_reinstall_interactive() {
 
   # 停止并删除容器和 volumes
   log_info "停止并删除容器..."
-  $DOCKER_COMPOSE down -v 2>/dev/null || true
+  stop_install_project_for_removal "$project_dir" ||
+    die "重新安装前的服务清理失败；项目配置与回滚快照已保留"
 
   cleanup_project_docker_resources
 
@@ -1710,7 +2397,8 @@ do_full_reinstall_interactive() {
 
   # 删除项目目录
   log_info "删除项目目录..."
-  rm -rf "$project_dir"
+  durable_remove_install_tree "$project_dir" ||
+    die "服务已清理，但无法持久删除旧项目目录；重新安装已中止"
 
   log_success "卸载完成，开始重新安装..."
   echo ""
@@ -1743,9 +2431,8 @@ perform_cleanup() {
   
   # 尝试使用 docker-compose 停止
   if [[ -f "${target_dir}/docker-compose.yml" ]]; then
-    cd "$target_dir"
-    $DOCKER_COMPOSE down --remove-orphans 2>/dev/null || true
-    cd - >/dev/null
+    stop_install_project_for_removal "$target_dir" ||
+      die "清理旧安装时服务移除失败；项目配置与回滚快照已保留"
   fi
 
   # 强制删除可能残留的容器
@@ -1761,8 +2448,9 @@ perform_cleanup() {
 
   # 3. 删除项目目录
   log_info "删除项目目录: $target_dir"
-  if [[ -d "$target_dir" ]]; then
-    rm -rf "$target_dir"
+  if [[ -d "$target_dir" || -L "$target_dir" ]]; then
+    durable_remove_install_tree "$target_dir" ||
+      die "无法持久删除旧项目目录；清理未完成"
     log_success "已删除项目目录"
   fi
 
@@ -1856,13 +2544,14 @@ migrate_env_file() {
 
   [[ -f "$env_file" ]] || return 0
 
-  local migrated=false
+  local migrated=false content
 
   # 镜像与当前安装 ref/显式覆盖保持一致；旧 tag-only 键只用于一次性迁移。
   migrate_image_env_file "$env_file" "${NEWAPI_TOOLS_IMAGE:-}"
+  content="$(<"$env_file")"
 
   # 补充 SQL_DSN（从分离字段构建）
-  if ! grep -q '^SQL_DSN=' "$env_file" 2>/dev/null; then
+  if ! printf '%s\n' "$content" | grep -q '^SQL_DSN='; then
     local db_engine db_dns db_port db_user db_password db_name sql_dsn=""
     db_engine="$(env_file_value "$env_file" 'DB_ENGINE')"
     db_dns="$(env_file_value "$env_file" 'DB_DNS')"
@@ -1879,58 +2568,60 @@ migrate_env_file() {
       fi
     fi
 
-    echo "SQL_DSN=$(dotenv_quote "$sql_dsn")" >> "$env_file"
+    content="$(append_install_env_content_line "$content" \
+      "SQL_DSN=$(dotenv_quote "$sql_dsn")")"
     migrated=true
     log_info "已补充 SQL_DSN 配置"
   fi
 
   # 补充 TIMEZONE
-  if ! grep -q '^TIMEZONE=' "$env_file" 2>/dev/null; then
-    echo "TIMEZONE=Asia/Shanghai" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^TIMEZONE='; then
+    content="$(append_install_env_content_line "$content" 'TIMEZONE=Asia/Shanghai')"
     migrated=true
   fi
 
   # 补充 LOG_LEVEL
-  if ! grep -q '^LOG_LEVEL=' "$env_file" 2>/dev/null; then
-    echo "LOG_LEVEL=info" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^LOG_LEVEL='; then
+    content="$(append_install_env_content_line "$content" 'LOG_LEVEL=info')"
     migrated=true
   fi
 
   # 补充 REDIS_PASSWORD（避免 compose WARN）
-  if ! grep -q '^REDIS_PASSWORD=' "$env_file" 2>/dev/null; then
-    echo "REDIS_PASSWORD=''" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^REDIS_PASSWORD='; then
+    content="$(append_install_env_content_line "$content" "REDIS_PASSWORD=''")"
     migrated=true
   fi
 
   # 合并镜像的内层 Nginx 通过 loopback 访问 Go；只有精确信任的
   # 直接对端才允许后端解析 X-Forwarded-For。
-  if ! grep -q '^TRUSTED_PROXY_CIDRS=' "$env_file" 2>/dev/null; then
-    echo "TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^TRUSTED_PROXY_CIDRS='; then
+    content="$(append_install_env_content_line "$content" \
+      'TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128')"
     migrated=true
   fi
 
-  if ! grep -q '^API_KEY_ROLE=' "$env_file" 2>/dev/null; then
-    echo "API_KEY_ROLE=viewer" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^API_KEY_ROLE='; then
+    content="$(append_install_env_content_line "$content" 'API_KEY_ROLE=viewer')"
     migrated=true
   fi
 
-  if ! grep -q '^NEWAPI_ADMIN_ACCESS_TOKEN=' "$env_file" 2>/dev/null; then
-    echo "NEWAPI_ADMIN_ACCESS_TOKEN=" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^NEWAPI_ADMIN_ACCESS_TOKEN='; then
+    content="$(append_install_env_content_line "$content" 'NEWAPI_ADMIN_ACCESS_TOKEN=')"
     migrated=true
   fi
-  if ! grep -q '^NEWAPI_ADMIN_USER_ID=' "$env_file" 2>/dev/null; then
-    echo "NEWAPI_ADMIN_USER_ID=0" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^NEWAPI_ADMIN_USER_ID='; then
+    content="$(append_install_env_content_line "$content" 'NEWAPI_ADMIN_USER_ID=0')"
     migrated=true
   fi
 
   local current_newapi_baseurl
-  current_newapi_baseurl="$(env_file_value "$env_file" 'NEWAPI_BASEURL')"
+  current_newapi_baseurl="$(env_content_value "$content" 'NEWAPI_BASEURL')"
   current_newapi_baseurl="${current_newapi_baseurl#"${current_newapi_baseurl%%[![:space:]]*}"}"
   current_newapi_baseurl="${current_newapi_baseurl%"${current_newapi_baseurl##*[![:space:]]}"}"
   if [[ -z "$current_newapi_baseurl" ]]; then
     local newapi_container newapi_mode newapi_port newapi_host newapi_env detected_newapi_baseurl=""
-    newapi_container="$(env_file_value "$env_file" 'NEWAPI_CONTAINER')"
-    newapi_mode="$(env_file_value "$env_file" 'NEWAPI_NETWORK_MODE')"
+    newapi_container="$(env_content_value "$content" 'NEWAPI_CONTAINER')"
+    newapi_mode="$(env_content_value "$content" 'NEWAPI_NETWORK_MODE')"
     newapi_port=""
     if [[ -n "$newapi_container" ]] &&
       newapi_env="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$newapi_container" 2>/dev/null)"; then
@@ -1945,34 +2636,39 @@ migrate_env_file() {
     fi
 
     if [[ -n "$detected_newapi_baseurl" ]]; then
-      replace_optional_env_value "$env_file" 'NEWAPI_BASEURL' "$detected_newapi_baseurl"
+      content="$(replace_install_env_content_optional \
+        "$content" 'NEWAPI_BASEURL' "$detected_newapi_baseurl")"
       migrated=true
       log_info "已自动检测并补充 NEWAPI_BASEURL"
-    elif grep -q '^NEWAPI_BASEURL=' "$env_file" 2>/dev/null; then
-      replace_optional_env_value "$env_file" 'NEWAPI_BASEURL'
+    elif printf '%s\n' "$content" | grep -q '^NEWAPI_BASEURL='; then
+      content="$(replace_install_env_content_optional "$content" 'NEWAPI_BASEURL')"
       migrated=true
       log_warn "NEWAPI_BASEURL 仍未检测到；已移除空配置，写操作保持禁用"
     fi
   fi
 
-  if ! grep -q '^OBSERVABILITY_TOKEN=' "$env_file" 2>/dev/null; then
+  if ! printf '%s\n' "$content" | grep -q '^OBSERVABILITY_TOKEN='; then
     local observability_token
-    observability_token="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)"
-    echo "OBSERVABILITY_TOKEN=$(dotenv_quote "$observability_token")" >> "$env_file"
+    observability_token="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | sha256sum | awk '{print $1}')"
+    content="$(append_install_env_content_line "$content" \
+      "OBSERVABILITY_TOKEN=$(dotenv_quote "$observability_token")")"
     migrated=true
   fi
-  if ! grep -q '^LOG_FRESHNESS_MAX_SECONDS=' "$env_file" 2>/dev/null; then
-    echo "LOG_FRESHNESS_MAX_SECONDS=900" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^LOG_FRESHNESS_MAX_SECONDS='; then
+    content="$(append_install_env_content_line "$content" \
+      'LOG_FRESHNESS_MAX_SECONDS=900')"
     migrated=true
   fi
-  if ! grep -q '^TOOL_STORE_PATH=' "$env_file" 2>/dev/null; then
-    echo "TOOL_STORE_PATH=/app/data/control-plane.db" >> "$env_file"
+  if ! printf '%s\n' "$content" | grep -q '^TOOL_STORE_PATH='; then
+    content="$(append_install_env_content_line "$content" \
+      'TOOL_STORE_PATH=/app/data/control-plane.db')"
     migrated=true
   fi
 
-  # .env contains database credentials and signing secrets. Older installs may
-  # have inherited a permissive umask, so every migration repairs the mode.
-  chmod 600 "$env_file"
+  # Commit every migration addition/removal as one complete dotenv image. This
+  # also repairs old permissive modes without exposing a truncate/append window.
+  atomic_write_install_dotenv "$env_file" "$content" ||
+    die "无法原子持久化完整 .env 迁移结果"
 
   if [[ "$migrated" == "true" ]]; then
     log_success "已自动补充 Go 版本所需的配置字段"
@@ -2006,9 +2702,9 @@ check_server_host_security() {
     echo ""
     read -r -p "是否改为安全默认值 SERVER_HOST=127.0.0.1（推荐）? [Y/n]: " confirm
     if [[ ! "$confirm" =~ ^[nN]$ ]]; then
-      # 注释掉旧行，追加新行
-      sed -i.bak 's|^SERVER_HOST=|# Disabled by install.sh (insecure): SERVER_HOST=|' "$env_file" 2>/dev/null && rm -f "${env_file}.bak"
-      echo "SERVER_HOST=127.0.0.1" >> "$env_file"
+      comment_and_replace_install_env_key "$env_file" 'SERVER_HOST' '127.0.0.1' \
+        '# Disabled by install.sh (insecure): ' ||
+        die "无法原子持久化安全 SERVER_HOST 设置"
       log_success "已改为 SERVER_HOST=127.0.0.1"
     else
       log_info "保留 SERVER_HOST=${host_value}（确认你了解风险）"
@@ -2036,6 +2732,8 @@ quick_update() {
 
   cd "$PROJECT_DIR"
 
+  prepare_install_rollback_transaction "$env_file" "$PROJECT_DIR"
+
   # 检查并更新配置（为老用户添加 GeoIP 支持）
   check_and_update_configs
 
@@ -2062,13 +2760,22 @@ quick_update() {
   log_info "拉取最新镜像..."
   if ! run_install_compose "$env_file" "$PROJECT_DIR" "$NEWAPI_TOOLS_IMAGE" \
     "${compose_args[@]}" pull --include-deps newapi-tools; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      restore_install_previous_configuration "$env_file" "$PROJECT_DIR" ||
+        log_error "高危：候选拉取失败后无法恢复完整旧安装配置"
+    fi
     die "拉取 newapi-tools 及其策略门禁/Redis 依赖镜像失败；当前运行中的服务保持不变"
   fi
   # Resolve mutable release/SHA tags to the exact pulled RepoDigest before
   # stopping the old service. Auto-derived images also have their OCI source
   # revision checked against the checked-out commit.
-  pin_install_image_after_pull "$env_file" ||
+  if ! pin_install_image_after_pull "$env_file"; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      restore_install_previous_configuration "$env_file" "$PROJECT_DIR" ||
+        log_error "高危：候选镜像验证失败后无法恢复完整旧安装配置"
+    fi
     die "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
+  fi
 
   restart_install_services_transactionally "$env_file" "$PROJECT_DIR" "${compose_args[@]}"
 
@@ -2182,7 +2889,7 @@ NewAPI Middleware Tool - 安装管理脚本
 环境变量:
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
-  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.5.0；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.5.1；main 会锁定本次 commit 的短 SHA 镜像）
   NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；发行/自定义 ref 必填
   NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 
@@ -2218,6 +2925,7 @@ main() {
 
   check_requirements
   detect_newapi_location
+  acquire_install_state_lock "${INSTALL_DIR}/${PROJECT_NAME}"
   check_existing_installation
   clone_or_update_project
   run_deploy

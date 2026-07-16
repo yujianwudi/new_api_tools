@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import {
@@ -48,11 +48,22 @@ import { UserAnalysisDialog } from './UserAnalysisDialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs'
 import { AffiliateStats } from './AffiliateStats'
 import {
-  clearIdempotencyKey,
-  getOrCreateIdempotencyKey,
+  beginPendingMutation,
+  bindOperationReleaseCandidate,
+  clearPendingMutation,
+  fetchOperationReconciliation,
+  getPendingMutation,
   idempotencyHeader,
-  mutationResponseRequiresReconciliation,
-  type IdempotencyOperation,
+  indexPendingMutationsByOperation,
+  listPendingMutations,
+  operationReconciliationAction,
+  operationReconciliationDecision,
+  operationReleaseCandidateMatches,
+  parseUserMutationOperationTargetId,
+  userMutationOperationIdentifier,
+  type OperationReleaseCandidate,
+  type PendingMutationRecord,
+  type PendingMutationSnapshot,
 } from '../lib/idempotency'
 import {
   canSafelyHardDelete,
@@ -107,6 +118,17 @@ interface UserInfo {
   source?: string
 }
 
+interface DeleteUserMutationPayload extends Record<string, unknown> {
+  userId: number
+  username: string
+  activityLevel: string
+  hardDelete: boolean
+  reason: string
+  confirmText: string
+}
+
+type DeleteUserPendingMutation = PendingMutationRecord | PendingMutationSnapshot<DeleteUserMutationPayload>
+
 export function UserManagement() {
   const { token } = useAuth()
   const { showToast } = useToast()
@@ -157,7 +179,35 @@ export function UserManagement() {
   // 删除类高风险操作的二次确认输入
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
   const [deleteReason, setDeleteReason] = useState('')
-  const deleteOperationRef = useRef<IdempotencyOperation | null>(null)
+  const [deleteUserTarget, setDeleteUserTarget] = useState<{ userId: number; username: string; activityLevel: string } | null>(null)
+  const [pendingDeleteMutations, setPendingDeleteMutations] = useState<Map<string, DeleteUserPendingMutation>>(
+    () => indexPendingMutationsByOperation<DeleteUserPendingMutation>(listPendingMutations(), 'user'),
+  )
+  const [deleteReleaseCandidate, setDeleteReleaseCandidate] = useState<OperationReleaseCandidate | null>(null)
+  const [deleteReconciling, setDeleteReconciling] = useState(false)
+  const pendingDeleteMutation = deleteUserTarget
+    ? pendingDeleteMutations.get(userMutationOperationIdentifier(deleteUserTarget.userId)) ?? null
+    : null
+  const pendingDeleteNotice = pendingDeleteMutations.values().next().value ?? null
+  const deletePayloadLocked = pendingDeleteMutation !== null
+  const deleteReconciliationRequired = pendingDeleteMutation?.reconciliationRequired === true
+
+  const rememberPendingDeleteMutation = (pending: DeleteUserPendingMutation) => {
+    setPendingDeleteMutations(current => {
+      const next = new Map(current)
+      next.set(pending.operationIdentifier, pending)
+      return next
+    })
+  }
+
+  const forgetPendingDeleteMutation = (pending: DeleteUserPendingMutation) => {
+    setPendingDeleteMutations(current => {
+      if (!current.has(pending.operationIdentifier)) return current
+      const next = new Map(current)
+      next.delete(pending.operationIdentifier)
+      return next
+    })
+  }
 
   // 用户分析弹窗状态
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
@@ -354,11 +404,49 @@ export function UserManagement() {
   }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, showToast])
 
   // 单个用户删除状态
-  const [deleteUserTarget, setDeleteUserTarget] = useState<{ userId: number; username: string; activityLevel: string } | null>(null)
   const [deleteMode, setDeleteMode] = useState<'soft' | 'hard'>('soft')
 
+  const openPendingMutationDialog = (pending: DeleteUserPendingMutation, username?: string) => {
+    let userId: number
+    try {
+      userId = parseUserMutationOperationTargetId(pending.operationIdentifier, pending.targetId)
+    } catch (error) {
+      showToast(
+        'error',
+        error instanceof Error
+          ? `待对账操作的用户 ID 无效，持久锁已保留：${error.message}`
+          : '待对账操作的用户 ID 无效，持久锁已保留',
+      )
+      return
+    }
+    rememberPendingDeleteMutation(pending)
+    setDeleteReleaseCandidate(current => operationReleaseCandidateMatches(current, pending) ? current : null)
+    setDeleteUserTarget({
+      userId,
+      username: username || `用户 #${pending.targetId}`,
+      activityLevel: '',
+    })
+    setDeleteMode(pending.action === 'user.hard_delete' ? 'hard' : 'soft')
+    setDeleteConfirmText('')
+    setDeleteReason('')
+    setConfirmDialog({
+      isOpen: true,
+      title: '用户操作待对账',
+      message: `操作 ${pending.action}（用户 #${pending.targetId}）已有持久化幂等所有权，只能依据 Tool Store 审计结果解除锁定。`,
+      type: 'danger',
+      onConfirm: () => { },
+    })
+  }
+
   const deleteUser = async (userId: number, username: string) => {
+    const existing = getPendingMutation(userMutationOperationIdentifier(userId))
+    if (existing) {
+      openPendingMutationDialog(existing, username)
+      showToast('error', '该用户已有待对账操作，请先读取 Tool Store 审计结果')
+      return
+    }
     const userToDelete = users.find(u => u.id === userId)
+    setDeleteReleaseCandidate(null)
     setDeleteUserTarget({ userId, username, activityLevel: userToDelete?.activity_level || '' })
     setDeleteMode('soft')
     setDeleteConfirmText('')
@@ -374,8 +462,12 @@ export function UserManagement() {
 
   const executeDeleteUser = async () => {
     if (!deleteUserTarget) return
+    if (pendingDeleteMutation) {
+      showToast('error', '当前用户操作已有持久化幂等所有权，请先对账')
+      return
+    }
 
-    const { userId, activityLevel } = deleteUserTarget
+    const { userId, username, activityLevel } = deleteUserTarget
     const hardDelete = deleteMode === 'hard'
     const reason = deleteReason.trim()
     const confirmText = deleteConfirmText.trim()
@@ -385,39 +477,68 @@ export function UserManagement() {
       showToast('error', 'NewAPI 能力探测未确认安全硬删除，已切回注销模式')
       return
     }
-    const fingerprint = JSON.stringify({ userId, hardDelete, reason, confirmText })
-    const idempotencyKey = getOrCreateIdempotencyKey(deleteOperationRef, fingerprint, 'user-management.delete')
+    const action = hardDelete ? 'user.hard_delete' : 'user.delete'
+    const operationIdentifier = userMutationOperationIdentifier(userId)
+    let pending: PendingMutationSnapshot<DeleteUserMutationPayload>
+    try {
+      pending = beginPendingMutation({
+        operationIdentifier,
+        fingerprint: JSON.stringify({ action, target_id: String(userId), reason, confirm_text: confirmText }),
+        action,
+        targetType: 'user',
+        targetId: String(userId),
+        payload: { userId, username, activityLevel, hardDelete, reason, confirmText },
+      })
+    } catch (error) {
+      const existing = getPendingMutation(operationIdentifier)
+      if (existing) openPendingMutationDialog(existing, username)
+      showToast('error', error instanceof Error ? error.message : '该用户已有待对账操作')
+      return
+    }
 
+    rememberPendingDeleteMutation(pending)
+    setDeleteReleaseCandidate(null)
     setDeleting(true)
     try {
-      const response = await fetch(`${apiUrl}/api/users/${userId}?hard_delete=${hardDelete}`, {
+      const response = await fetch(`${apiUrl}/api/users/${pending.payload.userId}?hard_delete=${pending.payload.hardDelete}`, {
         method: 'DELETE',
-        headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
+        headers: { ...getAuthHeaders(), ...idempotencyHeader(pending.key) },
         body: JSON.stringify({
-          confirm_text: confirmText,
-          reason,
+          confirm_text: pending.payload.confirmText,
+          reason: pending.payload.reason,
         }),
       })
       const data = await response.json()
       if (data.success) {
-        clearIdempotencyKey(deleteOperationRef)
-        showToast('success', data.message)
+        const lockCleared = clearPendingMutation(pending)
+        if (lockCleared) {
+          forgetPendingDeleteMutation(pending)
+        } else {
+          rememberPendingDeleteMutation(getPendingMutation(pending.operationIdentifier) ?? pending)
+        }
+        if (lockCleared) setDeleteReleaseCandidate(null)
+        showToast(
+          lockCleared ? 'success' : 'error',
+          lockCleared
+            ? data.message
+            : '操作已生效并写入审计，但浏览器未能清理本地锁；请保留页面并重新对账',
+        )
         // 直接从本地状态移除用户，避免重新加载
-        setUsers(prev => prev.filter(u => u.id !== userId))
+        setUsers(prev => prev.filter(u => u.id !== pending.payload.userId))
         setTotal(prev => prev - 1)
         // 更新统计数据（本地计算）
         if (stats) {
           setStats(prev => prev ? {
             ...prev,
             total_users: prev.total_users - 1,
-            active_users: activityLevel === 'active' ? prev.active_users - 1 : prev.active_users,
-            inactive_users: activityLevel === 'inactive' ? prev.inactive_users - 1 : prev.inactive_users,
-            very_inactive_users: activityLevel === 'very_inactive' ? prev.very_inactive_users - 1 : prev.very_inactive_users,
-            never_requested: activityLevel === 'never' ? prev.never_requested - 1 : prev.never_requested,
+            active_users: pending.payload.activityLevel === 'active' ? prev.active_users - 1 : prev.active_users,
+            inactive_users: pending.payload.activityLevel === 'inactive' ? prev.inactive_users - 1 : prev.inactive_users,
+            very_inactive_users: pending.payload.activityLevel === 'very_inactive' ? prev.very_inactive_users - 1 : prev.very_inactive_users,
+            never_requested: pending.payload.activityLevel === 'never' ? prev.never_requested - 1 : prev.never_requested,
           } : null)
         }
         // 如果是软删除，更新软删除计数
-        if (!hardDelete) {
+        if (!pending.payload.hardDelete) {
           fetchSoftDeletedCount()
         }
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -425,13 +546,11 @@ export function UserManagement() {
         setDeleteReason('')
         setDeleteUserTarget(null)
       } else {
-        showToast('error', mutationResponseRequiresReconciliation(data)
-          ? '删除结果不确定，请先对账，切勿修改内容后重新提交'
-          : data.error?.message || data.message || '删除失败')
+        showToast('error', data.error?.message || data.message || '提交未成功；幂等所有权已锁定，请读取审计结果')
       }
     } catch (error) {
       console.error('Failed to delete user:', error)
-      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
+      showToast('error', '网络中断，幂等所有权已保留；请读取 Tool Store 审计结果，切勿直接重试')
     } finally {
       setDeleting(false)
     }
@@ -442,6 +561,55 @@ export function UserManagement() {
     setDeleteConfirmText('')
     setDeleteReason('')
     setDeleteUserTarget(null)
+  }
+
+  const reconcileDeleteUser = async () => {
+    const pending = pendingDeleteMutation
+    if (!pending) return
+    setDeleteReconciling(true)
+    try {
+      const candidateMatches = operationReleaseCandidateMatches(deleteReleaseCandidate, pending)
+      const reconciliation = candidateMatches
+        ? deleteReleaseCandidate
+        : await fetchOperationReconciliation(apiUrl, getAuthHeaders(), pending)
+      const decision = operationReconciliationDecision(reconciliation.status)
+      const nextAction = operationReconciliationAction(reconciliation.status, candidateMatches)
+      if (nextAction === 'keep_locked') {
+        setDeleteReleaseCandidate(null)
+        const message = reconciliation.status === 'not_found'
+          ? 'Tool Store 尚未发现可证明终态的审计记录；原请求可能仍在到达，当前操作继续锁定'
+          : reconciliation.status === 'pending'
+            ? `审计 #${reconciliation.audit_id} 仍只有操作意图，当前操作继续锁定`
+            : `审计 #${reconciliation.audit_id} 已标记 cancelled，结果仍不确定；请在控制平面人工处置`
+        showToast('error', message)
+        return
+      }
+      if (nextAction === 'confirm_release') {
+        setDeleteReleaseCandidate(bindOperationReleaseCandidate(pending, reconciliation))
+        showToast('info', `审计 #${reconciliation.audit_id} 确认为 ${reconciliation.status}；操作未生效。请再次点击“确认解除本地锁”`)
+        return
+      }
+      if (!clearPendingMutation(pending)) {
+        rememberPendingDeleteMutation(getPendingMutation(pending.operationIdentifier) ?? pending)
+        showToast('error', '审计已确认终态，但浏览器未能安全清理本地锁；请勿重试并再次对账')
+        return
+      }
+      setDeleteReleaseCandidate(null)
+      forgetPendingDeleteMutation(pending)
+      setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+      setDeleteConfirmText('')
+      setDeleteReason('')
+      setDeleteUserTarget(null)
+      showToast(decision === 'applied' ? 'success' : 'info', decision === 'applied'
+        ? `审计 #${reconciliation.audit_id} 确认操作已经生效，已解除提交锁`
+        : `审计 #${reconciliation.audit_id} 确认为 ${reconciliation.status}，已释放本地所有权，可创建新操作`)
+      void Promise.all([fetchUsers(), fetchStats(), fetchSoftDeletedCount()])
+    } catch (error) {
+      console.error('Failed to reconcile user deletion:', error)
+      showToast('error', '对账失败，删除表单保持锁定，请检查网络后重试')
+    } finally {
+      setDeleteReconciling(false)
+    }
   }
 
   const previewBatchDelete = async (level: string, hardDelete: boolean = false) => {
@@ -634,6 +802,8 @@ export function UserManagement() {
   const confirmActionDisabled = Boolean(
     confirmDialog.loading ||
     deleting ||
+    deleteReconciling ||
+    deleteReconciliationRequired ||
     (currentDialogConfirmText && deleteConfirmText !== currentDialogConfirmText) ||
     (deleteUserTarget && deleteReason.trim().length < 3) ||
     (deleteUserTarget && deleteMode === 'hard' && !hardDeleteAvailable)
@@ -652,6 +822,29 @@ export function UserManagement() {
           刷新
         </Button>
       </div>
+
+      {pendingDeleteNotice && (
+        <div className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
+            <div>
+              <p className="font-medium text-foreground">用户操作待审计对账</p>
+              <p className="text-sm text-muted-foreground">
+                {pendingDeleteNotice.action} · 用户 #{pendingDeleteNotice.targetId}。刷新页面不会解除该锁，只有 Tool Store 的明确终态才能解锁。
+              </p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => openPendingMutationDialog(pendingDeleteNotice)}
+            disabled={deleting || deleteReconciling}
+          >
+            <RefreshCw className="mr-2 h-4 w-4" />
+            查看并对账
+          </Button>
+        </div>
+      )}
 
       <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'list' | 'affiliate')} className="w-full">
         <TabsList className="grid w-full max-w-md grid-cols-2">
@@ -1113,6 +1306,19 @@ export function UserManagement() {
           ) : deleteUserTarget ? (
             /* 单个用户删除 - 显示模式选择 */
             <div className="py-4 space-y-4">
+              {deletePayloadLocked && (
+                <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+                  <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+                  <span>
+                    该用户已有持久化操作锁。浏览器不会盲目重试，只能读取 Tool Store 的明确终态后解锁。
+                    {deleteReleaseCandidate && (
+                      <span className="block mt-1 font-medium text-amber-700 dark:text-amber-300">
+                        审计 #{deleteReleaseCandidate.audit_id} 已确认为 {deleteReleaseCandidate.status}。请显式确认后解除本地锁。
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
               <div className="text-sm text-muted-foreground">
                 用户: <span className="font-medium text-foreground">{deleteUserTarget.username}</span>
               </div>
@@ -1123,6 +1329,7 @@ export function UserManagement() {
                     name="deleteMode"
                     checked={deleteMode === 'soft'}
                     onChange={() => { setDeleteMode('soft'); setDeleteConfirmText('') }}
+                    disabled={deletePayloadLocked}
                     className="mt-1"
                   />
                   <div>
@@ -1144,7 +1351,7 @@ export function UserManagement() {
                     name="deleteMode"
                     checked={deleteMode === 'hard'}
                     onChange={() => { setDeleteMode('hard'); setDeleteConfirmText('') }}
-                    disabled={!hardDeleteAvailable}
+                    disabled={!hardDeleteAvailable || deletePayloadLocked}
                     className="mt-1"
                   />
                   <div>
@@ -1168,6 +1375,7 @@ export function UserManagement() {
                   onChange={(e) => setDeleteReason(e.target.value)}
                   placeholder="例如：用户主动申请注销"
                   maxLength={1000}
+                  disabled={deletePayloadLocked}
                 />
               </div>
               <div className="border-t pt-4">
@@ -1182,6 +1390,7 @@ export function UserManagement() {
                   onChange={(e) => setDeleteConfirmText(e.target.value)}
                   placeholder={`请输入 ${currentDialogConfirmText}`}
                   className={deleteMode === 'hard' ? "border-red-300 focus:border-red-500 focus:ring-red-500" : "border-orange-300 focus:border-orange-500 focus:ring-orange-500"}
+                  disabled={deletePayloadLocked}
                 />
               </div>
             </div>
@@ -1231,22 +1440,33 @@ export function UserManagement() {
               </Button>
             ) : (
               <>
-                <Button variant="outline" onClick={deleteUserTarget ? closeDeleteDialog : () => { setConfirmDialog(prev => ({ ...prev, isOpen: false })); setDeleteConfirmText(''); setDeleteReason('') }}>
-                  取消
+                <Button variant="outline" onClick={deleteUserTarget ? closeDeleteDialog : () => { setConfirmDialog(prev => ({ ...prev, isOpen: false })); setDeleteConfirmText(''); setDeleteReason('') }} disabled={deleteReconciling}>
+                  {deletePayloadLocked ? '暂时关闭' : '取消'}
                 </Button>
-                <Button
-                  variant={confirmDialog.type === 'danger' || (deleteUserTarget !== null && deleteMode === 'hard') ? 'destructive' : 'default'}
-                  onClick={() => {
-                    if (deleteUserTarget) {
-                      executeDeleteUser()
-                    } else {
-                      confirmDialog.onConfirm()
-                    }
-                  }}
-                  disabled={confirmActionDisabled}
-                >
-                  {deleting ? '正在提交...' : deleteUserTarget ? (deleteMode === 'hard' ? '确认彻底删除' : '确认注销') : (confirmDialog.hardDelete ? '确认彻底删除' : '确认注销')}
-                </Button>
+                {deleteReconciliationRequired && deleteUserTarget ? (
+                  <Button onClick={reconcileDeleteUser} disabled={deleting || deleteReconciling}>
+                    {deleteReconciling ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                    {deleteReleaseCandidate ? '确认解除本地锁' : '重新对账'}
+                  </Button>
+                ) : (
+                  <Button
+                    variant={confirmDialog.type === 'danger' || (deleteUserTarget !== null && deleteMode === 'hard') ? 'destructive' : 'default'}
+                    onClick={() => {
+                      if (deleteUserTarget) {
+                        executeDeleteUser()
+                      } else {
+                        confirmDialog.onConfirm()
+                      }
+                    }}
+                    disabled={confirmActionDisabled}
+                  >
+                    {deleting
+                      ? '正在提交...'
+                      : deleteUserTarget
+                        ? deleteMode === 'hard' ? '确认彻底删除' : '确认注销'
+                        : (confirmDialog.hardDelete ? '确认彻底删除' : '确认注销')}
+                  </Button>
+                )}
               </>
             )}
           </DialogFooter>

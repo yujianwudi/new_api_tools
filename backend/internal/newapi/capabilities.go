@@ -8,7 +8,7 @@ import (
 
 // Only exact stable releases and exact -rc.N prereleases are understood.
 // Any other suffix is an unknown contract and must remain read-only.
-var versionPattern = regexp.MustCompile(`(?i)^v?(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$`)
+var versionPattern = regexp.MustCompile(`(?i)^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.(0|[1-9][0-9]*))?$`)
 
 type Capabilities struct {
 	Version                    string `json:"version"`

@@ -7,7 +7,7 @@
 # Stage 1: Build Go binary
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS builder
 ARG TARGETARCH
-ARG APP_VERSION=0.5.0
+ARG APP_VERSION=0.5.1
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 

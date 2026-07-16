@@ -13,6 +13,18 @@ import (
 	"github.com/new-api-tools/backend/internal/util"
 )
 
+const (
+	defaultTopUpFinancialMonths = 12
+	maxTopUpFinancialMonths     = 24
+)
+
+func normalizeTopUpFinancialMonths(months int) int {
+	if months < 1 || months > maxTopUpFinancialMonths {
+		return defaultTopUpFinancialMonths
+	}
+	return months
+}
+
 // TopUpTrendPoint represents a single data point in the revenue trend
 type TopUpTrendPoint struct {
 	Date         string  `json:"date"`
@@ -362,6 +374,7 @@ func topUpTrendsMonthly(startTs, endTs int64) ([]TopUpTrendPoint, error) {
 
 // GetTopUpFinancialSummary returns monthly financial summaries
 func GetTopUpFinancialSummary(months int) ([]TopUpFinancialSummary, error) {
+	months = normalizeTopUpFinancialMonths(months)
 	cm := cache.Get()
 	cacheKey := fmt.Sprintf("topup:financial:%d", months)
 	var cached []TopUpFinancialSummary
@@ -373,7 +386,7 @@ func GetTopUpFinancialSummary(months int) ([]TopUpFinancialSummary, error) {
 	now := time.Now()
 	loc := now.Location()
 
-	result := make([]TopUpFinancialSummary, 0, months)
+	result := make([]TopUpFinancialSummary, 0)
 
 	for i := 0; i < months; i++ {
 		// Calculate month boundaries

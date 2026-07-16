@@ -771,6 +771,18 @@ func TestPendingAuditCapacityFailsClosedWithoutEvictingEvidence(t *testing.T) {
 	}
 }
 
+func TestRedisAuditStoreRejectsOversizedBatchesBeforeRedis(t *testing.T) {
+	store := &redisAutoGroupAuditStore{}
+	oversized := make([]string, int(autoGroupMaxPendingLogs)+1)
+
+	if _, err := store.ReserveIDs(context.Background(), len(oversized)); err == nil || !strings.Contains(err.Error(), "supported limit") {
+		t.Fatalf("oversized ID reservation was not rejected before Redis access: %v", err)
+	}
+	if err := store.StageLogs(context.Background(), oversized); err == nil || !strings.Contains(err.Error(), "supported limit") {
+		t.Fatalf("oversized staging batch was not rejected before Redis access: %v", err)
+	}
+}
+
 func TestAutoGroupRejectsFutureAuditVersion(t *testing.T) {
 	entry := map[string]interface{}{
 		"audit_version": float64(autoGroupAuditVersion + 1),

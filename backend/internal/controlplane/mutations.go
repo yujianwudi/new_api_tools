@@ -39,6 +39,7 @@ const (
 	defaultRedemptionCreateTimeout       = 50 * time.Second
 	defaultRedemptionDeleteTimeout       = 50 * time.Second
 	defaultRedemptionAuditReserve        = 5 * time.Second
+	defaultUserMutationTimeout           = 50 * time.Second
 	defaultOutcomeAuditTimeout           = 5 * time.Second
 	newAPIAdminRole                int64 = 10
 	newAPIRootRole                 int64 = 100
@@ -202,6 +203,7 @@ type Service struct {
 	redemptionCreateTimeout time.Duration
 	redemptionDeleteTimeout time.Duration
 	redemptionAuditReserve  time.Duration
+	userMutationTimeout     time.Duration
 	outcomeAuditTimeout     time.Duration
 }
 
@@ -219,6 +221,7 @@ func NewService(upstream UpstreamClient, store *toolstore.Store, mainDB *databas
 		redemptionCreateTimeout: defaultRedemptionCreateTimeout,
 		redemptionDeleteTimeout: defaultRedemptionDeleteTimeout,
 		redemptionAuditReserve:  defaultRedemptionAuditReserve,
+		userMutationTimeout:     defaultUserMutationTimeout,
 		outcomeAuditTimeout:     defaultOutcomeAuditTimeout,
 	}
 }
@@ -241,8 +244,10 @@ func (s *Service) MutateUser(ctx context.Context, meta OperationMeta, request Us
 		action = "user.hard_delete"
 	}
 	targetID := strconv.Itoa(request.UserID)
+	workCtx, operationDeadline, auditReserve, cancelOperation := s.userMutationContext(ctx)
+	defer cancelOperation()
 
-	unlock, err := s.mutationLocks.lockAll(ctx,
+	unlock, err := s.mutationLocks.lockAll(workCtx,
 		"idempotency:"+strings.TrimSpace(meta.IdempotencyKey),
 		"target:user:"+targetID,
 	)
@@ -262,7 +267,7 @@ func (s *Service) MutateUser(ctx context.Context, meta OperationMeta, request Us
 	if err != nil {
 		return MutationResult{}, err
 	}
-	replay, auditID, foundAudit, err := s.lookupOperation(ctx, meta, action, "user", targetID, intent.Request)
+	replay, auditID, foundAudit, err := s.lookupOperation(workCtx, meta, action, "user", targetID, intent.Request)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -270,7 +275,7 @@ func (s *Service) MutateUser(ctx context.Context, meta OperationMeta, request Us
 		return MutationResult{Action: action, TargetID: targetID, Replayed: true, AuditID: auditID}, nil
 	}
 
-	before, found, err := s.readUserState(ctx, request.UserID)
+	before, found, err := s.readUserState(workCtx, request.UserID)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -288,7 +293,7 @@ func (s *Service) MutateUser(ctx context.Context, meta OperationMeta, request Us
 	if targetRole >= newAPIAdminRole && normalizeActorRole(meta.ActorRole) != "admin" {
 		return MutationResult{}, ErrAdminRoleRequired
 	}
-	replay, auditID, err = s.beginOperation(ctx, meta, action, "user", targetID, intent)
+	replay, auditID, err = s.beginOperation(workCtx, meta, action, "user", targetID, intent)
 	if err != nil {
 		return MutationResult{}, err
 	}
@@ -296,25 +301,25 @@ func (s *Service) MutateUser(ctx context.Context, meta OperationMeta, request Us
 		return MutationResult{Action: action, TargetID: targetID, Replayed: true, AuditID: auditID}, nil
 	}
 
-	capabilities, version, err := s.detectCapabilities(ctx)
+	capabilities, version, err := s.detectCapabilities(workCtx)
 	if err != nil {
-		auditCtx, cancel := s.newOutcomeContext(ctx)
+		auditCtx, cancel := newOutcomeContext(ctx, operationDeadline, auditReserve)
 		defer cancel()
 		return MutationResult{}, s.finishFailure(auditCtx, meta, action, "user", targetID, intent, "NEWAPI_STATUS_UNAVAILABLE", toolstore.OperationFailed, err)
 	}
 	if !capabilities.AdminUserManage || (request.HardDelete && !capabilities.HardDeleteSafe) {
 		denied := fmt.Errorf("%w: NewAPI %s is read-only for %s", ErrCapabilityUnavailable, version, action)
-		auditCtx, cancel := s.newOutcomeContext(ctx)
+		auditCtx, cancel := newOutcomeContext(ctx, operationDeadline, auditReserve)
 		defer cancel()
 		return MutationResult{}, s.finishFailure(auditCtx, meta, action, "user", targetID, intent, "NEWAPI_CAPABILITY_UNAVAILABLE", toolstore.OperationDenied, denied)
 	}
 
 	if request.HardDelete {
-		err = s.upstream.HardDeleteUser(ctx, request.UserID, capabilities)
+		err = s.upstream.HardDeleteUser(workCtx, request.UserID, capabilities)
 	} else {
-		err = s.upstream.ManageUser(ctx, newapi.ManageUserRequest{ID: request.UserID, Action: request.Action})
+		err = s.upstream.ManageUser(workCtx, newapi.ManageUserRequest{ID: request.UserID, Action: request.Action})
 	}
-	auditCtx, cancel := s.newOutcomeContext(ctx)
+	auditCtx, cancel := newOutcomeContext(ctx, operationDeadline, auditReserve)
 	defer cancel()
 	if err != nil {
 		uncertain := isUncertainUpstreamError(err)
@@ -688,12 +693,36 @@ func (s *Service) finishFailure(ctx context.Context, meta OperationMeta, action,
 	return operationErr
 }
 
-func (s *Service) newOutcomeContext(parent context.Context) (context.Context, context.CancelFunc) {
-	timeout := s.outcomeAuditTimeout
+// userMutationContext starts the total user-write budget before any process
+// lock or database preflight. All potentially blocking pre-upstream work and
+// the NewAPI call share workCtx; the earlier work deadline leaves a bounded
+// tail for an outcome audit without exceeding the overall operation deadline.
+func (s *Service) userMutationContext(parent context.Context) (
+	context.Context, time.Time, time.Duration, context.CancelFunc,
+) {
+	timeout := s.userMutationTimeout
 	if timeout <= 0 {
-		timeout = defaultOutcomeAuditTimeout
+		timeout = defaultUserMutationTimeout
 	}
-	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+	auditReserve := s.outcomeAuditTimeout
+	if auditReserve <= 0 {
+		auditReserve = defaultOutcomeAuditTimeout
+	}
+	if auditReserve >= timeout {
+		auditReserve = timeout / 10
+	}
+	deadline := time.Now().Add(timeout)
+	workDeadline := deadline.Add(-auditReserve)
+	workCtx, cancel := context.WithDeadline(parent, workDeadline)
+	return workCtx, deadline, auditReserve, cancel
+}
+
+func newOutcomeContext(parent context.Context, operationDeadline time.Time, auditReserve time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(auditReserve)
+	if operationDeadline.Before(deadline) {
+		deadline = operationDeadline
+	}
+	return context.WithDeadline(context.WithoutCancel(parent), deadline)
 }
 
 func (s *Service) redemptionOperationContexts(parent context.Context, configuredTimeout, fallbackTimeout time.Duration) (

@@ -129,10 +129,62 @@ grep -Fq '      redis:' <<< "$newapi_service_block" ||
 policy_pull_count="$(grep -hF 'pull --include-deps newapi-tools' install.sh deploy.sh | wc -l | tr -d '[:space:]')"
 [[ "$policy_pull_count" == "3" ]] ||
   fail 'install/deploy must pre-pull all Compose dependencies before stopping existing services'
-release_docs=(README.md RELEASE_0.5.0.md)
-for release_doc in "${release_docs[@]}"; do
-  [[ -f "$release_doc" ]] || fail "required release document is missing: $release_doc"
-done
+if grep -Fq 'docker compose pull && docker compose down' docker-compose.yml; then
+  fail 'docker-compose.yml must not recommend a destructive pull/down/up update sequence'
+fi
+grep -Fq '使用固定安装器或 ./deploy.sh 执行事务更新' docker-compose.yml ||
+  fail 'docker-compose.yml must direct updates through the transactional installer/deployer'
+
+frontend_docker_dependabot_count="$(awk '
+  function unquote(value, first, last, single_quote) {
+    first = substr(value, 1, 1)
+    last = substr(value, length(value), 1)
+    single_quote = sprintf("%c", 39)
+    if ((first == "\"" && last == "\"") ||
+        (first == single_quote && last == single_quote)) {
+      return substr(value, 2, length(value) - 2)
+    }
+    return value
+  }
+  function flush_update() {
+    if (ecosystem == "docker" && directory == "/frontend") count++
+  }
+  $1 == "-" && $2 == "package-ecosystem:" {
+    flush_update()
+    ecosystem = unquote($3)
+    directory = ""
+    next
+  }
+  $1 == "directory:" { directory = unquote($2) }
+  END {
+    flush_update()
+    print count + 0
+  }
+' .github/dependabot.yml)"
+[[ "$frontend_docker_dependabot_count" == "1" ]] ||
+  fail 'Dependabot must cover frontend/Dockerfile with exactly one docker update entry'
+
+mapfile -t versioned_release_docs < <(
+  find . -maxdepth 1 -type f -name 'RELEASE_[0-9]*.[0-9]*.[0-9]*.md' -print |
+    sed 's#^./##' | sort -V
+)
+(( ${#versioned_release_docs[@]} > 0 )) || fail 'repository contains no versioned release documents'
+release_docs=(README.md "${versioned_release_docs[@]}")
+
+grep -Fq \
+  '生产部署必须使用发行页核验过并与发行 commit 绑定的 OCI manifest digest。' \
+  RELEASE_0.5.0.md ||
+  fail 'release notes must require a verified OCI manifest digest for production'
+if grep -Fq '生产环境应使用 `0.5.0` 或 OCI digest。' RELEASE_0.5.0.md; then
+  fail 'release notes must not recommend the mutable 0.5.0 OCI tag for production'
+fi
+if grep -Fq '稳定部署应使用 `0.2.0` 或 digest。' RELEASE_0.2.0.md; then
+  fail 'historical release notes must not recommend a mutable OCI tag for stable deployment'
+fi
+grep -Fq \
+  '`latest`、`0.2`、`0.2.0` 与短提交 SHA 都是可变 OCI tag，均可被重新指向其他镜像。' \
+  RELEASE_0.2.0.md ||
+  fail 'historical release notes must identify every published v0.2 image alias as mutable'
 
 if grep -Eqs 'bash[[:space:]]*<\([[:space:]]*curl|curl[^#|]*\|[[:space:]]*(ba)?sh' \
   install.sh "${release_docs[@]}"; then
@@ -141,30 +193,102 @@ fi
 
 # The image manifest digest and merge commit are only known after the protected
 # tag build completes, so those values stay fail-closed placeholders in the
-# repository copy. The installer itself is already committed: pin its exact
-# commit and the SHA-256 of the current Git blob so documentation cannot drift
-# back to executing an unchecked remote script.
-installer_sha256="$(git cat-file blob HEAD:install.sh | sha256sum | awk '{print $1}')"
-[[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]] ||
-  fail 'could not calculate the committed install.sh SHA-256'
-for release_doc in "${release_docs[@]}"; do
+# repository copy. Historical release documents must bind their installer to
+# the matching protected tag. A not-yet-tagged document for the current source
+# version may temporarily bind to HEAD until its tag is created.
+pending_release_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' \
+  backend/internal/buildinfo/buildinfo.go)"
+[[ "$pending_release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  fail 'could not determine the pending source release version'
+
+release_target_for_version() {
+  local version="$1" tag
+  tag="refs/tags/v${version}"
+  if git show-ref --verify --quiet "$tag"; then
+    printf '%s^{commit}\n' "$tag"
+  elif [[ "$version" == "$pending_release_version" ]]; then
+    printf 'HEAD\n'
+  else
+    return 1
+  fi
+}
+
+release_version_at_least() {
+  local current="$1" minimum="$2"
+  [[ "$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n1)" == "$minimum" ]]
+}
+
+validate_release_installer_pin() {
+  local release_doc="$1" version="$2" installer_commit installer_sha256
+  local committed_installer_sha256 release_target
+  installer_commit="$(sed -n 's/^INSTALLER_COMMIT_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$release_doc")"
+  installer_sha256="$(sed -n 's/^INSTALL_SCRIPT_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$release_doc")"
+  if [[ -z "$installer_commit" && -z "$installer_sha256" ]]; then
+    if release_version_at_least "$version" '0.5.0'; then
+      fail "$release_doc must pin its installer commit and checksum"
+    fi
+    return 0
+  fi
+  [[ "$installer_commit" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "$release_doc release install template must pin exactly one installer commit"
+  [[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$release_doc release install template must pin exactly one installer checksum"
+  git cat-file -e "${installer_commit}^{commit}" 2>/dev/null ||
+    fail "$release_doc installer commit is not present in repository history"
+  release_target="$(release_target_for_version "$version")" ||
+    fail "$release_doc has no matching release tag and is not the pending source version"
+  git merge-base --is-ancestor "$installer_commit" "$release_target" ||
+    fail "$release_doc installer commit is not an ancestor of its release source ${release_target}"
+  committed_installer_sha256="$(git cat-file blob "${installer_commit}:install.sh" | sha256sum | awk '{print $1}')"
+  [[ "$committed_installer_sha256" == "$installer_sha256" ]] ||
+    fail "$release_doc installer checksum does not match its pinned commit"
   grep -Fq \
     'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>' \
     "$release_doc" ||
     fail "$release_doc release install template must require the exact manifest digest"
   grep -Fq 'NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA>' "$release_doc" ||
     fail "$release_doc release install template must bind the image to the expected release commit"
-  grep -Eq '^INSTALLER_COMMIT_SHA=[0-9a-f]{40}$' "$release_doc" ||
-    fail "$release_doc release install template must pin an exact installer commit"
-  grep -Fq "INSTALL_SCRIPT_SHA256=${installer_sha256}" "$release_doc" ||
-    fail "$release_doc release install template must pin the committed install.sh checksum"
   grep -Fq \
     'https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh' \
     "$release_doc" ||
     fail "$release_doc release install template must download from the pinned installer commit"
   grep -Fq 'sha256sum -c -' "$release_doc" ||
     fail "$release_doc release install template must verify the downloaded installer"
+  if release_version_at_least "$version" '0.5.1'; then
+    grep -Fq \
+      'printf '\''%s  %s\n'\'' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1' \
+      "$release_doc" ||
+      fail "$release_doc release install template must stop before execution when checksum verification fails"
+  fi
+}
+
+for release_doc in "${versioned_release_docs[@]}"; do
+  release_version="${release_doc#RELEASE_}"
+  release_version="${release_version%.md}"
+  [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    fail "invalid versioned release document name: $release_doc"
+  validate_release_installer_pin "$release_doc" "$release_version"
 done
+
+readme_release_version="$(sed -n 's/^# NewAPI Tools v\([0-9][0-9.]*\)$/\1/p' README.md)"
+[[ "$readme_release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  fail 'README must declare exactly one semantic release version'
+readme_release_doc="RELEASE_${readme_release_version}.md"
+[[ -f "$readme_release_doc" ]] ||
+  fail "README release document is missing: $readme_release_doc"
+validate_release_installer_pin README.md "$readme_release_version"
+readme_installer_commit="$(sed -n 's/^INSTALLER_COMMIT_SHA=\([0-9a-f]\{40\}\)$/\1/p' README.md)"
+release_installer_commit="$(sed -n 's/^INSTALLER_COMMIT_SHA=\([0-9a-f]\{40\}\)$/\1/p' "$readme_release_doc")"
+readme_installer_sha256="$(sed -n 's/^INSTALL_SCRIPT_SHA256=\([0-9a-f]\{64\}\)$/\1/p' README.md)"
+release_installer_sha256="$(sed -n 's/^INSTALL_SCRIPT_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$readme_release_doc")"
+[[ "$readme_installer_commit" == "$release_installer_commit" &&
+   "$readme_installer_sha256" == "$release_installer_sha256" ]] ||
+  fail 'README installer pin must match its current versioned release document'
+
+workflow_dependabot_path_count="$(grep -cF "      - '.github/dependabot.yml'" \
+  .github/workflows/build.yml || true)"
+[[ "$workflow_dependabot_path_count" == "2" ]] ||
+  fail 'build workflow push and pull_request paths must include .github/dependabot.yml'
 
 # Every remote GitHub Action and reusable workflow must use a full commit SHA.
 while IFS= read -r workflow; do

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -385,6 +386,78 @@ func TestControlPlaneUserTimelineMergesSourcesWithStableCursor(t *testing.T) {
 		if allEvents[index].Freshness.ObservedAt > allEvents[index-1].Freshness.ObservedAt {
 			t.Fatalf("timeline order increased at %d: %d > %d", index, allEvents[index].Freshness.ObservedAt, allEvents[index-1].Freshness.ObservedAt)
 		}
+	}
+}
+
+func TestControlPlaneTimelineToolStoreCursorUsesCreatedAtAndIDTuple(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "timeline-tool-store.db")
+	store, err := toolstore.Init(storePath)
+	if err != nil {
+		t.Fatalf("open timeline tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	mainDB, logDB, service := newControlPlaneSearchTestService(t, store, database.LogSourceStatus{
+		Mode: database.LogSourceModeDedicated, Configured: true, Healthy: true,
+	})
+	createControlPlaneSearchMainTables(t, mainDB)
+	createControlPlaneSearchLogsTable(t, logDB, true)
+
+	risks := make([]toolstore.RiskCase, 0, 4)
+	for index := 1; index <= 4; index++ {
+		item, err := store.CreateRiskCase(context.Background(), toolstore.RiskCaseInput{
+			CaseKey: "tuple-risk-" + strconv.Itoa(index), Title: "Tuple risk", SubjectType: "user", SubjectID: "42",
+			Severity: toolstore.RiskSeverityHigh, Status: toolstore.RiskCaseOpen,
+		})
+		if err != nil {
+			t.Fatalf("create tuple risk %d: %v", index, err)
+		}
+		risks = append(risks, item)
+	}
+	rawStore, err := sqlx.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open raw timeline tool store: %v", err)
+	}
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	createdTimes := []time.Time{base.Add(3 * time.Second), base.Add(time.Second), base.Add(2 * time.Second), base.Add(2 * time.Second)}
+	for index, item := range risks {
+		createdAt := createdTimes[index].UnixMilli()
+		if _, err := rawStore.Exec(`UPDATE risk_cases SET created_at = ?, updated_at = ? WHERE id = ?`, createdAt, createdAt, item.ID); err != nil {
+			_ = rawStore.Close()
+			t.Fatalf("rewrite tuple risk timestamp %d: %v", index, err)
+		}
+	}
+	if err := rawStore.Close(); err != nil {
+		t.Fatalf("close raw timeline tool store: %v", err)
+	}
+
+	before := ""
+	got := make([]string, 0, 4)
+	for pageNumber := 0; pageNumber < 5; pageNumber++ {
+		page, err := service.UserTimeline(context.Background(), 42, before, 1)
+		if err != nil {
+			t.Fatalf("tuple timeline page %d: %v", pageNumber, err)
+		}
+		for _, event := range page.Events {
+			if event.Source == "tool_store.risk_cases" {
+				got = append(got, event.EventID)
+			}
+		}
+		if !page.HasMore {
+			break
+		}
+		if page.NextCursor == nil {
+			t.Fatalf("tuple timeline page %d omitted cursor", pageNumber)
+		}
+		before = *page.NextCursor
+	}
+	want := []string{
+		"risk_case:" + strconv.FormatInt(risks[0].ID, 10),
+		"risk_case:" + strconv.FormatInt(risks[3].ID, 10),
+		"risk_case:" + strconv.FormatInt(risks[2].ID, 10),
+		"risk_case:" + strconv.FormatInt(risks[1].ID, 10),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("non-monotonic timestamp pagination = %v, want %v", got, want)
 	}
 }
 

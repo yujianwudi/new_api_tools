@@ -133,4 +133,4 @@ ghcr.io/yujianwudi/new_api_tools:<发行提交前7位SHA>
 ghcr.io/yujianwudi/new_api_tools:latest
 ```
 
-`latest` 跟随可变的 `main`，稳定部署应使用 `0.2.0` 或 digest。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
+`latest`、`0.2`、`0.2.0` 与短提交 SHA 都是可变 OCI tag，均可被重新指向其他镜像。生产部署应使用核验过的 OCI manifest digest；镜像同时支持 `linux/amd64` 与 `linux/arm64`。

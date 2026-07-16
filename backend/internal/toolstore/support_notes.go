@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const supportNoteColumns = `id, subject_type, subject_id, author, body, visibility,
@@ -200,11 +201,33 @@ func (s *Store) ListSupportNotes(ctx context.Context, filter SupportNoteFilter) 
 	if !filter.IncludeDeleted {
 		query.WriteString(" AND deleted_at IS NULL")
 	}
-	if filter.BeforeID > 0 {
-		query.WriteString(" AND id < ?")
-		args = append(args, filter.BeforeID)
+	if filter.OrderByCreatedAt {
+		if filter.BeforeID < 0 {
+			return SupportNotePage{}, fmt.Errorf("%w: before_id cannot be negative", ErrInvalid)
+		}
+		if filter.BeforeCreatedAt.IsZero() != (filter.BeforeID == 0) ||
+			(!filter.BeforeCreatedAt.IsZero() && filter.BeforeCreatedAt.UnixMilli() < 0) {
+			return SupportNotePage{}, fmt.Errorf("%w: created_at cursor requires a non-negative timestamp and positive id", ErrInvalid)
+		}
+		if filter.BeforeID > 0 {
+			before := filter.BeforeCreatedAt.UTC().Truncate(time.Millisecond)
+			query.WriteString(" AND (created_at < ? OR (created_at = ? AND id < ?))")
+			args = append(args, dbTime(before), dbTime(before), filter.BeforeID)
+		}
+		query.WriteString(" ORDER BY created_at DESC, id DESC LIMIT ?")
+	} else {
+		if filter.BeforeID < 0 {
+			return SupportNotePage{}, fmt.Errorf("%w: before_id cannot be negative", ErrInvalid)
+		}
+		if !filter.BeforeCreatedAt.IsZero() {
+			return SupportNotePage{}, fmt.Errorf("%w: created_at cursor requires created_at ordering", ErrInvalid)
+		}
+		if filter.BeforeID > 0 {
+			query.WriteString(" AND id < ?")
+			args = append(args, filter.BeforeID)
+		}
+		query.WriteString(" ORDER BY id DESC LIMIT ?")
 	}
-	query.WriteString(" ORDER BY id DESC LIMIT ?")
 	args = append(args, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query.String(), args...)
@@ -224,7 +247,11 @@ func (s *Store) ListSupportNotes(ctx context.Context, filter SupportNoteFilter) 
 		return SupportNotePage{}, fmt.Errorf("iterate support notes: %w", err)
 	}
 	items, cursor, more := pageResult(items, limit, func(item SupportNote) int64 { return item.ID })
-	return SupportNotePage{Items: items, NextCursor: cursor, HasMore: more}, nil
+	page := SupportNotePage{Items: items, NextCursor: cursor, HasMore: more}
+	if more && filter.OrderByCreatedAt {
+		page.NextCreatedAt = items[len(items)-1].CreatedAt
+	}
+	return page, nil
 }
 
 func scanSupportNote(row rowScanner) (SupportNote, error) {

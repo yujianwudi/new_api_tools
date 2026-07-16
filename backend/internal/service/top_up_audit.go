@@ -464,7 +464,7 @@ func GetTopUpAnomalies(days int, pendingHours int, limit int) (*TopUpAnomalies, 
 		return nil, fmt.Errorf("top-up anomalies query failed: %w", err)
 	}
 
-	items := make([]TopUpAnomalyRecord, 0, limit)
+	items := make([]TopUpAnomalyRecord, 0)
 	for _, row := range rows {
 		rec := TopUpRecord{
 			ID:                toInt64(row["id"]),

@@ -130,7 +130,7 @@ export function TopUps() {
     fetchPaymentFilters()
   }, [apiUrl, getAuthHeaders])
 
-  const fetchStatistics = useCallback(async () => {
+  const fetchStatistics = useCallback(async (): Promise<boolean> => {
     const requestSequence = ++statisticsRequestSequence.current
     statisticsAbortController.current?.abort()
     const controller = new AbortController()
@@ -145,11 +145,16 @@ export function TopUps() {
         signal: controller.signal,
       })
       const data = await response.json()
-      if (requestSequence !== statisticsRequestSequence.current) return
-      if (data.success) setStatistics(data.data)
+      if (requestSequence !== statisticsRequestSequence.current) return false
+      if (data.success) {
+        setStatistics(data.data)
+        return true
+      }
+      return false
     } catch (error) {
-      if (controller.signal.aborted || requestSequence !== statisticsRequestSequence.current) return
+      if (controller.signal.aborted || requestSequence !== statisticsRequestSequence.current) return false
       console.error('Failed to fetch statistics:', error)
+      return false
     } finally {
       if (requestSequence === statisticsRequestSequence.current) {
         if (statisticsAbortController.current === controller) statisticsAbortController.current = null
@@ -158,7 +163,7 @@ export function TopUps() {
     }
   }, [apiUrl, getAuthHeaders, startDate, endDate])
 
-  const fetchRecords = useCallback(async () => {
+  const fetchRecords = useCallback(async (showErrorToast = true): Promise<boolean> => {
     const requestSequence = ++recordsRequestSequence.current
     recordsAbortController.current?.abort()
     const controller = new AbortController()
@@ -179,17 +184,21 @@ export function TopUps() {
         signal: controller.signal,
       })
       const data = await response.json()
-      if (requestSequence !== recordsRequestSequence.current) return
+      if (requestSequence !== recordsRequestSequence.current) return false
       if (data.success) {
         const result: PaginatedResponse = data.data
         setRecords(Array.isArray(result?.items) ? result.items : [])
         setTotal(typeof result?.total === 'number' ? result.total : 0)
         setTotalPages(typeof result?.total_pages === 'number' ? result.total_pages : 1)
-      } else { showToast('error', data.error?.message || '获取充值记录失败') }
+        return true
+      }
+      if (showErrorToast) showToast('error', data.error?.message || '获取充值记录失败')
+      return false
     } catch (error) {
-      if (controller.signal.aborted || requestSequence !== recordsRequestSequence.current) return
-      showToast('error', '网络错误，请重试')
+      if (controller.signal.aborted || requestSequence !== recordsRequestSequence.current) return false
+      if (showErrorToast) showToast('error', '网络错误，请重试')
       console.error('Failed to fetch records:', error)
+      return false
     } finally {
       if (requestSequence === recordsRequestSequence.current) {
         if (recordsAbortController.current === controller) recordsAbortController.current = null
@@ -210,9 +219,19 @@ export function TopUps() {
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchRecords(), fetchStatistics()])
-    setRefreshing(false)
-    showToast('success', '数据已刷新')
+    try {
+      const results = await Promise.all([fetchRecords(false), fetchStatistics()])
+      const successCount = results.filter(Boolean).length
+      if (successCount === results.length) {
+        showToast('success', '数据已刷新（2/2 成功）')
+      } else if (successCount === 1) {
+        showToast('error', '部分数据刷新失败（1/2 成功）')
+      } else {
+        showToast('error', '数据刷新失败（0/2 成功）')
+      }
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   // 复用记录 tab 的过滤条件导出 CSV。fetch + blob 走 Authorization；

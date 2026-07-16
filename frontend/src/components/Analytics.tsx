@@ -2,6 +2,11 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
+import {
+  cleanupAnalyticsBatchRun,
+  refreshAnalyticsBatchState,
+  replaceAnalyticsBatchRun,
+} from '../lib/analyticsBatch'
 import { RefreshCw, Trash2, AlertTriangle, Loader2, Timer, ChevronDown } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
@@ -64,6 +69,16 @@ interface SyncStatus {
 
 const BATCH_MAX_TOTAL_TIMEOUT_MS = 10 * 60 * 1000
 const BATCH_REQUEST_TIMEOUT_MS = 30 * 1000
+type BatchStopReason = 'manual' | 'timeout' | null
+
+interface AnalyticsBatchRun {
+  controller: AbortController
+  requestController: AbortController | null
+  timeout: number | null
+  stopReason: BatchStopReason
+  startTime: number
+  totalProcessed: number
+}
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
@@ -147,19 +162,17 @@ export function Analytics() {
   const [processing, setProcessing] = useState(false)
   const [batchProcessing, setBatchProcessing] = useState(false)
   const [isPageRefresh, setIsPageRefresh] = useState(false)
-  const batchAbortRef = useRef(false)
-  const batchStartTimeRef = useRef(0)
-  const batchTotalProcessedRef = useRef(0)
-  const batchControllerRef = useRef<AbortController | null>(null)
-  const batchRequestControllerRef = useRef<AbortController | null>(null)
-  const batchTimeoutRef = useRef<number | null>(null)
-  const batchStopReasonRef = useRef<'manual' | 'timeout' | null>(null)
+  const batchRunRef = useRef<AnalyticsBatchRun | null>(null)
 
   useEffect(() => () => {
-    batchAbortRef.current = true
-    batchControllerRef.current?.abort()
-    batchRequestControllerRef.current?.abort()
-    if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
+    const batchRun = batchRunRef.current
+    batchRun?.controller.abort()
+    batchRun?.requestController?.abort()
+    if (batchRun?.timeout !== null && batchRun?.timeout !== undefined) {
+      window.clearTimeout(batchRun.timeout)
+      batchRun.timeout = null
+    }
+    batchRunRef.current = null
   }, [])
 
   // 从 localStorage 恢复倒计时，或使用默认值
@@ -494,41 +507,41 @@ export function Analytics() {
   }
 
   const startBatchProcess = async () => {
-    batchControllerRef.current?.abort()
-    batchRequestControllerRef.current?.abort()
-    if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
-
     const batchController = new AbortController()
-    batchControllerRef.current = batchController
+    const batchRun: AnalyticsBatchRun = {
+      controller: batchController,
+      requestController: null,
+      timeout: null,
+      stopReason: null,
+      startTime: Date.now(),
+      totalProcessed: 0,
+    }
+    replaceAnalyticsBatchRun(batchRunRef, batchRun, timeout => window.clearTimeout(timeout))
     setBatchProcessing(true)
-    batchAbortRef.current = false
-    batchStopReasonRef.current = null
-    batchStartTimeRef.current = Date.now()
-    batchTotalProcessedRef.current = 0
     let consecutiveFailures = 0
     let completed = false
     const MAX_CONSECUTIVE_FAILURES = 3
 
-    batchTimeoutRef.current = window.setTimeout(() => {
-      batchStopReasonRef.current = 'timeout'
-      batchAbortRef.current = true
+    const batchTimeout = window.setTimeout(() => {
+      if (batchRunRef.current !== batchRun) return
+      batchRun.stopReason = 'timeout'
       batchController.abort()
-      batchRequestControllerRef.current?.abort()
+      batchRun.requestController?.abort()
     }, BATCH_MAX_TOTAL_TIMEOUT_MS)
+    batchRun.timeout = batchTimeout
 
     try {
-      while (!batchAbortRef.current && !batchController.signal.aborted) {
-        if (Date.now() - batchStartTimeRef.current >= BATCH_MAX_TOTAL_TIMEOUT_MS) {
-          batchStopReasonRef.current = 'timeout'
-          batchAbortRef.current = true
+      while (!batchController.signal.aborted) {
+        if (Date.now() - batchRun.startTime >= BATCH_MAX_TOTAL_TIMEOUT_MS) {
+          batchRun.stopReason = 'timeout'
           batchController.abort()
-          batchRequestControllerRef.current?.abort()
+          batchRun.requestController?.abort()
           break
         }
 
         try {
           const requestController = new AbortController()
-          batchRequestControllerRef.current = requestController
+          batchRun.requestController = requestController
           let requestTimedOut = false
           const abortRequest = () => requestController.abort()
           batchController.signal.addEventListener('abort', abortRequest, { once: true })
@@ -559,14 +572,14 @@ export function Analytics() {
           } finally {
             window.clearTimeout(requestTimeout)
             batchController.signal.removeEventListener('abort', abortRequest)
-            if (batchRequestControllerRef.current === requestController) {
-              batchRequestControllerRef.current = null
+            if (batchRun.requestController === requestController) {
+              batchRun.requestController = null
             }
           }
 
           if (responseOk && data.success) {
             consecutiveFailures = 0
-            batchTotalProcessedRef.current += (data.total_processed || 0)
+            batchRun.totalProcessed += (data.total_processed || 0)
             await fetchSyncStatus(batchController.signal)
             if (batchController.signal.aborted) break
 
@@ -596,37 +609,32 @@ export function Analytics() {
         }
       }
 
-      const stopReason = batchStopReasonRef.current as 'manual' | 'timeout' | null
+      if (batchRunRef.current !== batchRun) return
+      const stopReason = batchRun.stopReason
       if (completed) {
-        if (batchTimeoutRef.current !== null) {
-          window.clearTimeout(batchTimeoutRef.current)
-          batchTimeoutRef.current = null
-        }
-        showToast('success', `同步完成！共处理 ${batchTotalProcessedRef.current.toLocaleString()} 条日志`)
-        await Promise.all([fetchSyncStatus(), fetchAnalytics()])
+        window.clearTimeout(batchTimeout)
+        batchRun.timeout = null
+        showToast('success', `同步完成！共处理 ${batchRun.totalProcessed.toLocaleString()} 条日志`)
       } else if (stopReason === 'manual') {
         showToast('info', '批处理已手动停止')
-        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       } else if (stopReason === 'timeout') {
-        const elapsed = Date.now() - batchStartTimeRef.current
+        const elapsed = Date.now() - batchRun.startTime
         showToast('info', `批处理已运行 ${Math.max(1, Math.floor(elapsed / 60000))} 分钟，自动停止。可再次点击继续处理。`)
-        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       }
+      await refreshAnalyticsBatchState(fetchSyncStatus, fetchAnalytics)
     } finally {
-      if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
-      batchTimeoutRef.current = null
-      batchRequestControllerRef.current?.abort()
-      batchRequestControllerRef.current = null
-      if (batchControllerRef.current === batchController) batchControllerRef.current = null
-      setBatchProcessing(false)
+      if (cleanupAnalyticsBatchRun(batchRunRef, batchRun, timeout => window.clearTimeout(timeout))) {
+        setBatchProcessing(false)
+      }
     }
   }
 
   const stopBatchProcess = () => {
-    batchStopReasonRef.current = 'manual'
-    batchAbortRef.current = true
-    batchControllerRef.current?.abort()
-    batchRequestControllerRef.current?.abort()
+    const batchRun = batchRunRef.current
+    if (!batchRun) return
+    batchRun.stopReason = 'manual'
+    batchRun.controller.abort()
+    batchRun.requestController?.abort()
   }
 
   const resetAnalytics = async () => {

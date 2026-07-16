@@ -100,6 +100,33 @@ func TestHTTP502IsNotAuthoritativeAPIError(t *testing.T) {
 	}
 }
 
+func TestRetryOriented4xxStatusesAreNotAuthoritativeAPIErrors(t *testing.T) {
+	for _, statusCode := range []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+				_, _ = w.Write([]byte(`{"success":false,"message":"retry later"}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "token", 1, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if statusCode == http.StatusTooManyRequests {
+				client.maxBodyBytes = 8
+			}
+			err = client.ManageUser(context.Background(), ManageUserRequest{ID: 42, Action: "disable"})
+			if err == nil {
+				t.Fatalf("status %d was accepted", statusCode)
+			}
+			var apiErr *APIError
+			if errors.As(err, &apiErr) {
+				t.Fatalf("status %d error = %#v, must remain non-authoritative", statusCode, apiErr)
+			}
+		})
+	}
+}
+
 func TestHTTP400IsAuthoritativeAPIErrorWithInvalidBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -279,6 +306,10 @@ func TestDetectCapabilitiesVersionGate(t *testing.T) {
 		"v1.0.0-rc.22garbage",
 		"v1.0.0+build.1",
 		"v1.0.0garbage",
+		"v01.0.0",
+		"v1.00.0",
+		"v1.0.00",
+		"v1.0.0-rc.021",
 	} {
 		t.Run(version, func(t *testing.T) {
 			capabilities := DetectCapabilities(version)

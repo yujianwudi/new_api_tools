@@ -31,6 +31,8 @@ TOOLS_CONTAINER="newapi-tools"
 # ENV_FILE / COMPOSE_FILE 在 resolve_project_dir() 中确定（支持 curl 直跑）
 ENV_FILE=""
 COMPOSE_FILE=""
+SETUP_STATE_LOCK_FD=""
+SETUP_STATE_LOCK_PATH=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -41,10 +43,118 @@ die()         { log_error "$*"; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少必要命令: $1"; }
 
+# Use the same sibling lock path and security contract as install.sh and
+# deploy.sh. setup-log-db.sh mutates the same dotenv/Compose state and must be
+# serialized with both entrypoints for its full write/recreate transaction.
+setup_project_state_lock_path() {
+  local project_dir="$1" resolved parent base
+  [[ -n "$project_dir" && "$project_dir" != "/" ]] || return 1
+  if [[ -d "$project_dir" ]]; then
+    resolved="$(cd -- "$project_dir" && pwd -P)" || return 1
+    parent="$(dirname -- "$resolved")"
+    base="$(basename -- "$resolved")"
+  else
+    parent="$(dirname -- "$project_dir")"
+    base="$(basename -- "$project_dir")"
+    [[ -d "$parent" ]] || return 1
+    parent="$(cd -- "$parent" && pwd -P)" || return 1
+  fi
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != "/" ]] || return 1
+  printf '%s/.%s.state.lock\n' "$parent" "$base"
+}
+
+setup_state_lock_fd_matches_path() {
+  local fd="$1" path="$2" fd_path fd_identity path_identity
+  [[ "$fd" =~ ^[0-9]+$ && -f "$path" && ! -L "$path" ]] || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  [[ -e "$fd_path" ]] || return 1
+  fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null)" || return 1
+  [[ "$fd_identity" == "$path_identity" ]]
+}
+
+setup_state_lock_current_uid() { id -u; }
+setup_state_lock_path_owner() { stat -c '%u' -- "$1" 2>/dev/null; }
+
+setup_state_lock_fd_is_secure() {
+  local fd="$1" path="$2" fd_path owner mode
+  setup_state_lock_fd_matches_path "$fd" "$path" || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  owner="$(stat -Lc '%u' -- "$fd_path" 2>/dev/null)" || return 1
+  mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(setup_state_lock_current_uid)" && "$mode" == "600" ]]
+}
+
+acquire_setup_state_lock() {
+  local project_dir="$1" lock_path inherited_fd inherited_path old_umask
+  lock_path="$(setup_project_state_lock_path "$project_dir")" ||
+    die "无法确定日志库配置状态锁路径"
+
+  inherited_fd="${NEWAPI_TOOLS_STATE_LOCK_FD:-}"
+  inherited_path="${NEWAPI_TOOLS_STATE_LOCK_PATH:-}"
+  if [[ "$inherited_path" == "$lock_path" ]] &&
+    setup_state_lock_fd_is_secure "$inherited_fd" "$lock_path"; then
+    flock -n "$inherited_fd" || die "继承的日志库配置状态锁已失效"
+    SETUP_STATE_LOCK_FD="$inherited_fd"
+    SETUP_STATE_LOCK_PATH="$lock_path"
+    return 0
+  fi
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    [[ -f "$lock_path" && ! -L "$lock_path" ]] ||
+      die "日志库配置状态锁不是安全的常规文件：${lock_path}"
+    [[ "$(setup_state_lock_path_owner "$lock_path")" == "$(setup_state_lock_current_uid)" ]] ||
+      die "日志库配置状态锁不属于当前用户：${lock_path}"
+  fi
+  old_umask="$(umask)"
+  umask 077
+  if ! exec {SETUP_STATE_LOCK_FD}>>"$lock_path"; then
+    umask "$old_umask"
+    die "无法打开日志库配置状态锁：${lock_path}"
+  fi
+  umask "$old_umask"
+  setup_state_lock_fd_matches_path "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁在打开时发生替换：${lock_path}"
+  [[ "$(stat -Lc '%u' -- "/proc/${BASHPID}/fd/${SETUP_STATE_LOCK_FD}" 2>/dev/null)" == \
+    "$(setup_state_lock_current_uid)" ]] ||
+    die "日志库配置状态锁打开后不属于当前用户：${lock_path}"
+  chmod 600 "/proc/${BASHPID}/fd/${SETUP_STATE_LOCK_FD}" ||
+    die "无法收紧日志库配置状态锁权限：${lock_path}"
+  setup_state_lock_fd_is_secure "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁权限或身份无效：${lock_path}"
+  flock -n "$SETUP_STATE_LOCK_FD" ||
+    die "另一个安装、部署、卸载或日志库配置进程正在操作该项目：${lock_path}"
+  setup_state_lock_fd_matches_path "$SETUP_STATE_LOCK_FD" "$lock_path" ||
+    die "日志库配置状态锁在加锁时发生替换：${lock_path}"
+
+  SETUP_STATE_LOCK_PATH="$lock_path"
+  export NEWAPI_TOOLS_STATE_LOCK_FD="$SETUP_STATE_LOCK_FD"
+  export NEWAPI_TOOLS_STATE_LOCK_PATH="$SETUP_STATE_LOCK_PATH"
+}
+
 detect_docker_compose() {
-  if docker compose version >/dev/null 2>&1; then DOCKER_COMPOSE="docker compose"
-  elif command -v docker-compose >/dev/null 2>&1; then DOCKER_COMPOSE="docker-compose"
-  else die "缺少 docker compose / docker-compose"; fi
+  local output version
+  output="$(docker compose version 2>/dev/null)" ||
+    die "缺少 Docker Compose v2.24+ 插件；不再支持 legacy docker-compose v1"
+  if [[ "$output" =~ v?([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+  else
+    die "无法解析 Docker Compose 版本；要求 v2.24+"
+  fi
+  version_at_least "$version" "2.24.0" ||
+    die "Docker Compose ${version} 过旧；日志库 overlay 要求 v2.24+"
+  DOCKER_COMPOSE="docker compose"
+}
+
+version_at_least() {
+  local current="$1" required="$2"
+  local current_major current_minor current_patch required_major required_minor required_patch
+  IFS=. read -r current_major current_minor current_patch <<< "$current"
+  IFS=. read -r required_major required_minor required_patch <<< "$required"
+  (( current_major > required_major )) ||
+    (( current_major == required_major && current_minor > required_minor )) ||
+    (( current_major == required_major && current_minor == required_minor && current_patch >= required_patch ))
 }
 
 #######################################
@@ -92,31 +202,354 @@ resolve_project_dir() {
 }
 
 #######################################
-# DSN 解析（兼容 URL 形式与 keyword 形式）
-#   URL    : postgresql://user:pass@host:port/db
-#   keyword: host=h port=p user=u password=pw dbname=db sslmode=disable
+# DSN parsing and rewriting. Keep this contract aligned with deploy.sh:
+# recognize only unambiguous PostgreSQL/MySQL forms, preserve credentials and
+# query options byte-for-byte, and change only the network host/port.
 #######################################
-dsn_field() {
-  # $1=dsn  $2=field(host|port|user|password|dbname)
-  local dsn="$1" field="$2"
-  if [[ "$dsn" == *"://"* ]]; then
-    case "$field" in
-      host)     echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@([^:/?]+).*#\1#p' ;;
-      port)     echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^:/?]+:([0-9]+).*#\1#p' ;;
-      user)     echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^:@/?]+).*#\1#p' ;;
-      password) echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^:@/?]+:([^@]*)@.*#\1#p' ;;
-      dbname)   echo "$dsn" | sed -nE 's#^[a-zA-Z0-9+.-]+://[^@]*@[^/]+/([^?]+).*#\1#p' ;;
-    esac
-  else
-    # keyword 形式：用空格分隔的 key=value
-    echo "$dsn" | tr ' ' '\n' | sed -nE "s/^${field}=(.*)$/\1/p" | head -n1
+dsn_parse_error() {
+  printf '无法安全解析日志库 DSN：%s（原始 DSN 已隐藏）\n' "$1" >&2
+  return 1
+}
+
+dsn_validate_port() {
+  local port="${1:-}"
+  [[ -z "$port" ]] && return 0
+  if [[ ! "$port" =~ ^[0-9]+$ || ${#port} -gt 5 ]] ||
+    (( 10#$port < 1 || 10#$port > 65535 )); then
+    dsn_parse_error "端口必须是 1-65535 的数字"
   fi
 }
 
-# 重新组装成 Go pgx/mysql 可用的 keyword DSN（统一输出形式，便于本工具消费）
-build_pg_keyword_dsn() {
-  local host="$1" port="$2" user="$3" pass="$4" db="$5"
-  echo "host=${host} port=${port:-5432} user=${user} password=${pass} dbname=${db} sslmode=disable"
+dsn_validate_postgres_url_query() {
+  local query="${1:-}" parameter key normalized_key
+  [[ -n "$query" ]] || return 0
+  while :; do
+    parameter="${query%%&*}"
+    key="${parameter%%=*}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+      dsn_parse_error "PostgreSQL URL query 含无效或编码后的键名"
+      return 1
+    }
+    normalized_key="${key,,}"
+    case "$normalized_key" in
+      host|hostaddr|port)
+        dsn_parse_error "PostgreSQL URL query 不能覆盖 host、hostaddr 或 port"
+        return 1
+        ;;
+    esac
+    [[ "$query" == *'&'* ]] || break
+    query="${query#*&}"
+  done
+}
+
+dsn_url_component() {
+  local dsn="$1" component="$2"
+  local scheme rest authority path query="" userinfo="" hostport user="" password="" host="" port="" dbname
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* && "$dsn" != *[[:space:]]* ]] || {
+    dsn_parse_error "URL DSN 不能包含空白或换行"
+    return 1
+  }
+  scheme="${dsn%%://*}"
+  case "$scheme" in
+    postgres|postgresql|mysql) ;;
+    *) dsn_parse_error "不支持的 URL scheme"; return 1 ;;
+  esac
+
+  rest="${dsn#*://}"
+  [[ "$rest" == */* ]] || { dsn_parse_error "URL DSN 缺少 /dbname"; return 1; }
+  authority="${rest%%/*}"
+  path="${rest#*/}"
+  [[ -n "$authority" && -n "$path" && "$path" != *'#'* ]] || {
+    dsn_parse_error "URL DSN 的 authority 或 dbname 无效"
+    return 1
+  }
+
+  dbname="${path%%\?*}"
+  if [[ "$path" == *'?'* ]]; then
+    query="${path#*\?}"
+    if [[ "$scheme" == "postgres" || "$scheme" == "postgresql" ]]; then
+      dsn_validate_postgres_url_query "$query" || return 1
+    fi
+  fi
+  [[ -n "$dbname" && "$dbname" != */* ]] || {
+    dsn_parse_error "URL DSN 的 dbname 缺失或包含未转义的斜杠"
+    return 1
+  }
+
+  hostport="$authority"
+  if [[ "$authority" == *@* ]]; then
+    userinfo="${authority%@*}"
+    hostport="${authority##*@}"
+    [[ -n "$userinfo" ]] || { dsn_parse_error "URL DSN 的用户信息为空"; return 1; }
+    if [[ "$userinfo" == *:* ]]; then
+      user="${userinfo%%:*}"
+      password="${userinfo#*:}"
+    else
+      user="$userinfo"
+    fi
+    [[ -n "$user" ]] || { dsn_parse_error "URL DSN 的用户名为空"; return 1; }
+  fi
+
+  if [[ "$hostport" =~ ^\[([^][]+)\](:([0-9]+))?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+  elif [[ "$hostport" =~ ^([^:]+)(:([0-9]+))?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+  else
+    dsn_parse_error "URL DSN 的 host:port 无法无歧义解析"
+    return 1
+  fi
+  [[ -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "URL DSN 的 host 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) [[ "$scheme" == "mysql" ]] && printf 'mysql\n' || printf 'postgres\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 URL DSN 字段"; return 1 ;;
+  esac
+}
+
+dsn_mysql_go_component() {
+  local dsn="$1" component="$2"
+  local user password address dbname host="" port=""
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* && "$dsn" != *[[:space:]]* ]] || {
+    dsn_parse_error "MySQL Go DSN 不能包含空白或换行"
+    return 1
+  }
+  if [[ "$dsn" =~ ^([^:/@]+):(.*)@tcp\(([^()]*)\)/([^?]+)(\?.*)?$ ]]; then
+    user="${BASH_REMATCH[1]}"
+    password="${BASH_REMATCH[2]}"
+    address="${BASH_REMATCH[3]}"
+    dbname="${BASH_REMATCH[4]}"
+  else
+    dsn_parse_error "MySQL Go DSN 必须形如 user:password@tcp(host:port)/dbname"
+    return 1
+  fi
+
+  if [[ "$address" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  elif [[ "$address" =~ ^([^:]+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    dsn_parse_error "MySQL Go DSN 的 tcp 地址必须是 host:port"
+    return 1
+  fi
+  [[ -n "$host" && "$host" != *[[:space:]@/]* && -n "$dbname" && "$dbname" != */* ]] || {
+    dsn_parse_error "MySQL Go DSN 的 host 或 dbname 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) printf 'mysql\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 MySQL Go DSN 字段"; return 1 ;;
+  esac
+}
+
+dsn_postgres_keyword_component() {
+  local dsn="$1" component="$2"
+  local token key value normalized_key
+  local host="" port="" user="" password="" dbname=""
+  local seen_host=false seen_port=false seen_user=false seen_password=false seen_dbname=false
+  local -a tokens=()
+
+  [[ "$dsn" != *$'\n'* && "$dsn" != *$'\r'* ]] || {
+    dsn_parse_error "PostgreSQL keyword DSN 不能包含换行"
+    return 1
+  }
+  # libpq quoting requires a full lexer. Reject ambiguous input instead of
+  # splitting or rewriting credentials incorrectly.
+  [[ "$dsn" != *"'"* && "$dsn" != *'"'* && "$dsn" != *'\'* ]] || {
+    dsn_parse_error "暂不支持带引号或反斜杠转义的 PostgreSQL keyword DSN"
+    return 1
+  }
+
+  read -r -a tokens <<< "$dsn"
+  (( ${#tokens[@]} > 0 )) || { dsn_parse_error "PostgreSQL keyword DSN 为空"; return 1; }
+  for token in "${tokens[@]}"; do
+    [[ "$token" == *=* ]] || {
+      dsn_parse_error "PostgreSQL keyword DSN 含无法归属的空白值"
+      return 1
+    }
+    key="${token%%=*}"
+    value="${token#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+      dsn_parse_error "PostgreSQL keyword DSN 含无效键名"
+      return 1
+    }
+    normalized_key="${key,,}"
+    case "$normalized_key" in
+      host)
+        [[ "$seen_host" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 host"; return 1; }
+        seen_host=true; host="$value"
+        ;;
+      hostaddr)
+        dsn_parse_error "PostgreSQL keyword DSN 不支持 hostaddr；它可能绕过 host 改写"
+        return 1
+        ;;
+      port)
+        [[ "$seen_port" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 port"; return 1; }
+        seen_port=true; port="$value"
+        ;;
+      user)
+        [[ "$seen_user" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 user"; return 1; }
+        seen_user=true; user="$value"
+        ;;
+      password)
+        [[ "$seen_password" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 password"; return 1; }
+        seen_password=true; password="$value"
+        ;;
+      dbname)
+        [[ "$seen_dbname" == false ]] || { dsn_parse_error "PostgreSQL keyword DSN 重复 dbname"; return 1; }
+        if [[ "$value" == *=* || "${value,,}" == postgres://* || "${value,,}" == postgresql://* ]]; then
+          dsn_parse_error "PostgreSQL keyword DSN 的 dbname 不能嵌套连接串"
+          return 1
+        fi
+        seen_dbname=true; dbname="$value"
+        ;;
+    esac
+  done
+
+  [[ "$seen_host" == true && -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "PostgreSQL keyword DSN 缺少有效 host"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+
+  case "$component" in
+    validate) ;;
+    engine) printf 'postgres\n' ;;
+    host) printf '%s\n' "$host" ;;
+    user) printf '%s\n' "$user" ;;
+    password) printf '%s\n' "$password" ;;
+    port) printf '%s\n' "$port" ;;
+    dbname) printf '%s\n' "$dbname" ;;
+    *) dsn_parse_error "内部请求了未知的 PostgreSQL keyword DSN 字段"; return 1 ;;
+  esac
+}
+
+detect_dsn_format() {
+  local dsn="${1:-}"
+  [[ -n "$dsn" ]] || return 0
+  if [[ "$dsn" =~ ^postgres(ql)?:// ]]; then
+    dsn_url_component "$dsn" validate || return 1
+    printf 'postgres_url\n'
+  elif [[ "$dsn" =~ ^mysql:// ]]; then
+    dsn_url_component "$dsn" validate || return 1
+    printf 'mysql_url\n'
+  elif [[ "$dsn" == *@tcp\(* ]]; then
+    dsn_mysql_go_component "$dsn" validate || return 1
+    printf 'mysql_go\n'
+  elif [[ "$dsn" == *=* ]]; then
+    dsn_postgres_keyword_component "$dsn" validate || return 1
+    printf 'postgres_keyword\n'
+  else
+    dsn_parse_error "仅支持 PostgreSQL/MySQL URL、MySQL Go DSN 和 PostgreSQL keyword DSN"
+  fi
+}
+
+extract_dsn_component() {
+  local dsn="${1:-}" component="$2" format
+  [[ -n "$dsn" ]] || return 0
+  format="$(detect_dsn_format "$dsn")" || return 1
+  case "$format" in
+    postgres_url|mysql_url) dsn_url_component "$dsn" "$component" ;;
+    mysql_go) dsn_mysql_go_component "$dsn" "$component" ;;
+    postgres_keyword) dsn_postgres_keyword_component "$dsn" "$component" ;;
+    *) dsn_parse_error "内部识别到了未知 DSN 格式"; return 1 ;;
+  esac
+}
+
+extract_dsn_engine() { extract_dsn_component "${1:-}" engine; }
+extract_dsn_host() { extract_dsn_component "${1:-}" host; }
+extract_dsn_user() { extract_dsn_component "${1:-}" user; }
+extract_dsn_password() { extract_dsn_component "${1:-}" password; }
+extract_dsn_port() { extract_dsn_component "${1:-}" port; }
+extract_dsn_dbname() { extract_dsn_component "${1:-}" dbname; }
+
+dsn_host_port() {
+  local host="$1" port="$2"
+  [[ -n "$host" && "$host" != *[[:space:]@/]* ]] || {
+    dsn_parse_error "改写后的数据库 host 无效"
+    return 1
+  }
+  dsn_validate_port "$port" || return 1
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]:%s' "$host" "$port"
+  else
+    printf '%s:%s' "$host" "$port"
+  fi
+}
+
+rewrite_dsn_host_port() {
+  local dsn="$1" new_host="$2" new_port="$3" format address
+  format="$(detect_dsn_format "$dsn")" || return 1
+  address="$(dsn_host_port "$new_host" "$new_port")" || return 1
+
+  case "$format" in
+    postgres_url|mysql_url)
+      local scheme rest authority path userinfo_prefix=""
+      scheme="${dsn%%://*}"
+      rest="${dsn#*://}"
+      authority="${rest%%/*}"
+      path="${rest#*/}"
+      if [[ "$authority" == *@* ]]; then
+        userinfo_prefix="${authority%@*}@"
+      fi
+      printf '%s://%s%s/%s\n' "$scheme" "$userinfo_prefix" "$address" "$path"
+      ;;
+    mysql_go)
+      if [[ "$dsn" =~ ^(.+)@tcp\([^()]*\)/(.*)$ ]]; then
+        printf '%s@tcp(%s)/%s\n' "${BASH_REMATCH[1]}" "$address" "${BASH_REMATCH[2]}"
+      else
+        dsn_parse_error "MySQL Go DSN 无法安全改写地址"
+        return 1
+      fi
+      ;;
+    postgres_keyword)
+      local token key normalized_key seen_port=false i
+      local -a tokens=() rewritten=()
+      read -r -a tokens <<< "$dsn"
+      for token in "${tokens[@]}"; do
+        key="${token%%=*}"
+        normalized_key="${key,,}"
+        case "$normalized_key" in
+          host) rewritten+=("${key}=${new_host}") ;;
+          port) rewritten+=("${key}=${new_port}"); seen_port=true ;;
+          *) rewritten+=("$token") ;;
+        esac
+      done
+      [[ "$seen_port" == true ]] || rewritten+=("port=${new_port}")
+      printf '%s' "${rewritten[0]}"
+      for ((i = 1; i < ${#rewritten[@]}; i++)); do
+        printf ' %s' "${rewritten[$i]}"
+      done
+      printf '\n'
+      ;;
+    *)
+      dsn_parse_error "未知 DSN 格式"
+      return 1
+      ;;
+  esac
 }
 
 #######################################
@@ -133,10 +566,11 @@ detect_newapi_container() {
 
 docker_inspect_env_value() {
   docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null \
-    | awk -F= -v k="$2" '$1==k{print $2; exit}'
+    | awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }'
 }
 
 is_ipv4_literal() { [[ "${1:-}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; }
+is_ip_literal() { is_ipv4_literal "${1:-}" || [[ "${1:-}" == *:* ]]; }
 
 # 找「把指定宿主机端口发布到回环/0.0.0.0」的容器 → "网络<TAB>容器名<TAB>容器内端口"
 find_container_by_published_port() {
@@ -167,7 +601,7 @@ find_container_by_network_ip() {
     while IFS=$'\t' read -r net ip; do
       [[ -z "$net" ]] && continue
       [[ "$ip" == "$target_ip" ]] && { printf '%s\t%s\n' "$net" "$name"; return 0; }
-    done < <(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\t"}}{{$v.IPAddress}}{{"\n"}}{{end}}' "$cid" 2>/dev/null)
+    done < <(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{if $v.IPAddress}}{{$k}}{{"\t"}}{{$v.IPAddress}}{{"\n"}}{{end}}{{if $v.GlobalIPv6Address}}{{$k}}{{"\t"}}{{$v.GlobalIPv6Address}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null)
   done < <(docker ps -q)
   return 0
 }
@@ -185,30 +619,576 @@ ensure_tool_on_network() {
 
 # 读取 .env 里某 key 的值（无则空）
 read_env_value() {
-  [[ -f "$ENV_FILE" ]] || { echo ""; return 0; }
-  grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2- || echo ""
+  local key="$1" value
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || { echo ""; return 0; }
+  value="$(awk -v k="$key" '
+    index($0, k "=") == 1 { value = substr($0, length(k) + 2); found = 1 }
+    END { if (found) print value }
+  ' "$ENV_FILE")"
+  value="${value%$'\r'}"
+  if [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\'/\'}"
+  elif [[ ${#value} -ge 2 && "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s\n' "$value"
+}
+
+env_file_has_key() {
+  local key="$1"
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || return 1
+  grep -qE "^${key}=" "$ENV_FILE"
+}
+
+dotenv_quote() {
+  local value="${1-}" escaped
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  escaped="$(printf '%s' "$value" | sed "s/'/\\\\'/g")"
+  printf "'%s'" "$escaped"
+}
+
+# Persist a complete file image in the target directory. Both .env and the
+# generated Compose override can contain deployment-sensitive data, so never
+# expose a truncate/append window and never follow an existing symlink.
+setup_target_identity() {
+  local target="$1"
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  stat -Lc '%d:%i' -- "$target" 2>/dev/null
+}
+
+setup_target_matches_identity() {
+  local target="$1" expected="$2" current
+  if [[ "$expected" == "absent" ]]; then
+    [[ ! -e "$target" && ! -L "$target" ]]
+    return
+  fi
+  current="$(setup_target_identity "$target")" || return 1
+  [[ "$current" == "$expected" ]]
+}
+
+setup_target_metadata() {
+  local target="$1"
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  stat -Lc '%d:%i %u:%g' -- "$target" 2>/dev/null
+}
+
+setup_target_matches_metadata() {
+  local target="$1" expected_identity="$2" expected_ownership="$3"
+  local metadata current_identity current_ownership
+  metadata="$(setup_target_metadata "$target")" || return 1
+  read -r current_identity current_ownership <<< "$metadata"
+  [[ "$current_identity" == "$expected_identity" &&
+    "$current_ownership" == "$expected_ownership" ]]
+}
+
+SETUP_FILE_CONTENT=""
+SETUP_FILE_IDENTITY=""
+load_setup_file_image() {
+  local target="$1" file_fd fd_path path_identity fd_identity status
+  [[ -f "$target" && ! -L "$target" && -r "$target" ]] || return 1
+  exec {file_fd}< "$target" || return 1
+  fd_path="/proc/${BASHPID}/fd/${file_fd}"
+  if [[ ! -e "$fd_path" ]] ||
+    ! path_identity="$(stat -Lc '%d:%i' -- "$target" 2>/dev/null)" ||
+    ! fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" ||
+    [[ "$path_identity" != "$fd_identity" ]] ||
+    [[ -L "$target" ]]; then
+    exec {file_fd}<&-
+    return 1
+  fi
+  SETUP_FILE_CONTENT="$(cat <&"$file_fd")"
+  status=$?
+  exec {file_fd}<&-
+  (( status == 0 )) || return "$status"
+  SETUP_FILE_IDENTITY="$path_identity"
+}
+
+atomic_write_setup_file() {
+  local target="$1" content="$2" expected_identity="${3:-}" parent tmp mode
+  local metadata current_identity target_ownership="" final_ownership
+  parent="$(dirname "$target")"
+  [[ -d "$parent" ]] || return 1
+  if [[ -z "$expected_identity" ]]; then
+    if [[ -e "$target" || -L "$target" ]]; then
+      expected_identity="$(setup_target_identity "$target")" || return 1
+    else
+      expected_identity="absent"
+    fi
+  elif ! setup_target_matches_identity "$target" "$expected_identity"; then
+    return 1
+  fi
+  if [[ "$expected_identity" != "absent" ]]; then
+    metadata="$(setup_target_metadata "$target")" || return 1
+    read -r current_identity target_ownership <<< "$metadata"
+    [[ "$current_identity" == "$expected_identity" ]] || return 1
+  fi
+
+  tmp="$(umask 077; mktemp "${target}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if [[ -n "$target_ownership" ]] && {
+    ! setup_target_matches_metadata "$target" "$expected_identity" "$target_ownership" ||
+      ! chown -- "$target_ownership" "$tmp"
+  }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  # Apply the final mode after ownership. Some filesystems/ACL layers adjust
+  # permission bits during chown; doing chmod last keeps the replacement at
+  # the required 0600 on every supported host.
+  if ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! sync -f "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if [[ -n "$target_ownership" ]]; then
+    setup_target_matches_metadata "$target" "$expected_identity" "$target_ownership" || {
+      rm -f -- "$tmp"
+      return 1
+    }
+  elif ! setup_target_matches_identity "$target" "$expected_identity"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! mv -Tf -- "$tmp" "$target" || ! sync -f "$parent"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  mode="$(stat -c '%a' -- "$target" 2>/dev/null)" || return 1
+  [[ "$mode" == "600" ]] || return 1
+  if [[ -n "$target_ownership" ]]; then
+    final_ownership="$(stat -c '%u:%g' -- "$target" 2>/dev/null)" || return 1
+    [[ "$final_ownership" == "$target_ownership" ]]
+  fi
+}
+
+LOG_ENV_ATTEMPT_CONTENT=""
+LOG_ENV_ATTEMPT_READY=false
+BUILT_LOG_ENV_CONTENT=""
+build_log_db_env_content() {
+  local dsn="$1" log_network="${2:-}" source_content="$3"
+  local content quoted_dsn quoted_network
+  [[ "$log_network" != *$'\n'* && "$log_network" != *$'\r'* ]] || return 1
+  quoted_dsn="$(dotenv_quote "$dsn")" || return 1
+  quoted_network="$(dotenv_quote "$log_network")" || return 1
+
+  content="$(
+    awk '
+      index($0, "LOG_SQL_DSN=") == 1 { next }
+      index($0, "LOG_NETWORK=") == 1 { next }
+      { print }
+    ' <<< "$source_content"
+    printf 'LOG_SQL_DSN=%s\n' "$quoted_dsn"
+    printf 'LOG_NETWORK=%s\n' "$quoted_network"
+  )" || return 1
+
+  BUILT_LOG_ENV_CONTENT="$content"
+}
+
+persist_log_db_env() {
+  local dsn="$1" log_network="${2:-}" required_identity="${3:-}"
+  load_setup_file_image "$ENV_FILE" || return 1
+  if [[ -n "$required_identity" && "$SETUP_FILE_IDENTITY" != "$required_identity" ]]; then
+    return 1
+  fi
+  build_log_db_env_content "$dsn" "$log_network" "$SETUP_FILE_CONTENT" || return 1
+
+  LOG_ENV_ATTEMPT_CONTENT="$BUILT_LOG_ENV_CONTENT"
+  LOG_ENV_ATTEMPT_READY=true
+  atomic_write_setup_file "$ENV_FILE" "$BUILT_LOG_ENV_CONTENT" "$SETUP_FILE_IDENTITY"
 }
 
 # 写 docker-compose.override.yml，把日志库网络固化进工具服务。
 # docker compose 默认会自动叠加 override 文件，使「纯 docker compose up」重建后
 # 网络依然挂着（setup-log-db.sh 自己用纯 compose 重建，故能吃到它）。
-# 注意：deploy.sh / install.sh 用显式 -f / COMPOSE_FILE，不会加载 override —— 那种
-# 情况下网络会掉，但后端已做降级（不再崩），重跑本脚本即可恢复。
+# 同时把 LOG_NETWORK 写入 .env，供 deploy.sh / install.sh 通过
+# docker-compose.logdb.yml 恢复同一网络；override 保留纯 Compose 的兼容入口。
 LOG_OVERRIDE_NET_NAME="log-db-network"
-write_log_network_override() {
-  local net="$1"
-  local override="${PROJECT_DIR}/docker-compose.override.yml"
-  local main_net; main_net="$(read_env_value NEWAPI_NETWORK)"
+LOG_OVERRIDE_MARKER="# 由 setup-log-db.sh 自动生成：把 newapi-tools 接入日志库所在的 docker 网络，"
+LOG_OVERRIDE_SNAPSHOT_EXISTS=false
+LOG_OVERRIDE_SNAPSHOT_CONTENT=""
+LOG_OVERRIDE_SNAPSHOT_IDENTITY=""
+LOG_OVERRIDE_ATTEMPT_CONTENT=""
+LOG_OVERRIDE_ATTEMPT_READY=false
+LOG_OVERRIDE_ATTEMPT_REMOVED=false
+LOG_ENV_SNAPSHOT_CONTENT=""
+LOG_ENV_SNAPSHOT_IDENTITY=""
+LOG_ENV_CANDIDATE_CONTENT=""
+LOG_OVERRIDE_CANDIDATE_EXISTS=false
+LOG_OVERRIDE_CANDIDATE_CONTENT=""
+BUILT_LOG_OVERRIDE_CONTENT=""
+SETUP_TRANSACTION_FILE_CONTENT=""
 
-  # 日志库网络与主库网络相同 → 工具已经在上面，无需 override（避免重复挂同一网络报错）
-  if [[ -n "$main_net" && "$net" == "$main_net" ]]; then
-    log_info "日志库与主库同在网络 '$net'，无需额外网络配置"
-    [[ -f "$override" ]] && grep -q "$LOG_OVERRIDE_NET_NAME" "$override" 2>/dev/null && \
-      log_warn "检测到旧的 $override 仍引用日志库网络，如不再需要可手动删除"
+log_db_transaction_marker_path() {
+  printf '%s/.setup-log-db.transaction\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_env_snapshot_path() {
+  printf '%s/.setup-log-db.transaction.env.snapshot\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_override_snapshot_path() {
+  printf '%s/.setup-log-db.transaction.override.snapshot\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_env_candidate_path() {
+  printf '%s/.setup-log-db.transaction.env.candidate\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_override_candidate_path() {
+  printf '%s/.setup-log-db.transaction.override.candidate\n' "$PROJECT_DIR"
+}
+
+load_mode600_setup_transaction_file() {
+  local target="$1" identity metadata mode owner
+  load_setup_file_image "$target" || return 1
+  identity="$SETUP_FILE_IDENTITY"
+  metadata="$(stat -Lc '%a %u' -- "$target" 2>/dev/null)" || return 1
+  read -r mode owner <<< "$metadata"
+  [[ "$mode" == "600" && "$owner" == "$(setup_state_lock_current_uid)" ]] || return 1
+  setup_target_matches_identity "$target" "$identity" || return 1
+  SETUP_TRANSACTION_FILE_CONTENT="$SETUP_FILE_CONTENT"
+}
+
+durable_remove_setup_transaction_file() {
+  local target="$1" parent identity metadata mode owner
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
     return 0
   fi
+  identity="$(setup_target_identity "$target")" || return 1
+  metadata="$(stat -Lc '%a %u' -- "$target" 2>/dev/null)" || return 1
+  read -r mode owner <<< "$metadata"
+  [[ "$mode" == "600" && "$owner" == "$(setup_state_lock_current_uid)" ]] || return 1
+  setup_target_matches_identity "$target" "$identity" || return 1
+  parent="$(dirname -- "$target")"
+  rm -f -- "$target" || return 1
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  sync -f "$parent"
+}
 
-  cat > "$override" <<EOF
+discard_stale_log_db_transaction_snapshots() {
+  local env_snapshot override_snapshot env_candidate override_candidate status=0
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+  durable_remove_setup_transaction_file "$env_snapshot" || status=1
+  durable_remove_setup_transaction_file "$override_snapshot" || status=1
+  durable_remove_setup_transaction_file "$env_candidate" || status=1
+  durable_remove_setup_transaction_file "$override_candidate" || status=1
+  return "$status"
+}
+
+# The marker is the authoritative transaction record. It is published only
+# after both old file images are durable, and removed before stale snapshots so
+# a crash during cleanup commits the already-healthy candidate instead of
+# resurrecting the old configuration on the next invocation.
+complete_log_db_configuration_transaction() {
+  local marker
+  marker="$(log_db_transaction_marker_path)"
+  durable_remove_setup_transaction_file "$marker" || return 1
+  discard_stale_log_db_transaction_snapshots
+}
+
+normalize_persisted_log_network() {
+  local persisted_log_network="${1:-}" main_network
+  main_network="$(read_env_value NEWAPI_NETWORK)"
+  if [[ -n "$persisted_log_network" && "$persisted_log_network" == "$main_network" ]]; then
+    persisted_log_network=""
+  fi
+  printf '%s\n' "$persisted_log_network"
+}
+
+plan_log_network_override_candidate() {
+  local persisted_log_network="${1:-}"
+  LOG_OVERRIDE_CANDIDATE_EXISTS=false
+  LOG_OVERRIDE_CANDIDATE_CONTENT=""
+  if [[ -n "$persisted_log_network" ]]; then
+    if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]] &&
+      ! grep -Fxq "$LOG_OVERRIDE_MARKER" <<< "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+      return 1
+    fi
+    build_log_network_override_content "$persisted_log_network" || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$BUILT_LOG_OVERRIDE_CONTENT"
+  elif [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]] &&
+    ! grep -Fxq "$LOG_OVERRIDE_MARKER" <<< "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+    # A user-managed override is intentionally retained when no extra generated
+    # log-network attachment is needed.
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$LOG_OVERRIDE_SNAPSHOT_CONTENT"
+  fi
+}
+
+begin_log_db_configuration_transaction() {
+  local dsn="$1" persisted_log_network="${2:-}"
+  local marker env_snapshot override_snapshot env_candidate override_candidate
+  local old_override_state candidate_override_state marker_content
+  marker="$(log_db_transaction_marker_path)"
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+
+  [[ ! -e "$marker" && ! -L "$marker" ]] || {
+    log_error "检测到尚未恢复的日志库配置事务：${marker}"
+    return 1
+  }
+  discard_stale_log_db_transaction_snapshots || {
+    log_error "无法安全清理旧日志库配置事务快照"
+    return 1
+  }
+  capture_log_db_env_snapshot || return 1
+  capture_log_network_override_snapshot || return 1
+  persisted_log_network="$(normalize_persisted_log_network "$persisted_log_network")" || return 1
+  build_log_db_env_content "$dsn" "$persisted_log_network" "$LOG_ENV_SNAPSHOT_CONTENT" || return 1
+  LOG_ENV_CANDIDATE_CONTENT="$BUILT_LOG_ENV_CONTENT"
+  plan_log_network_override_candidate "$persisted_log_network" || return 1
+
+  if ! atomic_write_setup_file "$env_snapshot" "$LOG_ENV_SNAPSHOT_CONTENT" ||
+    ! atomic_write_setup_file "$env_candidate" "$LOG_ENV_CANDIDATE_CONTENT"; then
+    discard_stale_log_db_transaction_snapshots || true
+    return 1
+  fi
+  if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]]; then
+    old_override_state="present"
+    if ! atomic_write_setup_file "$override_snapshot" "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+      discard_stale_log_db_transaction_snapshots || true
+      return 1
+    fi
+  else
+    old_override_state="absent"
+  fi
+  if [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "true" ]]; then
+    candidate_override_state="present"
+    if ! atomic_write_setup_file "$override_candidate" "$LOG_OVERRIDE_CANDIDATE_CONTENT"; then
+      discard_stale_log_db_transaction_snapshots || true
+      return 1
+    fi
+  else
+    candidate_override_state="absent"
+  fi
+  marker_content="$(printf 'version=2\nold_override=%s\ncandidate_override=%s' \
+    "$old_override_state" "$candidate_override_state")"
+  if ! atomic_write_setup_file "$marker" "$marker_content"; then
+    # atomic_write_setup_file can fail after the marker rename when only the
+    # parent-directory fsync fails. In that state the marker may already be the
+    # authoritative transaction record, so deleting its backing images would
+    # strand an unrecoverable marker. Preserve every artifact whenever the
+    # marker path exists; a later locked startup can either recover it or fail
+    # closed without losing the rollback evidence.
+    if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+      discard_stale_log_db_transaction_snapshots || true
+    fi
+    return 1
+  fi
+}
+
+load_persistent_log_db_transaction() {
+  local marker env_snapshot override_snapshot env_candidate override_candidate
+  local marker_content old_override_state candidate_override_state
+  marker="$(log_db_transaction_marker_path)"
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+
+  load_mode600_setup_transaction_file "$marker" || return 1
+  marker_content="$SETUP_TRANSACTION_FILE_CONTENT"
+  case "$marker_content" in
+    $'version=2\nold_override=present\ncandidate_override=present')
+      old_override_state="present"; candidate_override_state="present" ;;
+    $'version=2\nold_override=present\ncandidate_override=absent')
+      old_override_state="present"; candidate_override_state="absent" ;;
+    $'version=2\nold_override=absent\ncandidate_override=present')
+      old_override_state="absent"; candidate_override_state="present" ;;
+    $'version=2\nold_override=absent\ncandidate_override=absent')
+      old_override_state="absent"; candidate_override_state="absent" ;;
+    *) return 1 ;;
+  esac
+
+  load_mode600_setup_transaction_file "$env_snapshot" || return 1
+  LOG_ENV_SNAPSHOT_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  load_mode600_setup_transaction_file "$env_candidate" || return 1
+  LOG_ENV_CANDIDATE_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  if [[ "$old_override_state" == "present" ]]; then
+    load_mode600_setup_transaction_file "$override_snapshot" || return 1
+    LOG_OVERRIDE_SNAPSHOT_EXISTS=true
+    LOG_OVERRIDE_SNAPSHOT_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  else
+    [[ ! -e "$override_snapshot" && ! -L "$override_snapshot" ]] || return 1
+    LOG_OVERRIDE_SNAPSHOT_EXISTS=false
+    LOG_OVERRIDE_SNAPSHOT_CONTENT=""
+  fi
+  if [[ "$candidate_override_state" == "present" ]]; then
+    load_mode600_setup_transaction_file "$override_candidate" || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  else
+    [[ ! -e "$override_candidate" && ! -L "$override_candidate" ]] || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=false
+    LOG_OVERRIDE_CANDIDATE_CONTENT=""
+  fi
+}
+
+# Called by main only after the shared project flock is held. An incomplete
+# transaction is always rolled back to its durable old file images and the old
+# service is force-recreated before the marker is cleared.
+recover_incomplete_log_db_transaction() {
+  local marker override env_current_content env_current_identity
+  local override_current_exists=false override_current_content="" override_current_identity="absent"
+  local override_matches_old=false override_matches_candidate=false
+  marker="$(log_db_transaction_marker_path)"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    discard_stale_log_db_transaction_snapshots
+    return
+  fi
+
+  load_persistent_log_db_transaction || {
+    log_error "日志库配置事务记录不安全、损坏或权限不是 0600"
+    return 1
+  }
+  load_setup_file_image "$ENV_FILE" || return 1
+  env_current_content="$SETUP_FILE_CONTENT"
+  env_current_identity="$SETUP_FILE_IDENTITY"
+  if [[ "$env_current_content" != "$LOG_ENV_SNAPSHOT_CONTENT" &&
+    "$env_current_content" != "$LOG_ENV_CANDIDATE_CONTENT" ]]; then
+    log_error "中断事务后的 .env 既不等于旧文件像也不等于候选文件像；拒绝覆盖人工修改"
+    return 1
+  fi
+
+  override="${PROJECT_DIR}/docker-compose.override.yml"
+  if [[ -e "$override" || -L "$override" ]]; then
+    load_setup_file_image "$override" || return 1
+    override_current_exists=true
+    override_current_content="$SETUP_FILE_CONTENT"
+    override_current_identity="$SETUP_FILE_IDENTITY"
+  fi
+  if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]]; then
+    [[ "$override_current_exists" == "true" &&
+      "$override_current_content" == "$LOG_OVERRIDE_SNAPSHOT_CONTENT" ]] &&
+      override_matches_old=true
+  else
+    [[ "$override_current_exists" == "false" ]] && override_matches_old=true
+  fi
+  if [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "true" ]]; then
+    [[ "$override_current_exists" == "true" &&
+      "$override_current_content" == "$LOG_OVERRIDE_CANDIDATE_CONTENT" ]] &&
+      override_matches_candidate=true
+  else
+    [[ "$override_current_exists" == "false" ]] && override_matches_candidate=true
+  fi
+  if [[ "$override_matches_old" != "true" && "$override_matches_candidate" != "true" ]]; then
+    log_error "中断事务后的 Compose override 既不等于旧文件像也不等于候选文件像；拒绝覆盖人工修改"
+    return 1
+  fi
+
+  # Only populate the rollback attempt after both current files have passed the
+  # complete old-or-candidate image check. This avoids a partial rollback when
+  # either file was edited outside the advisory lock after the crash.
+  LOG_ENV_SNAPSHOT_IDENTITY="$env_current_identity"
+  LOG_ENV_ATTEMPT_CONTENT="$LOG_ENV_CANDIDATE_CONTENT"
+  LOG_ENV_ATTEMPT_READY=true
+  LOG_OVERRIDE_SNAPSHOT_IDENTITY="$override_current_identity"
+  LOG_OVERRIDE_ATTEMPT_CONTENT="$LOG_OVERRIDE_CANDIDATE_CONTENT"
+  LOG_OVERRIDE_ATTEMPT_READY="$LOG_OVERRIDE_CANDIDATE_EXISTS"
+  LOG_OVERRIDE_ATTEMPT_REMOVED=false
+  [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "false" ]] && LOG_OVERRIDE_ATTEMPT_REMOVED=true
+
+  log_warn "检测到中断的日志库配置事务，正在恢复旧配置与旧服务"
+  restore_log_db_env_snapshot || return 1
+  restore_log_network_override_snapshot || return 1
+  run_setup_compose_recreate || return 1
+  complete_log_db_configuration_transaction || return 1
+  log_success "已恢复中断事务中的旧日志库配置与服务"
+}
+
+capture_log_db_env_snapshot() {
+  load_setup_file_image "$ENV_FILE" || return 1
+  LOG_ENV_SNAPSHOT_CONTENT="$SETUP_FILE_CONTENT"
+  LOG_ENV_SNAPSHOT_IDENTITY="$SETUP_FILE_IDENTITY"
+}
+
+restore_log_db_env_snapshot() {
+  local current_content current_identity
+  load_setup_file_image "$ENV_FILE" || return 1
+  current_content="$SETUP_FILE_CONTENT"
+  current_identity="$SETUP_FILE_IDENTITY"
+
+  if [[ "$current_identity" == "$LOG_ENV_SNAPSHOT_IDENTITY" &&
+    "$current_content" == "$LOG_ENV_SNAPSHOT_CONTENT" ]]; then
+    return 0
+  fi
+  [[ "$LOG_ENV_ATTEMPT_READY" == "true" &&
+    "$current_content" == "$LOG_ENV_ATTEMPT_CONTENT" ]] || return 1
+  atomic_write_setup_file "$ENV_FILE" "$LOG_ENV_SNAPSHOT_CONTENT" "$current_identity"
+}
+
+capture_log_network_override_snapshot() {
+  local override="${PROJECT_DIR}/docker-compose.override.yml"
+  LOG_OVERRIDE_SNAPSHOT_EXISTS=false
+  LOG_OVERRIDE_SNAPSHOT_CONTENT=""
+  LOG_OVERRIDE_SNAPSHOT_IDENTITY=""
+  [[ -e "$override" || -L "$override" ]] || return 0
+  load_setup_file_image "$override" || return 1
+  LOG_OVERRIDE_SNAPSHOT_EXISTS=true
+  LOG_OVERRIDE_SNAPSHOT_CONTENT="$SETUP_FILE_CONTENT"
+  LOG_OVERRIDE_SNAPSHOT_IDENTITY="$SETUP_FILE_IDENTITY"
+}
+
+restore_log_network_override_snapshot() {
+  local override="${PROJECT_DIR}/docker-compose.override.yml"
+  local current_exists=false current_content="" current_identity=""
+  if [[ -e "$override" || -L "$override" ]]; then
+    load_setup_file_image "$override" || return 1
+    current_exists=true
+    current_content="$SETUP_FILE_CONTENT"
+    current_identity="$SETUP_FILE_IDENTITY"
+  fi
+
+  if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]]; then
+    if [[ "$current_exists" == "true" &&
+      "$current_identity" == "$LOG_OVERRIDE_SNAPSHOT_IDENTITY" &&
+      "$current_content" == "$LOG_OVERRIDE_SNAPSHOT_CONTENT" ]]; then
+      return 0
+    fi
+    if [[ "$current_exists" == "true" ]]; then
+      [[ "$LOG_OVERRIDE_ATTEMPT_READY" == "true" &&
+        "$current_content" == "$LOG_OVERRIDE_ATTEMPT_CONTENT" ]] || return 1
+      atomic_write_setup_file "$override" "$LOG_OVERRIDE_SNAPSHOT_CONTENT" "$current_identity"
+      return
+    fi
+    [[ "$LOG_OVERRIDE_ATTEMPT_REMOVED" == "true" ]] || return 1
+    atomic_write_setup_file "$override" "$LOG_OVERRIDE_SNAPSHOT_CONTENT" "absent"
+    return
+  fi
+
+  [[ "$current_exists" == "true" ]] || return 0
+  [[ "$LOG_OVERRIDE_ATTEMPT_READY" == "true" &&
+    "$current_content" == "$LOG_OVERRIDE_ATTEMPT_CONTENT" ]] || return 1
+  grep -Fxq "$LOG_OVERRIDE_MARKER" "$override" || return 1
+  setup_target_matches_identity "$override" "$current_identity" || return 1
+  rm -f -- "$override" || return 1
+  [[ ! -e "$override" && ! -L "$override" ]] || return 1
+  sync -f "$PROJECT_DIR"
+}
+
+build_log_network_override_content() {
+  local net="$1"
+  [[ "$net" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || {
+    log_error "日志库 Docker 网络名格式无效"
+    return 1
+  }
+
+  BUILT_LOG_OVERRIDE_CONTENT="$(cat <<EOF
 # 由 setup-log-db.sh 自动生成：把 newapi-tools 接入日志库所在的 docker 网络，
 # 使「docker compose up」重建后日志库连接依然可用。请勿手改；重跑 setup-log-db.sh 会覆盖。
 services:
@@ -218,21 +1198,162 @@ services:
 networks:
   ${LOG_OVERRIDE_NET_NAME}:
     external: true
-    name: ${net}
+    name: '${net}'
 EOF
+  )"
+}
+
+write_log_network_override() {
+  local net="$1"
+  local override="${PROJECT_DIR}/docker-compose.override.yml"
+  local main_net; main_net="$(read_env_value NEWAPI_NETWORK)"
+
+  # 日志库网络与主库网络相同 → 工具已经在上面，无需 override（避免重复挂同一网络报错）
+  if [[ -n "$main_net" && "$net" == "$main_net" ]]; then
+    log_info "日志库与主库同在网络 '$net'，无需额外网络配置"
+    remove_generated_log_network_override
+    return
+  fi
+
+  if [[ -e "$override" || -L "$override" ]]; then
+    [[ -f "$override" && ! -L "$override" ]] || {
+      log_error "现有 Compose override 不是安全的常规文件"
+      return 1
+    }
+    grep -Fxq "$LOG_OVERRIDE_MARKER" "$override" || {
+      log_error "现有 Compose override 不是 setup-log-db.sh 生成，拒绝覆盖用户配置"
+      return 1
+    }
+  fi
+
+  build_log_network_override_content "$net" || return 1
+  LOG_OVERRIDE_ATTEMPT_CONTENT="$BUILT_LOG_OVERRIDE_CONTENT"
+  LOG_OVERRIDE_ATTEMPT_READY=true
+  atomic_write_setup_file "$override" "$BUILT_LOG_OVERRIDE_CONTENT" || {
+    log_error "无法原子持久化日志库 Compose override"
+    return 1
+  }
   log_success "已写入 $override（固化日志库网络 '${net}'）"
 }
 
-# 把 KEY=VALUE 写入 .env（已存在则替换该行）
-upsert_env() {
-  local key="$1" value="$2"
-  [[ -f "$ENV_FILE" ]] || die "未找到 $ENV_FILE，请先用 deploy.sh / install.sh 完成基础部署"
-  if grep -qE "^${key}=" "$ENV_FILE"; then
-    # 用 | 作分隔符；value 里若含 | 会出问题，但 DSN 不含 |
-    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
-  else
-    printf '\n%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+remove_generated_log_network_override() {
+  local override="${PROJECT_DIR}/docker-compose.override.yml" identity
+  [[ -e "$override" || -L "$override" ]] || return 0
+  identity="$(setup_target_identity "$override")" || {
+    log_error "现有 Compose override 不是安全的常规文件，拒绝自动清理"
+    return 1
+  }
+  if ! grep -Fxq "$LOG_OVERRIDE_MARKER" "$override"; then
+    log_warn "保留非 setup-log-db.sh 生成的 $override；请确认其中没有旧日志网络"
+    return 0
   fi
+  setup_target_matches_identity "$override" "$identity" || {
+    log_error "Compose override 在清理前发生变化，拒绝继续"
+    return 1
+  }
+  LOG_OVERRIDE_ATTEMPT_REMOVED=true
+  rm -f -- "$override" || { log_error "无法删除旧日志库 Compose override"; return 1; }
+  [[ ! -e "$override" && ! -L "$override" ]] || {
+    log_error "旧日志库 Compose override 删除未生效"
+    return 1
+  }
+  sync -f "$PROJECT_DIR" || {
+    log_error "旧日志库 Compose override 删除后无法同步项目目录"
+    return 1
+  }
+  log_success "已清理不再需要的日志库 Compose override"
+}
+
+commit_log_db_configuration() {
+  local dsn="$1" persisted_log_network="${2:-}"
+  # The base Compose manifest already attaches newapi-tools to the main NewAPI
+  # network. Persisting it again would attach one external network twice.
+  persisted_log_network="$(normalize_persisted_log_network "$persisted_log_network")" || return 1
+  LOG_ENV_ATTEMPT_CONTENT=""
+  LOG_ENV_ATTEMPT_READY=false
+  LOG_OVERRIDE_ATTEMPT_CONTENT=""
+  LOG_OVERRIDE_ATTEMPT_READY=false
+  LOG_OVERRIDE_ATTEMPT_REMOVED=false
+  capture_log_db_env_snapshot || {
+    log_error "现有 .env 不安全或无法读取；配置尚未修改"
+    return 1
+  }
+  capture_log_network_override_snapshot || {
+    log_error "现有 Compose override 不安全或无法读取；.env 尚未修改"
+    return 1
+  }
+
+  if [[ -n "$persisted_log_network" ]]; then
+    if ! write_log_network_override "$persisted_log_network"; then
+      restore_log_network_override_snapshot ||
+        log_error "高危：override 写入失败后无法恢复旧快照"
+      return 1
+    fi
+  elif ! remove_generated_log_network_override; then
+    restore_log_network_override_snapshot ||
+      log_error "高危：override 清理失败后无法恢复旧快照"
+    return 1
+  fi
+
+  if ! persist_log_db_env "$dsn" "$persisted_log_network" "$LOG_ENV_SNAPSHOT_IDENTITY"; then
+    restore_log_db_env_snapshot ||
+      log_error "高危：.env 提交失败后无法恢复旧 .env 快照（可能存在并发修改）"
+    restore_log_network_override_snapshot ||
+      log_error "高危：.env 提交失败后无法恢复旧 Compose override"
+    return 1
+  fi
+}
+
+run_setup_compose_recreate() {
+  local override="${PROJECT_DIR}/docker-compose.override.yml"
+  local host_overlay="${PROJECT_DIR}/docker-compose.host.yml"
+  local log_overlay="${PROJECT_DIR}/docker-compose.logdb.yml"
+  local newapi_network log_network
+  local -a compose_args=(--env-file "$ENV_FILE" -f "$COMPOSE_FILE")
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" &&
+    -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || return 1
+  newapi_network="$(read_env_value NEWAPI_NETWORK)"
+  if env_file_has_key NEWAPI_NETWORK && [[ -z "$newapi_network" ]]; then
+    [[ -f "$host_overlay" && ! -L "$host_overlay" ]] || return 1
+    compose_args+=(-f "$host_overlay")
+  fi
+  log_network="$(read_env_value LOG_NETWORK)"
+  if [[ -n "$log_network" && "$log_network" != "$newapi_network" ]]; then
+    [[ -f "$log_overlay" && ! -L "$log_overlay" ]] || return 1
+    compose_args+=(-f "$log_overlay")
+  fi
+  if [[ -e "$override" || -L "$override" ]]; then
+    [[ -f "$override" && ! -L "$override" ]] || return 1
+    compose_args+=(-f "$override")
+  fi
+  (
+    cd "$PROJECT_DIR"
+    COMPOSE_FILE= docker compose "${compose_args[@]}" \
+      up -d --force-recreate --wait --wait-timeout 180 "$TOOLS_CONTAINER"
+  )
+}
+
+# Return 10 when the candidate restart failed but the old configuration and
+# service were restored, and 20 when rollback or old-service recovery failed.
+restart_log_db_services_transactionally() {
+  local env_restored=true override_restored=true
+  if run_setup_compose_recreate; then
+    return 0
+  fi
+
+  log_error "候选日志库配置重建失败，开始恢复旧配置"
+  restore_log_db_env_snapshot || env_restored=false
+  restore_log_network_override_snapshot || override_restored=false
+  if [[ "$env_restored" != "true" || "$override_restored" != "true" ]]; then
+    log_error "高危：候选重建失败且无法完整恢复旧 .env/override"
+    return 20
+  fi
+  if run_setup_compose_recreate; then
+    log_warn "候选日志库配置未生效；旧配置与旧服务已恢复健康"
+    return 10
+  fi
+  log_error "高危：旧配置已恢复，但旧服务也无法重新达到健康状态"
+  return 20
 }
 
 #######################################
@@ -244,6 +1365,12 @@ main() {
   need_cmd docker
   detect_docker_compose
   resolve_project_dir
+  if [[ "$MODE" != "--print" ]]; then
+    need_cmd flock
+    acquire_setup_state_lock "$PROJECT_DIR"
+    recover_incomplete_log_db_transaction ||
+      die "无法安全恢复中断的日志库配置事务；已保留 0600 快照与 marker，请检查文件和 docker compose 状态"
+  fi
 
   echo ""
   echo -e "${BLUE}========================================${NC}"
@@ -267,17 +1394,22 @@ main() {
   fi
   log_success "检测到 LOG_SQL_DSN（原始内容与凭据已隐藏）"
 
-  # 2) 解析
-  local host port user pass db
-  host="$(dsn_field "$raw_dsn" host)"
-  port="$(dsn_field "$raw_dsn" port)"; port="${port:-5432}"
-  user="$(dsn_field "$raw_dsn" user)"
-  pass="$(dsn_field "$raw_dsn" password)"
-  db="$(dsn_field "$raw_dsn" dbname)"
+  # 2) 解析。任何歧义都失败关闭，不能把 MySQL 或带选项的 URL
+  # 静默重组为 PostgreSQL keyword DSN。
+  local engine host port db
+  detect_dsn_format "$raw_dsn" >/dev/null ||
+    die "LOG_SQL_DSN 格式不受支持或无法安全解析"
+  engine="$(extract_dsn_engine "$raw_dsn")" || die "无法识别 LOG_SQL_DSN 引擎"
+  host="$(extract_dsn_host "$raw_dsn")" || die "无法读取 LOG_SQL_DSN host"
+  port="$(extract_dsn_port "$raw_dsn")" || die "无法读取 LOG_SQL_DSN port"
+  db="$(extract_dsn_dbname "$raw_dsn")" || die "无法读取 LOG_SQL_DSN dbname"
   [[ -n "$host" && -n "$db" ]] || die "无法解析 LOG_SQL_DSN（host/dbname 缺失；原始内容已隐藏）"
+  if [[ -z "$port" ]]; then
+    [[ "$engine" == "mysql" ]] && port="3306" || port="5432"
+  fi
 
   # 3) 决定工具怎么连到日志库（与 deploy.sh 主库逻辑同款）
-  local need_network=""
+  local need_network="" rewrite_required=false
   if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]; then
     local hit hnet hname hport
     hit="$(find_container_by_published_port "$port")"
@@ -287,12 +1419,13 @@ main() {
     if [[ -n "$hnet" && -n "$hname" ]]; then
       log_warn "日志库 127.0.0.1:${port} 实为容器 '${hname}'（端口仅发布在宿主机回环，网关不可达）"
       log_info "将把 $TOOLS_CONTAINER 接入网络 '${hnet}'，用容器名 '${hname}:${hport}' 直连"
-      host="$hname"; port="$hport"; need_network="$hnet"
+      host="$hname"; port="$hport"; need_network="$hnet"; rewrite_required=true
     else
       host="host.docker.internal"
+      rewrite_required=true
       log_info "日志库在宿主机回环上，改写为 host.docker.internal"
     fi
-  elif is_ipv4_literal "$host"; then
+  elif is_ip_literal "$host"; then
     local hit hnet hname
     hit="$(find_container_by_network_ip "$host")"
     hnet="$(printf '%s' "$hit" | cut -f1)"
@@ -300,7 +1433,7 @@ main() {
     if [[ -n "$hnet" && -n "$hname" ]]; then
       log_warn "日志库 ${host} 是容器 '${hname}' 在网络 '${hnet}' 上的 IP"
       log_info "将把 $TOOLS_CONTAINER 接入网络 '${hnet}'，用容器名直连"
-      host="$hname"; need_network="$hnet"
+      host="$hname"; need_network="$hnet"; rewrite_required=true
     else
       log_info "日志库地址 ${host} 是 IP 但不属于已知 docker 网络容器，按外部地址原样使用"
     fi
@@ -308,12 +1441,15 @@ main() {
     log_info "日志库地址为主机名/外部地址，原样使用: ${host}"
   fi
 
-  local final_dsn
-  final_dsn="$(build_pg_keyword_dsn "$host" "$port" "$user" "$pass" "$db")"
+  local final_dsn="$raw_dsn"
+  if [[ "$rewrite_required" == "true" ]]; then
+    final_dsn="$(rewrite_dsn_host_port "$raw_dsn" "$host" "$port")" ||
+      die "无法在保留凭据与连接选项的前提下改写 LOG_SQL_DSN"
+  fi
 
   echo ""
   log_success "最终连接目标（用户名与密码已隐藏）:"
-  echo -e "    ${GREEN}host=${host} port=${port} dbname=${db} user=*** password=***${NC}"
+  echo -e "    ${GREEN}engine=${engine} host=${host} port=${port} dbname=${db} credentials=***${NC}"
   [[ -n "$need_network" ]] && echo -e "    需接入网络: ${GREEN}${need_network}${NC}"
   echo ""
 
@@ -322,32 +1458,70 @@ main() {
     exit 0
   fi
 
-  # 4) 写入 .env
-  upsert_env "LOG_SQL_DSN" "$final_dsn"
-  chmod 600 "$ENV_FILE"
+  # 4) 一次性提交完整 .env。LOG_NETWORK 同时持久化，确保后续
+  # install.sh/deploy.sh 仍会选择 docker-compose.logdb.yml，不会在升级后丢网。
+  local persisted_log_network="$need_network"
+  # 5) 先持久化 mode-600 旧文件快照与 marker，再提交不含凭据的 override
+  # 和 .env。marker 会跨越候选服务 recreate；任意进程崩溃都由下一次持锁
+  # 启动恢复旧配置和旧服务，只有候选健康（或 --no-restart 明确提交）后才清理。
+  begin_log_db_configuration_transaction "$final_dsn" "$persisted_log_network" ||
+    die "无法持久化日志库配置事务快照；配置尚未修改"
+  if ! commit_log_db_configuration "$final_dsn" "$persisted_log_network"; then
+    recover_incomplete_log_db_transaction ||
+      die "高危：日志库配置提交失败，且无法从持久事务快照恢复旧配置/服务"
+    die "日志库配置事务失败；旧 .env/override 与旧服务已恢复，可安全重跑"
+  fi
   log_success "已写入 $ENV_FILE"
 
-  # 5) 固化网络：写 override（持久）+ 立即接入（当前生效）
-  if [[ -n "$need_network" ]]; then
-    write_log_network_override "$need_network"
-    ensure_tool_on_network "$need_network"
-  fi
-
   if [[ "$MODE" == "--no-restart" ]]; then
+    local manual_compose_files="-f docker-compose.yml"
+    if [[ -n "$persisted_log_network" ]]; then
+      ensure_tool_on_network "$persisted_log_network"
+    fi
+    if env_file_has_key NEWAPI_NETWORK && [[ -z "$(read_env_value NEWAPI_NETWORK)" ]]; then
+      manual_compose_files+=" -f docker-compose.host.yml"
+    fi
+    if [[ -n "$(read_env_value LOG_NETWORK)" &&
+      "$(read_env_value LOG_NETWORK)" != "$(read_env_value NEWAPI_NETWORK)" ]]; then
+      manual_compose_files+=" -f docker-compose.logdb.yml"
+    fi
+    if [[ -f "${PROJECT_DIR}/docker-compose.override.yml" &&
+      ! -L "${PROJECT_DIR}/docker-compose.override.yml" ]]; then
+      manual_compose_files+=" -f docker-compose.override.yml"
+    fi
+    complete_log_db_configuration_transaction ||
+      die "配置已写入但无法持久清理事务记录；请检查 ${PROJECT_DIR}/.setup-log-db.transaction*"
     log_info "--no-restart：已写入 .env，未重建容器。稍后请手动："
-    echo "    cd $PROJECT_DIR && $DOCKER_COMPOSE --env-file .env up -d --force-recreate $TOOLS_CONTAINER"
+    echo "    cd $PROJECT_DIR && docker compose --env-file .env ${manual_compose_files} up -d --force-recreate --wait $TOOLS_CONTAINER"
     exit 0
   fi
 
-  # 6) 重建工具容器使其生效（纯 compose，会自动叠加 override，网络随之挂上）
+  # 7) 重建并等待语义健康；失败时恢复两份旧配置并尝试恢复旧服务。
   log_info "重建 $TOOLS_CONTAINER 以加载新配置..."
-  ( cd "$PROJECT_DIR" && $DOCKER_COMPOSE --env-file .env up -d --force-recreate "$TOOLS_CONTAINER" )
-  # 兜底：override 未生效时（极少数）也把网络补上
-  [[ -n "$need_network" ]] && ensure_tool_on_network "$need_network"
+  local restart_status
+  if restart_log_db_services_transactionally; then
+    restart_status=0
+  else
+    restart_status=$?
+  fi
+  case "$restart_status" in
+    0)
+      complete_log_db_configuration_transaction ||
+        die "候选服务已健康，但无法持久清理日志库配置事务记录；请检查 mode-600 marker"
+      ;;
+    10)
+      complete_log_db_configuration_transaction ||
+        die "旧配置与旧服务已恢复，但无法持久清理日志库配置事务记录"
+      die "日志库配置重建失败，已恢复旧配置与旧服务；可修正后安全重跑"
+      ;;
+    *) die "高危：日志库配置重建与旧服务恢复均失败，请立即检查 docker compose ps/logs" ;;
+  esac
 
   echo ""
   log_success "完成！日志类查询（仪表盘流量、使用日志、模型监控、风控/IP 分析）现在会读取日志库。"
   log_info "验证： $DOCKER_COMPOSE logs --tail=20 $TOOLS_CONTAINER  并刷新前端仪表盘。"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

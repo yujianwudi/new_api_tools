@@ -8,7 +8,7 @@
 #   使用 docker buildx build 或 DOCKER_BUILDKIT=1 启用缓存挂载
 
 # Stage 1: 构建前端
-FROM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS frontend-builder
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -19,7 +19,7 @@ RUN npm run build
 # Stage 2: 构建 Go 后端
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS backend-builder
 ARG TARGETARCH
-ARG APP_VERSION=0.5.0
+ARG APP_VERSION=0.5.1
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 WORKDIR /build

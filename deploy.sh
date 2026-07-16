@@ -29,8 +29,11 @@ NEWAPI_TOOLS_IMAGE_DERIVED=false
 NEWAPI_TOOLS_EXPECTED_REVISION=""
 DEPLOY_ROLLBACK_ENV_AVAILABLE=false
 DEPLOY_ROLLBACK_ENV_CONTENT=""
+DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
 DEPLOY_ENV_GENERATED_THIS_RUN=false
 DEPLOY_COMPOSE_PROJECT_NAME_OVERRIDE=""
+DEPLOY_STATE_LOCK_FD=""
+DEPLOY_STATE_LOCK_PATH=""
 
 # 由 detect_environment() 设置：host 模式下需要追加 overlay compose 文件
 COMPOSE_FILES=("-f" "$COMPOSE_FILE")
@@ -47,6 +50,96 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
+
+# Keep the lock beside the project directory instead of inside it. This gives
+# first installs a stable lock before the target exists and prevents purge from
+# unlinking the active lock inode while another process is still excluded.
+project_state_lock_path() {
+  local project_dir="$1" resolved parent base
+  [[ -n "$project_dir" && "$project_dir" != "/" ]] || return 1
+  if [[ -d "$project_dir" ]]; then
+    resolved="$(cd -- "$project_dir" && pwd -P)" || return 1
+    parent="$(dirname -- "$resolved")"
+    base="$(basename -- "$resolved")"
+  else
+    parent="$(dirname -- "$project_dir")"
+    base="$(basename -- "$project_dir")"
+    [[ -d "$parent" ]] || return 1
+    parent="$(cd -- "$parent" && pwd -P)" || return 1
+  fi
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != "/" ]] || return 1
+  printf '%s/.%s.state.lock\n' "$parent" "$base"
+}
+
+state_lock_fd_matches_path() {
+  local fd="$1" path="$2" fd_path fd_identity path_identity
+  [[ "$fd" =~ ^[0-9]+$ && -f "$path" && ! -L "$path" ]] || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  [[ -e "$fd_path" ]] || return 1
+  fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$path" 2>/dev/null)" || return 1
+  [[ "$fd_identity" == "$path_identity" ]]
+}
+
+state_lock_current_uid() { id -u; }
+state_lock_path_owner() { stat -c '%u' -- "$1" 2>/dev/null; }
+
+state_lock_fd_is_secure() {
+  local fd="$1" path="$2" fd_path owner mode
+  state_lock_fd_matches_path "$fd" "$path" || return 1
+  fd_path="/proc/${BASHPID}/fd/${fd}"
+  owner="$(stat -Lc '%u' -- "$fd_path" 2>/dev/null)" || return 1
+  mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" || return 1
+  [[ "$owner" == "$(state_lock_current_uid)" && "$mode" == "600" ]]
+}
+
+acquire_deploy_state_lock() {
+  local project_dir="$1" lock_path inherited_fd inherited_path old_umask
+  lock_path="$(project_state_lock_path "$project_dir")" ||
+    die "无法确定部署状态锁路径"
+
+  inherited_fd="${NEWAPI_TOOLS_STATE_LOCK_FD:-}"
+  inherited_path="${NEWAPI_TOOLS_STATE_LOCK_PATH:-}"
+  if [[ "$inherited_path" == "$lock_path" ]] &&
+    state_lock_fd_is_secure "$inherited_fd" "$lock_path"; then
+    flock -n "$inherited_fd" || die "继承的部署状态锁已失效"
+    DEPLOY_STATE_LOCK_FD="$inherited_fd"
+    DEPLOY_STATE_LOCK_PATH="$lock_path"
+    return 0
+  fi
+  unset NEWAPI_TOOLS_STATE_LOCK_FD NEWAPI_TOOLS_STATE_LOCK_PATH
+
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    [[ -f "$lock_path" && ! -L "$lock_path" ]] ||
+      die "部署状态锁不是安全的常规文件：${lock_path}"
+    [[ "$(state_lock_path_owner "$lock_path")" == "$(state_lock_current_uid)" ]] ||
+      die "部署状态锁不属于当前用户：${lock_path}"
+  fi
+  old_umask="$(umask)"
+  umask 077
+  if ! exec {DEPLOY_STATE_LOCK_FD}>>"$lock_path"; then
+    umask "$old_umask"
+    die "无法打开部署状态锁：${lock_path}"
+  fi
+  umask "$old_umask"
+  state_lock_fd_matches_path "$DEPLOY_STATE_LOCK_FD" "$lock_path" ||
+    die "部署状态锁在打开时发生替换：${lock_path}"
+  [[ "$(stat -Lc '%u' -- "/proc/${BASHPID}/fd/${DEPLOY_STATE_LOCK_FD}" 2>/dev/null)" == \
+    "$(state_lock_current_uid)" ]] ||
+    die "部署状态锁打开后不属于当前用户：${lock_path}"
+  chmod 600 "/proc/${BASHPID}/fd/${DEPLOY_STATE_LOCK_FD}" ||
+    die "无法收紧部署状态锁权限：${lock_path}"
+  state_lock_fd_is_secure "$DEPLOY_STATE_LOCK_FD" "$lock_path" ||
+    die "部署状态锁权限或身份无效：${lock_path}"
+  flock -n "$DEPLOY_STATE_LOCK_FD" ||
+    die "另一个安装、部署或卸载进程正在操作该项目：${lock_path}"
+  state_lock_fd_matches_path "$DEPLOY_STATE_LOCK_FD" "$lock_path" ||
+    die "部署状态锁在加锁时发生替换：${lock_path}"
+
+  DEPLOY_STATE_LOCK_PATH="$lock_path"
+  export NEWAPI_TOOLS_STATE_LOCK_FD="$DEPLOY_STATE_LOCK_FD"
+  export NEWAPI_TOOLS_STATE_LOCK_PATH="$DEPLOY_STATE_LOCK_PATH"
+}
 
 validate_newapi_tools_image() {
   local image="${1:-}"
@@ -103,46 +196,163 @@ env_content_value() {
   printf '%s\n' "$value"
 }
 
+atomic_write_deploy_dotenv() {
+  local target="$1" content="$2" tmp mode
+  local parent
+  parent="$(dirname "$target")"
+
+  # Refuse an existing directory. A symlink is safe to replace only because
+  # mv -T treats the destination as a path entry rather than following a
+  # symlink-to-directory. The final checks catch a concurrent replacement.
+  [[ ! -d "$target" ]] || return 1
+  tmp="$(umask 077; mktemp "${target}.tmp.XXXXXX")" || return 1
+  if ! printf '%s\n' "$content" > "$tmp" ||
+    ! chmod 600 "$tmp" ||
+    ! sync -f "$tmp" ||
+    ! mv -Tf -- "$tmp" "$target" ||
+    ! sync -f "$parent"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  mode="$(stat -c '%a' -- "$target" 2>/dev/null)" || return 1
+  [[ "$mode" == "600" ]]
+}
+
 persist_deploy_image_env() {
-  local env_file="$1" image="$2" tmp
-  [[ -f "$env_file" ]] || die "无法持久化部署镜像：配置文件不存在"
+  local env_file="$1" image="$2" content
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "无法持久化部署镜像：配置文件不存在或不是安全的常规文件"
   validate_newapi_tools_image "$image"
 
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  awk 'index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next } { print }' "$env_file" > "$tmp"
-  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$image")" >> "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$env_file"
+  content="$(
+    awk 'index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next } { print }' "$env_file"
+    printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$image")"
+  )"
+  atomic_write_deploy_dotenv "$env_file" "$content"
 }
 
 persist_deploy_compose_project_env() {
-  local env_file="$1" project_name="$2" tmp
-  [[ -f "$env_file" ]] || die "无法持久化 Compose 项目标识：配置文件不存在"
+  local env_file="$1" project_name="$2" content
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "无法持久化 Compose 项目标识：配置文件不存在或不是安全的常规文件"
   [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
     die "COMPOSE_PROJECT_NAME 格式无效"
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  awk 'index($0, "COMPOSE_PROJECT_NAME=") == 1 { next } { print }' "$env_file" > "$tmp"
-  printf 'COMPOSE_PROJECT_NAME=%s\n' "$(dotenv_quote "$project_name")" >> "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$env_file"
+  content="$(
+    awk 'index($0, "COMPOSE_PROJECT_NAME=") == 1 { next } { print }' "$env_file"
+    printf 'COMPOSE_PROJECT_NAME=%s\n' "$(dotenv_quote "$project_name")"
+  )"
+  atomic_write_deploy_dotenv "$env_file" "$content"
 }
 
 restore_deploy_env_content() {
-  local env_file="$1" content="$2" image="$3" tmp
-  [[ -f "$env_file" ]] || die "无法恢复部署配置：配置文件不存在"
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  printf '%s\n' "$content" > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$env_file"
+  local env_file="$1" content="$2" image="$3"
+  [[ ! -d "$env_file" ]] || die "无法恢复部署配置：目标是目录"
+  atomic_write_deploy_dotenv "$env_file" "$content"
   persist_deploy_image_env "$env_file" "$image"
 }
 
 restore_deploy_env_snapshot() {
-  local env_file="$1" content="$2" tmp
-  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
-  printf '%s\n' "$content" > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$env_file"
+  local env_file="$1" content="$2"
+  atomic_write_deploy_dotenv "$env_file" "$content"
+}
+
+deploy_rollback_snapshot_path() {
+  printf '%s.rollback\n' "$ENV_FILE"
+}
+
+normalize_deploy_rollback_env_content() {
+  local content="$1" image="$2" project_name="$3"
+  is_immutable_newapi_tools_image "$image" || return 1
+  [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || return 1
+  printf '%s\n' "$content" |
+    awk '
+      index($0, "NEWAPI_TOOLS_IMAGE=") == 1 { next }
+      index($0, "COMPOSE_PROJECT_NAME=") == 1 { next }
+      { print }
+    '
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$image")"
+  printf 'COMPOSE_PROJECT_NAME=%s\n' "$(dotenv_quote "$project_name")"
+}
+
+persist_deploy_rollback_snapshot() {
+  local content="$1" snapshot_file
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  atomic_write_deploy_dotenv "$snapshot_file" "$content"
+}
+
+load_deploy_rollback_snapshot() {
+  local snapshot_file mode snapshot_fd fd_path path_identity fd_identity status
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" && -r "$snapshot_file" ]] || return 1
+  exec {snapshot_fd}< "$snapshot_file" || return 1
+  fd_path="/proc/${BASHPID}/fd/${snapshot_fd}"
+  if [[ ! -e "$fd_path" ]] ||
+    ! path_identity="$(stat -Lc '%d:%i' -- "$snapshot_file" 2>/dev/null)" ||
+    ! fd_identity="$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null)" ||
+    [[ "$path_identity" != "$fd_identity" ]] ||
+    [[ -L "$snapshot_file" ]] ||
+    ! mode="$(stat -Lc '%a' -- "$fd_path" 2>/dev/null)" ||
+    [[ "$mode" != "600" ]]; then
+    exec {snapshot_fd}<&-
+    return 1
+  fi
+  cat <&"$snapshot_fd"
+  status=$?
+  exec {snapshot_fd}<&-
+  return "$status"
+}
+
+ensure_deploy_rollback_snapshot() {
+  local snapshot_file content
+  [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]] || return 0
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    content="$(load_deploy_rollback_snapshot)" || return 1
+    DEPLOY_ROLLBACK_ENV_CONTENT="$content"
+    return 0
+  fi
+  persist_deploy_rollback_snapshot "$DEPLOY_ROLLBACK_ENV_CONTENT"
+}
+
+restore_active_deploy_rollback_snapshot() {
+  local fallback_content="${1:-}" content
+  content="$fallback_content"
+  if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    content="$(load_deploy_rollback_snapshot)" || return 1
+  elif [[ -z "$fallback_content" ]]; then
+    return 1
+  fi
+  restore_deploy_env_snapshot "$ENV_FILE" "$content"
+}
+
+remove_deploy_rollback_snapshot() {
+  local snapshot_file parent
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  parent="$(dirname "$snapshot_file")"
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  rm -f -- "$snapshot_file" || return 1
+  [[ ! -e "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  if ! sync -f "$parent"; then
+    # A cleanup failure must not discard the only durable rollback copy.
+    persist_deploy_rollback_snapshot "$DEPLOY_ROLLBACK_ENV_CONTENT" || true
+    return 1
+  fi
+}
+
+durable_remove_deploy_file() {
+  local target="$1" parent removed=false
+  parent="$(dirname "$target")"
+  [[ ! -d "$target" || -L "$target" ]] || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    rm -f -- "$target" || return 1
+    removed=true
+  fi
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  if [[ "$removed" == "true" ]]; then
+    sync -f "$parent" || return 1
+  fi
 }
 
 image_repository_without_tag() {
@@ -323,16 +533,16 @@ configure_host_compose_files() {
   COMPOSE_FILES=("-f" "$COMPOSE_FILE" "-f" "$COMPOSE_HOST_FILE")
 }
 
-# v0.5.0 的基础 Compose 文件使用 service_completed_successfully 镜像策略门禁，
+# 当前基础 Compose 文件使用 service_completed_successfully 镜像策略门禁，
 # 并与 host overlay 的 !reset 语法统一要求 Docker Compose v2.24+。
 detect_docker_compose() {
   if docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
     DOCKER_COMPOSE_V2_VERSION="$(get_docker_compose_v2_version)"
   else
-    die "缺少 Docker Compose v2.24+；v0.5.0 不再支持旧版 docker-compose"
+    die "缺少 Docker Compose v2.24+；当前不可变镜像策略不支持旧版 docker-compose"
   fi
-  require_docker_compose_v224 "v0.5.0 不可变镜像策略门禁"
+  require_docker_compose_v224 "当前不可变镜像策略门禁"
 }
 
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
@@ -1383,7 +1593,8 @@ generate_env_file() {
   [[ "$USE_BRIDGE_MODE" == "true" ]] && network_mode_tag="bridge"
   [[ "$USE_HOST_MODE" == "true" ]] && network_mode_tag="host"
 
-  cat > "$ENV_FILE" <<EOF
+  local env_content
+  env_content="$(cat <<EOF
 # NewAPI Middleware Tool 配置文件
 # 由 deploy.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 网络部署模式: ${network_mode_tag}
@@ -1445,8 +1656,9 @@ JWT_EXPIRE_HOURS=24
 # Redis 配置
 REDIS_PASSWORD=''
 EOF
-
-  chmod 600 "$ENV_FILE"
+)"
+  atomic_write_deploy_dotenv "$ENV_FILE" "$env_content" ||
+    die "无法原子持久化完整部署配置；旧配置保持不变"
   DEPLOY_ENV_GENERATED_THIS_RUN=true
   log_success "配置文件已生成"
 }
@@ -1658,6 +1870,12 @@ start_deploy_services_and_wait() {
 
 restore_deploy_previous_configuration() {
   local rollback_content="$1" rollback_image="$2"
+  if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    rollback_content="$(load_deploy_rollback_snapshot)" || {
+      log_error "高危：持久化回滚快照不可读；拒绝使用仅存在于进程内存的旧配置"
+      return 1
+    }
+  fi
   if ! (restore_deploy_env_content "$ENV_FILE" "$rollback_content" "$rollback_image"); then
     log_error "高危：无法把磁盘配置恢复为旧部署；请立即停止人工重启并检查 ${ENV_FILE}"
     return 1
@@ -1687,11 +1905,49 @@ rollback_deploy_to_previous() {
   start_deploy_services_and_wait rollback "$rollback_image"
 }
 
+recover_preexisting_deploy_rollback_snapshot() {
+  local rollback_content rollback_image rollback_project
+  [[ "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" == "true" ]] || return 0
+  rollback_content="$(load_deploy_rollback_snapshot)" || return 1
+  rollback_image="$(env_content_value "$rollback_content" 'NEWAPI_TOOLS_IMAGE')"
+  rollback_project="$(env_content_value "$rollback_content" 'COMPOSE_PROJECT_NAME')"
+  is_immutable_newapi_tools_image "$rollback_image" || return 1
+  [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || return 1
+
+  log_warn "正在从中断事务的权威快照恢复旧部署 ${rollback_image}"
+  if ! (
+    restore_deploy_env_snapshot "$ENV_FILE" "$rollback_content"
+    DEPLOY_COMPOSE_PROJECT_NAME_OVERRIDE="$rollback_project"
+    NEWAPI_TOOLS_IMAGE="$rollback_image"
+    export NEWAPI_TOOLS_IMAGE
+    configure_deploy_context_from_env "$ENV_FILE"
+    if ! run_deploy_compose "$ENV_FILE" "$rollback_image" down; then
+      log_error "清理中断事务当前容器时发生错误；仍将尝试按快照重建旧服务"
+    fi
+    start_deploy_services_and_wait rollback "$rollback_image"
+  ); then
+    log_error "无法按持久化快照恢复旧部署；快照已保留，拒绝生成或启动新的候选配置"
+    return 1
+  fi
+
+  DEPLOY_ROLLBACK_ENV_CONTENT="$rollback_content"
+  DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+  DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  log_success "已从中断事务恢复并验证旧部署；回滚快照将保留到本次候选提交成功"
+}
+
 #######################################
 # 启动服务
 #######################################
 start_services() {
   log_info "启动服务..."
+
+  [[ "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" != "true" ]] ||
+    die "检测到尚未恢复的中断部署快照；拒绝在当前可能是候选版本的容器上继续"
+  if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]] &&
+    ! ensure_deploy_rollback_snapshot; then
+    die "检测到旧服务，但无法建立或读取 mode-600 完整回滚快照；拒绝覆盖 .env"
+  fi
 
   local candidate_request="$NEWAPI_TOOLS_IMAGE" candidate_env_content
   candidate_env_content="$(<"$ENV_FILE")"
@@ -1700,13 +1956,15 @@ start_services() {
   # 下载 GeoIP 数据库
   if ! (download_geoip_database); then
     if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$DEPLOY_ROLLBACK_ENV_CONTENT") ||
+      (restore_active_deploy_rollback_snapshot) ||
         log_error "高危：部署预检失败后无法恢复旧配置"
     fi
     die "部署预检失败；尚未拉取或切换候选服务"
   fi
 
-  local had_existing_service=false rollback_env_content="" rollback_image="" rollback_reference="" rollback_project=""
+  local had_existing_service=false had_rollback_deployment=false
+  local rollback_env_content="" normalized_rollback_env_content=""
+  local rollback_image="" rollback_reference="" rollback_project=""
   local existing_container_names
 
   # Capture the actual previous configuration before changing any image pin.
@@ -1714,7 +1972,7 @@ start_services() {
   # callers (including upgrades) fall back to the current file.
   if ! existing_container_names="$(list_deploy_container_names)"; then
     if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$DEPLOY_ROLLBACK_ENV_CONTENT") ||
+      (restore_active_deploy_rollback_snapshot) ||
         log_error "高危：Docker 容器枚举失败后无法恢复旧配置"
     fi
     die "无法可靠枚举现有 Docker 容器；拒绝在部署状态未知时继续"
@@ -1735,7 +1993,7 @@ start_services() {
       legacy_version="$(env_content_value "$rollback_env_content" 'NEWAPI_TOOLS_VERSION')"
       if [[ -n "$legacy_version" ]]; then
         if [[ ! "$legacy_version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-          (restore_deploy_env_snapshot "$ENV_FILE" "$rollback_env_content") ||
+          (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
             log_error "高危：无法恢复旧版本字段无效的完整配置"
           die "旧 NEWAPI_TOOLS_VERSION 格式无效；无法建立安全回滚锚点"
         fi
@@ -1743,18 +2001,18 @@ start_services() {
       fi
     fi
     if [[ -z "$rollback_reference" ]]; then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$rollback_env_content") ||
+      (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
         log_error "高危：无法恢复缺少镜像引用的旧配置"
       die "检测到现有服务，但旧配置中没有可审计的镜像引用；拒绝在无回滚锚点时部署"
     fi
     if ! (validate_newapi_tools_image "$rollback_reference"); then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$rollback_env_content") ||
+      (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
         log_error "高危：无法恢复镜像引用无效的旧配置"
       die "旧部署镜像引用无效；已拒绝部署"
     fi
 
     if ! rollback_project="$(resolve_deploy_running_compose_project "newapi-tools" "$rollback_env_content")"; then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$rollback_env_content") ||
+      (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
         log_error "高危：无法恢复 Compose 项目标识校验失败前的旧配置"
       die "无法建立可信的旧 Compose project 身份；拒绝部署"
     fi
@@ -1763,10 +2021,24 @@ start_services() {
     # The running container is authoritative. A mutable tag may already point
     # at a newly pulled image which has never served production traffic.
     if ! rollback_image="$(resolve_deploy_running_image_digest "newapi-tools" "$rollback_reference")"; then
-      (restore_deploy_env_snapshot "$ENV_FILE" "$rollback_env_content") ||
+      (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
         log_error "高危：无法恢复未建立回滚锚点前的旧配置"
       die "无法把现有容器实际运行镜像固定为唯一 OCI digest；拒绝在无回滚锚点时部署"
     fi
+
+    # The rollback file is the authoritative recovery point across process or
+    # host crashes. It preserves every previous setting while replacing only
+    # the image/project identity with values verified from the running service.
+    if ! normalized_rollback_env_content="$(normalize_deploy_rollback_env_content \
+      "$rollback_env_content" "$rollback_image" "$rollback_project")" ||
+      ! persist_deploy_rollback_snapshot "$normalized_rollback_env_content"; then
+      (restore_active_deploy_rollback_snapshot "$rollback_env_content") ||
+        log_error "高危：完整旧配置无法写回，且持久化回滚快照建立失败"
+      die "无法在覆盖镜像锚点或停止服务前持久化完整 mode-600 回滚快照"
+    fi
+    rollback_env_content="$normalized_rollback_env_content"
+    DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+    DEPLOY_ROLLBACK_ENV_CONTENT="$rollback_env_content"
 
     # Keep a crash-safe immutable old-image anchor on disk while the candidate
     # is pulled and health-checked. Shell interpolation still uses the exported
@@ -1785,12 +2057,34 @@ start_services() {
     fi
     NEWAPI_TOOLS_IMAGE="$candidate_request"
     export NEWAPI_TOOLS_IMAGE
+    had_rollback_deployment=true
+  elif [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+    # A deliberately stopped/removed installation still has an authoritative
+    # pre-candidate snapshot. Treat it as a rollback-capable deployment rather
+    # than as a first install, without consulting candidate container state.
+    rollback_env_content="$(load_deploy_rollback_snapshot)" ||
+      die "持久化旧部署快照不可读；拒绝把无容器安装当作首次部署"
+    rollback_image="$(env_content_value "$rollback_env_content" 'NEWAPI_TOOLS_IMAGE')"
+    rollback_project="$(env_content_value "$rollback_env_content" 'COMPOSE_PROJECT_NAME')"
+    is_immutable_newapi_tools_image "$rollback_image" ||
+      die "无容器旧部署快照未固定到不可变 OCI digest"
+    [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "无容器旧部署快照缺少有效 Compose project"
+    DEPLOY_COMPOSE_PROJECT_NAME_OVERRIDE="$rollback_project"
+    if ! (persist_deploy_compose_project_env "$ENV_FILE" "$rollback_project"); then
+      (restore_active_deploy_rollback_snapshot) ||
+        log_error "高危：无容器旧部署的 Compose project 无法写入候选配置，且旧配置恢复失败"
+      die "无法在候选切换前持久化无容器旧部署的权威 Compose project 身份"
+    fi
+    NEWAPI_TOOLS_IMAGE="$candidate_request"
+    export NEWAPI_TOOLS_IMAGE
+    had_rollback_deployment=true
   fi
 
   # 先拉取成功再停止旧容器，避免镜像不存在/网络失败造成不必要停机。
   log_info "拉取部署镜像 ${NEWAPI_TOOLS_IMAGE}..."
   if ! run_deploy_compose "$ENV_FILE" "$candidate_request" pull --include-deps newapi-tools; then
-    if [[ "$had_existing_service" == "true" ]] &&
+    if [[ "$had_rollback_deployment" == "true" ]] &&
       ! restore_deploy_previous_configuration "$rollback_env_content" "$rollback_image"; then
       die "候选镜像拉取失败，且完整旧配置恢复失败；当前容器可能仍运行，请勿重启"
     fi
@@ -1802,7 +2096,7 @@ start_services() {
   NEWAPI_TOOLS_IMAGE="$candidate_request"
   export NEWAPI_TOOLS_IMAGE
   if ! pin_deploy_image_after_pull; then
-    if [[ "$had_existing_service" == "true" ]] &&
+    if [[ "$had_rollback_deployment" == "true" ]] &&
       ! restore_deploy_previous_configuration "$rollback_env_content" "$rollback_image"; then
       die "候选镜像验证失败，且完整旧配置恢复失败；当前容器可能仍运行，请勿重启"
     fi
@@ -1833,9 +2127,15 @@ start_services() {
     if (persist_deploy_image_env "$ENV_FILE" "$candidate_image"); then
       NEWAPI_TOOLS_IMAGE="$candidate_image"
       export NEWAPI_TOOLS_IMAGE
-      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
-      DEPLOY_ROLLBACK_ENV_CONTENT=""
-      log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+      if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" != "true" ]] ||
+        (remove_deploy_rollback_snapshot); then
+        DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+        DEPLOY_ROLLBACK_ENV_CONTENT=""
+        log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+      else
+        candidate_healthy=false
+        log_error "候选服务已健康且镜像已提交，但无法清除旧配置回滚快照，将执行回滚"
+      fi
     else
       candidate_healthy=false
       log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
@@ -1843,7 +2143,7 @@ start_services() {
   fi
 
   if [[ "$candidate_healthy" != "true" ]]; then
-    if [[ "$had_existing_service" != "true" ]]; then
+    if [[ "$had_rollback_deployment" != "true" ]]; then
       if ! run_deploy_compose "$ENV_FILE" "$candidate_image" down --remove-orphans; then
         log_error "清理首次安装候选 Compose 项目失败；将强制移除已知的可重启容器"
         run_deploy_compose "$ENV_FILE" "$candidate_image" \
@@ -1929,13 +2229,41 @@ NGINX
 uninstall() {
   log_warn "正在卸载 NewAPI Middleware Tool..."
 
-  if [[ -f "$COMPOSE_FILE" && -f "$ENV_FILE" ]]; then
-    $DOCKER_COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v 2>/dev/null || true
-    log_success "容器已停止并移除"
+  local snapshot_file snapshot_content
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    snapshot_content="$(load_deploy_rollback_snapshot)" ||
+      die "卸载检测到不安全或不可读取的回滚快照；拒绝删除配置并误报成功"
+    restore_deploy_env_snapshot "$ENV_FILE" "$snapshot_content" ||
+      die "卸载前无法恢复权威旧部署配置；回滚快照已保留"
   fi
 
-  if [[ -f "$ENV_FILE" ]]; then
-    rm -f "$ENV_FILE"
+  if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+    [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] ||
+      die "卸载配置不是安全的常规文件；拒绝继续"
+    configure_deploy_context_from_env "$ENV_FILE" ||
+      die "卸载前无法重建 Compose/网络上下文；配置与回滚快照已保留"
+    DEPLOY_COMPOSE_PROJECT_NAME_OVERRIDE=""
+    if ! run_deploy_compose "$ENV_FILE" "$(env_file_value "$ENV_FILE" 'NEWAPI_TOOLS_IMAGE')" down -v; then
+      die "卸载服务清理失败；配置与回滚快照已保留，未报告卸载成功"
+    fi
+    log_success "容器已停止并移除"
+  else
+    local container_names
+    container_names="$(list_deploy_container_names)" ||
+      die "卸载时无法可靠枚举容器；拒绝误报成功"
+    if printf '%s\n' "$container_names" | grep -qE '^newapi-tools(-redis)?$'; then
+      die "检测到 newapi-tools 容器但缺少可审计配置；拒绝误报卸载成功"
+    fi
+  fi
+
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    durable_remove_deploy_file "$snapshot_file" ||
+      die "服务已清理，但无法持久删除回滚快照；卸载未完成"
+  fi
+  if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+    durable_remove_deploy_file "$ENV_FILE" ||
+      die "服务已清理，但无法持久删除配置文件；卸载未完成"
     log_success "配置文件已删除"
   fi
 
@@ -1994,15 +2322,88 @@ EOF
 }
 
 capture_deploy_rollback_env() {
-  local container_names="$1"
+  local container_names="$1" snapshot_file old_content rollback_reference
+  local legacy_version rollback_project rollback_image normalized_content
+  local has_existing_container=false
   DEPLOY_ROLLBACK_ENV_AVAILABLE=false
   DEPLOY_ROLLBACK_ENV_CONTENT=""
-  if ! printf '%s\n' "$container_names" | grep -qE '^newapi-tools$'; then
+  DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+  # A durable snapshot is authoritative even when a crash happened after
+  # compose down removed the old container. Validate it before consulting the
+  # current container list so that exact outage window remains recoverable.
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    old_content="$(load_deploy_rollback_snapshot)" ||
+      die "检测到不可读取、不安全或权限不是 0600 的旧回滚快照 ${snapshot_file}；拒绝覆盖"
+    rollback_reference="$(env_content_value "$old_content" 'NEWAPI_TOOLS_IMAGE')"
+    rollback_project="$(env_content_value "$old_content" 'COMPOSE_PROJECT_NAME')"
+    is_immutable_newapi_tools_image "$rollback_reference" ||
+      die "旧回滚快照未固定到不可变 OCI digest；拒绝用当前可能是候选版本的容器重写恢复锚点"
+    [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "旧回滚快照缺少有效的 Compose project；拒绝用当前可能是候选版本的容器重写恢复锚点"
+    DEPLOY_ROLLBACK_ENV_CONTENT="$old_content"
+    DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+    DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=true
+    log_warn "检测到上次未提交完成的权威回滚快照；将先恢复其中固定的旧部署，绝不采用当前容器身份覆盖"
     return 0
   fi
-  [[ -f "$ENV_FILE" ]] ||
-    die "检测到现有 newapi-tools 容器，但缺少旧 .env；无法审计密码、DSN、网络与回滚配置，拒绝覆盖"
-  DEPLOY_ROLLBACK_ENV_CONTENT="$(<"$ENV_FILE")"
+
+  if printf '%s\n' "$container_names" | grep -qE '^newapi-tools$'; then
+    has_existing_container=true
+  elif [[ ! -e "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
+    # A genuinely fresh install has neither a container nor a previous dotenv.
+    return 0
+  fi
+
+  [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] ||
+    die "检测到已有部署配置，但缺少安全的旧 .env；无法审计密码、DSN、网络与回滚配置，拒绝覆盖"
+  old_content="$(<"$ENV_FILE")"
+
+  rollback_reference="$(env_content_value "$old_content" 'NEWAPI_TOOLS_IMAGE')"
+  if [[ -z "$rollback_reference" ]]; then
+    legacy_version="$(env_content_value "$old_content" 'NEWAPI_TOOLS_VERSION')"
+    if [[ -n "$legacy_version" ]]; then
+      [[ "$legacy_version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+        die "旧回滚配置的 NEWAPI_TOOLS_VERSION 格式无效；拒绝覆盖"
+      rollback_reference="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${legacy_version}"
+    fi
+  fi
+  if [[ -z "$rollback_reference" && "$has_existing_container" != "true" ]]; then
+    # A documented first install may start from a copied .env.example whose
+    # persistent image keys are empty while the candidate is supplied through
+    # the process environment. It has no committed deployment to roll back.
+    return 0
+  fi
+  [[ -n "$rollback_reference" ]] ||
+    die "旧回滚配置缺少 NEWAPI_TOOLS_IMAGE/NEWAPI_TOOLS_VERSION；拒绝覆盖"
+  (validate_newapi_tools_image "$rollback_reference") ||
+    die "旧回滚配置的镜像引用无效；拒绝覆盖"
+
+  if [[ "$has_existing_container" == "true" ]]; then
+    rollback_project="$(resolve_deploy_running_compose_project "newapi-tools" "$old_content")" ||
+      die "无法在覆盖 .env 前固定运行中服务的 Compose project 身份"
+    rollback_image="$(resolve_deploy_running_image_digest "newapi-tools" "$rollback_reference")" ||
+      die "无法在覆盖 .env 前把运行中服务固定为唯一 OCI digest"
+  else
+    # With no container label to consult, only an explicit project identity is
+    # authoritative. Guessing Compose's directory-derived default could target
+    # a different project after the checkout or install directory has moved.
+    rollback_project="$(env_content_value "$old_content" 'COMPOSE_PROJECT_NAME')"
+    [[ "$rollback_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "旧 .env 对应的容器不存在，且缺少有效的显式 COMPOSE_PROJECT_NAME；拒绝猜测回滚项目"
+    if is_immutable_newapi_tools_image "$rollback_reference"; then
+      rollback_image="$rollback_reference"
+    elif ! rollback_image="$(resolve_deploy_image_digest "$rollback_reference" "")"; then
+      die "旧 .env 对应的容器不存在，且可变镜像无法从本地唯一固定为同仓库 OCI digest"
+    fi
+  fi
+  normalized_content="$(normalize_deploy_rollback_env_content \
+    "$old_content" "$rollback_image" "$rollback_project")" ||
+    die "无法生成完整的旧部署恢复配置"
+  persist_deploy_rollback_snapshot "$normalized_content" ||
+    die "无法在覆盖 .env 前原子写入 mode-600 完整回滚快照 ${snapshot_file}"
+
+  DEPLOY_ROLLBACK_ENV_CONTENT="$normalized_content"
   DEPLOY_ROLLBACK_ENV_AVAILABLE=true
 }
 
@@ -2011,7 +2412,11 @@ capture_deploy_rollback_env() {
 #######################################
 main() {
   need_cmd docker
+  need_cmd flock
+  need_cmd id
   need_cmd sha256sum
+  need_cmd stat
+  need_cmd sync
   detect_docker_compose
 
   local mode="${1:-}"
@@ -2022,6 +2427,7 @@ main() {
       exit 0
       ;;
     --uninstall)
+      acquire_deploy_state_lock "$SCRIPT_DIR"
       uninstall
       exit 0
       ;;
@@ -2031,6 +2437,7 @@ main() {
       ;;
     "")
       # 正常部署流程
+      acquire_deploy_state_lock "$SCRIPT_DIR"
       resolve_deploy_image
       echo ""
       echo -e "${BLUE}========================================${NC}"
@@ -2041,12 +2448,14 @@ main() {
       detect_environment
       detect_log_database
       interactive_config
+      check_compose_file
       local existing_container_names
       existing_container_names="$(list_deploy_container_names)" ||
         die "无法可靠枚举现有 Docker 容器；拒绝覆盖可能正在使用的 .env"
       capture_deploy_rollback_env "$existing_container_names"
+      recover_preexisting_deploy_rollback_snapshot ||
+        die "检测到中断部署，但无法恢复持久化的旧服务；拒绝继续"
       generate_env_file
-      check_compose_file
       start_services
       ;;
     *)

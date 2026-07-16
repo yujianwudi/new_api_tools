@@ -15,6 +15,10 @@ const reconciliationRunColumns = `id, run_key, kind, status, window_start, windo
 	error_message, created_at, updated_at`
 
 func (s *Store) CreateReconciliationRun(ctx context.Context, input ReconciliationRunInput) (ReconciliationRun, error) {
+	return s.createReconciliationRun(ctx, s.db, input)
+}
+
+func (s *Store) createReconciliationRun(ctx context.Context, executor execQueryer, input ReconciliationRunInput) (ReconciliationRun, error) {
 	var err error
 	if input.RunKey, err = requireText("run_key", input.RunKey); err != nil {
 		return ReconciliationRun{}, err
@@ -51,7 +55,7 @@ func (s *Store) CreateReconciliationRun(ctx context.Context, input Reconciliatio
 	input.SummaryJSON = summary
 	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
 	input.ErrorMessage = strings.TrimSpace(input.ErrorMessage)
-	result, err := s.db.ExecContext(ctx, `INSERT INTO reconciliation_runs(
+	result, err := executor.ExecContext(ctx, `INSERT INTO reconciliation_runs(
 		run_key, kind, status, window_start, window_end, started_at, finished_at,
 		scanned_count, matched_count, discrepancy_count, discrepancy_minor,
 		currency, summary_json, error_code, error_message, created_at, updated_at
@@ -69,7 +73,7 @@ func (s *Store) CreateReconciliationRun(ctx context.Context, input Reconciliatio
 		return ReconciliationRun{}, fmt.Errorf("read reconciliation run result: %w", err)
 	}
 	if rows == 0 {
-		existing, getErr := s.GetReconciliationRunByKey(ctx, input.RunKey)
+		existing, getErr := getReconciliationRun(ctx, executor, "run_key", input.RunKey)
 		if getErr != nil {
 			return ReconciliationRun{}, getErr
 		}
@@ -82,7 +86,7 @@ func (s *Store) CreateReconciliationRun(ctx context.Context, input Reconciliatio
 	if err != nil {
 		return ReconciliationRun{}, fmt.Errorf("read reconciliation run id: %w", err)
 	}
-	return s.GetReconciliationRun(ctx, id)
+	return getReconciliationRun(ctx, executor, "id", id)
 }
 
 func reconciliationRunMatchesFingerprint(item ReconciliationRun, input ReconciliationRunInput) bool {

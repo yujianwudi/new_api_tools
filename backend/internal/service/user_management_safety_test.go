@@ -44,6 +44,36 @@ func installDestructiveSnapshotStoreForTest(t *testing.T) {
 	})
 }
 
+func TestUserListOrderMappingRejectsSQLFragments(t *testing.T) {
+	columnCases := map[string]string{
+		"id":                         "id",
+		"username":                   "username",
+		"quota":                      "quota",
+		"used_quota":                 "used_quota",
+		"request_count":              "request_count",
+		"":                           "request_count",
+		"id DESC; DROP TABLE users;": "request_count",
+	}
+	for input, want := range columnCases {
+		if got := userListOrderColumn(input); got != want {
+			t.Fatalf("userListOrderColumn(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	directionCases := map[string]string{
+		"ASC":                 "ASC",
+		"asc":                 "ASC",
+		"DESC":                "DESC",
+		"":                    "DESC",
+		"DESC NULLS FIRST --": "DESC",
+	}
+	for input, want := range directionCases {
+		if got := userListOrderDirection(input); got != want {
+			t.Fatalf("userListOrderDirection(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func installUserManagementSafetyDB(t *testing.T) (*sqlx.DB, *UserManagementService) {
 	t.Helper()
 	installDestructiveSnapshotStoreForTest(t)

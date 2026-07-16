@@ -44,3 +44,12 @@ updates:
       time: '04:40'
       timezone: Asia/Shanghai
     open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:50'
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5

@@ -162,7 +162,7 @@ func TestTopUpQueryHandlersHideDatabaseErrors(t *testing.T) {
 
 func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	store := installTopUpExportFixture(t)
+	store, _ := installTopUpExportFixture(t)
 
 	viewer := topUpExportRouter(store, auth.RoleViewer)
 	viewerRecorder := httptest.NewRecorder()
@@ -200,6 +200,12 @@ func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
 	if page.Items[0].RequestID == "" || page.Items[0].RequestID != page.Items[1].RequestID {
 		t.Fatalf("audit request IDs are not correlated: %+v", page.Items)
 	}
+	runs, err := store.ListReconciliationRuns(context.Background(), toolstore.ReconciliationRunFilter{
+		Kind: "top_up_export_audit_outcome", Status: toolstore.ReconciliationSucceeded, Limit: 10,
+	})
+	if err != nil || len(runs.Items) != 1 {
+		t.Fatalf("resolved export audit recovery = %+v, error=%v", runs.Items, err)
+	}
 	var outcome struct {
 		RowCount         int64 `json:"row_count"`
 		ExpectedRowCount int64 `json:"expected_row_count"`
@@ -217,7 +223,179 @@ func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
 	}
 }
 
-func installTopUpExportFixture(t *testing.T) *toolstore.Store {
+func TestTopUpExportRollsBackIntentWhenInitialRecoveryFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, storePath := installTopUpExportFixture(t)
+	rawStore, err := sqlx.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open raw tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = rawStore.Close() })
+	if _, err := rawStore.Exec(`CREATE TRIGGER fail_top_up_export_recovery_insert
+		BEFORE INSERT ON reconciliation_runs
+		WHEN NEW.kind = 'top_up_export_audit_outcome'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected recovery insert failure');
+		END`); err != nil {
+		t.Fatalf("install recovery insert failure: %v", err)
+	}
+
+	admin := topUpExportRouter(store, auth.RoleAdmin)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/top-ups/export?status=success", nil)
+	request.RemoteAddr = "192.0.2.48:12345"
+	admin.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("export status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if disposition := recorder.Header().Get("Content-Disposition"); disposition != "" {
+		t.Fatalf("failed export started a CSV attachment: %q", disposition)
+	}
+	if contentType := recorder.Header().Get("Content-Type"); strings.Contains(contentType, "text/csv") {
+		t.Fatalf("failed export started a CSV stream: %q", contentType)
+	}
+	if expectedRows := recorder.Header().Get("X-Export-Expected-Rows"); expectedRows != "" {
+		t.Fatalf("failed export exposed CSV stream metadata: %q", expectedRows)
+	}
+
+	audits, err := store.ListOperationAudits(context.Background(), toolstore.OperationAuditFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list export audits: %v", err)
+	}
+	if len(audits.Items) != 0 {
+		t.Fatalf("recovery failure left orphaned export intent audits: %+v", audits.Items)
+	}
+	runs, err := store.ListReconciliationRuns(context.Background(), toolstore.ReconciliationRunFilter{
+		Kind: "top_up_export_audit_outcome", Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list audit recovery records: %v", err)
+	}
+	if len(runs.Items) != 0 {
+		t.Fatalf("recovery failure left partial reconciliation rows: %+v", runs.Items)
+	}
+}
+
+func TestTopUpExportPersistsReconcileableRecordWhenOutcomeAuditFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, storePath := installTopUpExportFixture(t)
+	rawStore, err := sqlx.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open raw tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = rawStore.Close() })
+	if _, err := rawStore.Exec(`CREATE TRIGGER fail_top_up_export_outcome_audit
+		BEFORE INSERT ON operation_audit
+		WHEN NEW.action = 'top_ups.export.outcome'
+		BEGIN SELECT RAISE(ABORT, 'injected outcome audit failure'); END`); err != nil {
+		t.Fatalf("install outcome audit failure: %v", err)
+	}
+
+	admin := topUpExportRouter(store, auth.RoleAdmin)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/top-ups/export?status=success", nil)
+	request.RemoteAddr = "192.0.2.46:12345"
+	admin.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("export status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	audits, err := store.ListOperationAudits(context.Background(), toolstore.OperationAuditFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list export audits: %v", err)
+	}
+	if len(audits.Items) != 1 || audits.Items[0].Action != "top_ups.export.intent" {
+		t.Fatalf("failed outcome append did not leave exactly the durable intent: %+v", audits.Items)
+	}
+	runs, err := store.ListReconciliationRuns(context.Background(), toolstore.ReconciliationRunFilter{
+		Kind: "top_up_export_audit_outcome", Status: toolstore.ReconciliationRunning, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("list audit recovery records: %v", err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].ErrorCode != "OPERATION_AUDIT_APPEND_PENDING" {
+		t.Fatalf("outcome audit recovery record = %+v, want one pending reconciliation", runs.Items)
+	}
+	var summary struct {
+		RequestID        string                    `json:"request_id"`
+		Status           toolstore.OperationStatus `json:"status"`
+		ErrorCode        string                    `json:"error_code"`
+		IdempotencyKey   string                    `json:"idempotency_key"`
+		Phase            string                    `json:"phase"`
+		OutcomePersisted bool                      `json:"outcome_persisted"`
+		Filters          map[string]any            `json:"filters"`
+		Result           struct {
+			RowCount         int64 `json:"row_count"`
+			ExpectedRowCount int64 `json:"expected_row_count"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(runs.Items[0].SummaryJSON, &summary); err != nil {
+		t.Fatalf("decode audit recovery summary: %v", err)
+	}
+	if summary.RequestID == "" || summary.Status != toolstore.OperationSucceeded || summary.ErrorCode != "" ||
+		summary.Phase != "pending" || summary.OutcomePersisted ||
+		summary.IdempotencyKey != "export:"+summary.RequestID+":outcome" || summary.Filters["status"] != "success" ||
+		summary.Result.RowCount != 1 || summary.Result.ExpectedRowCount != 1 {
+		t.Fatalf("audit recovery summary is incomplete: %+v", summary)
+	}
+}
+
+func TestTopUpExportKeepsPrebuiltPendingAuditWhenOutcomeAndRecoveryUpdatesFail(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, storePath := installTopUpExportFixture(t)
+	rawStore, err := sqlx.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open raw tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = rawStore.Close() })
+	for _, statement := range []string{
+		`CREATE TRIGGER fail_top_up_export_outcome_audit_hard
+			BEFORE INSERT ON operation_audit
+			WHEN NEW.action = 'top_ups.export.outcome'
+			BEGIN SELECT RAISE(ABORT, 'injected outcome audit failure'); END`,
+		`CREATE TRIGGER fail_top_up_export_recovery_update
+			BEFORE UPDATE ON reconciliation_runs
+			BEGIN SELECT RAISE(ABORT, 'injected recovery update failure'); END`,
+	} {
+		if _, err := rawStore.Exec(statement); err != nil {
+			t.Fatalf("install tool-store failure trigger: %v", err)
+		}
+	}
+
+	admin := topUpExportRouter(store, auth.RoleAdmin)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/top-ups/export?status=success", nil)
+	request.RemoteAddr = "192.0.2.47:12345"
+	admin.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("export status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	runs, err := store.ListReconciliationRuns(context.Background(), toolstore.ReconciliationRunFilter{
+		Kind: "top_up_export_audit_outcome", Status: toolstore.ReconciliationRunning, Limit: 10,
+	})
+	if err != nil || len(runs.Items) != 1 {
+		t.Fatalf("prebuilt pending audit recovery = %+v, error=%v", runs.Items, err)
+	}
+	var summary struct {
+		RequestID        string `json:"request_id"`
+		Phase            string `json:"phase"`
+		OutcomePersisted bool   `json:"outcome_persisted"`
+		Result           struct {
+			ExpectedRowCount int64 `json:"expected_row_count"`
+			SnapshotMaxID    int64 `json:"snapshot_max_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(runs.Items[0].SummaryJSON, &summary); err != nil {
+		t.Fatalf("decode prebuilt recovery summary: %v", err)
+	}
+	if summary.RequestID == "" || summary.Phase != "pending" || summary.OutcomePersisted ||
+		summary.Result.ExpectedRowCount != 1 || summary.Result.SnapshotMaxID != 10 {
+		t.Fatalf("prebuilt recovery did not retain request/filter/snapshot basis: %+v", summary)
+	}
+}
+
+func installTopUpExportFixture(t *testing.T) (*toolstore.Store, string) {
 	t.Helper()
 	db, err := sqlx.Open("sqlite", ":memory:")
 	if err != nil {
@@ -242,7 +420,8 @@ func installTopUpExportFixture(t *testing.T) *toolstore.Store {
 	`)
 	database.SetForTesting(&database.Manager{DB: db, IsPG: true})
 
-	store, err := toolstore.Init(filepath.Join(t.TempDir(), "control-plane.db"))
+	storePath := filepath.Join(t.TempDir(), "control-plane.db")
+	store, err := toolstore.Init(storePath)
 	if err != nil {
 		database.SetForTesting(nil)
 		_ = db.Close()
@@ -253,7 +432,7 @@ func installTopUpExportFixture(t *testing.T) *toolstore.Store {
 		database.SetForTesting(nil)
 		_ = db.Close()
 	})
-	return store
+	return store, storePath
 }
 
 func topUpExportRouter(store *toolstore.Store, role auth.Role) *gin.Engine {

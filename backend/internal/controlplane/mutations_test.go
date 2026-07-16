@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ type fakeUpstream struct {
 	manageCalls      int
 	createCalls      int
 	deleteCalls      int
+	onStatusContext  func(context.Context) error
 	onManage         func(newapi.ManageUserRequest) error
 	onManageContext  func(context.Context, newapi.ManageUserRequest) error
 	onCreate         func(newapi.RedemptionCreateRequest) ([]string, error)
@@ -38,11 +40,21 @@ type fakeUpstream struct {
 	onHardDeleteUser func(int) error
 }
 
-func (f *fakeUpstream) Status(context.Context) (*newapi.Status, error) {
-	if f.statusErr != nil {
-		return nil, f.statusErr
+func (f *fakeUpstream) Status(ctx context.Context) (*newapi.Status, error) {
+	f.mu.Lock()
+	onStatusContext := f.onStatusContext
+	statusErr := f.statusErr
+	version := f.version
+	f.mu.Unlock()
+	if onStatusContext != nil {
+		if err := onStatusContext(ctx); err != nil {
+			return nil, err
+		}
 	}
-	return &newapi.Status{Version: f.version}, nil
+	if statusErr != nil {
+		return nil, statusErr
+	}
+	return &newapi.Status{Version: version}, nil
 }
 
 func (f *fakeUpstream) ManageUser(ctx context.Context, request newapi.ManageUserRequest) error {
@@ -640,6 +652,139 @@ func TestUserMutationCancellationPersistsUncertainOutcome(t *testing.T) {
 		!strings.Contains(string(item.AfterJSON), `"uncertain":true`) ||
 		!strings.Contains(string(item.AfterJSON), `"do_not_retry":true`) {
 		t.Fatalf("unsafe canceled outcome: %+v", item)
+	}
+}
+
+func TestUserMutationAppliesServiceDeadlineToCapabilityAndWriteCalls(t *testing.T) {
+	t.Run("capability detection", func(t *testing.T) {
+		var statusReached atomic.Bool
+		upstream := &fakeUpstream{version: "v1.0.0-rc.21"}
+		upstream.onStatusContext = func(ctx context.Context) error {
+			statusReached.Store(true)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		service, _, _ := setupMutationService(t, upstream)
+		service.userMutationTimeout = 250 * time.Millisecond
+		service.outcomeAuditTimeout = 50 * time.Millisecond
+
+		started := time.Now()
+		_, err := service.MutateUser(context.Background(), testMeta(), UserMutationRequest{UserID: 7, Action: "disable"})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("capability timeout error = %v, want deadline exceeded", err)
+		}
+		if !statusReached.Load() {
+			t.Fatal("capability deadline expired before reaching the Status callback")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("capability timeout took %s, service deadline was not enforced", elapsed)
+		}
+	})
+
+	t.Run("user write", func(t *testing.T) {
+		var manageReached atomic.Bool
+		upstream := &fakeUpstream{version: "v1.0.0-rc.21"}
+		upstream.onManageContext = func(ctx context.Context, _ newapi.ManageUserRequest) error {
+			manageReached.Store(true)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		service, _, _ := setupMutationService(t, upstream)
+		service.userMutationTimeout = 250 * time.Millisecond
+		service.outcomeAuditTimeout = 50 * time.Millisecond
+
+		started := time.Now()
+		_, err := service.MutateUser(context.Background(), testMeta(), UserMutationRequest{UserID: 7, Action: "disable"})
+		if !errors.Is(err, ErrOperationUncertain) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("write timeout error = %v, want uncertain deadline exceeded", err)
+		}
+		if !manageReached.Load() {
+			t.Fatal("user mutation deadline expired before reaching the ManageUser callback")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("write timeout took %s, service deadline was not enforced", elapsed)
+		}
+	})
+}
+
+func TestUserMutationDeadlineIncludesTargetLockWaitAndReservesOutcomeAudit(t *testing.T) {
+	var statusCalls atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+
+	upstream := &fakeUpstream{version: "v1.0.0-rc.21"}
+	upstream.onStatusContext = func(ctx context.Context) error {
+		if statusCalls.Add(1) == 1 {
+			return nil
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	upstream.onManageContext = func(ctx context.Context, _ newapi.ManageUserRequest) error {
+		close(firstStarted)
+		select {
+		case <-releaseFirst:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	service, store, _ := setupMutationService(t, upstream)
+	service.userMutationTimeout = 2 * time.Second
+	service.outcomeAuditTimeout = 100 * time.Millisecond
+	firstMeta := testMeta()
+	firstMeta.IdempotencyKey = "user-budget-lock-owner"
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := service.MutateUser(context.Background(), firstMeta, UserMutationRequest{UserID: 7, Action: "disable"})
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("lock owner did not reach the upstream user write")
+	}
+
+	// The owner has already captured its budget before this synchronized field
+	// change. The queued request must count lock wait against this shorter total.
+	service.userMutationTimeout = 250 * time.Millisecond
+	service.outcomeAuditTimeout = 50 * time.Millisecond
+	secondMeta := testMeta()
+	secondMeta.RequestID = "request-user-budget-waiter"
+	secondMeta.IdempotencyKey = "user-budget-lock-waiter"
+	timer := time.AfterFunc(120*time.Millisecond, release)
+	defer timer.Stop()
+
+	started := time.Now()
+	_, err := service.MutateUser(context.Background(), secondMeta, UserMutationRequest{UserID: 7, Action: "disable"})
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOperationUncertain) {
+		t.Fatalf("queued capability timeout error = %v, want authoritative deadline exceeded", err)
+	}
+	if elapsed > 325*time.Millisecond {
+		t.Fatalf("queued user mutation took %s; lock wait received a fresh upstream timeout", elapsed)
+	}
+	if firstErr := <-firstDone; firstErr != nil {
+		t.Fatalf("lock owner mutation error = %v", firstErr)
+	}
+
+	upstream.mu.Lock()
+	manageCalls := upstream.manageCalls
+	upstream.mu.Unlock()
+	if manageCalls != 1 {
+		t.Fatalf("queued timed-out mutation reached the upstream write: calls=%d", manageCalls)
+	}
+	_, outcomeKey := auditKeys(secondMeta.IdempotencyKey)
+	outcome, auditErr := store.GetOperationAuditByIdempotencyKey(context.Background(), outcomeKey)
+	if auditErr != nil {
+		t.Fatalf("queued timeout outcome audit was not persisted from the reserved budget: %v", auditErr)
+	}
+	if outcome.Status != toolstore.OperationFailed || outcome.ErrorCode != "NEWAPI_STATUS_UNAVAILABLE" {
+		t.Fatalf("queued timeout outcome audit = %+v", outcome)
 	}
 }
 

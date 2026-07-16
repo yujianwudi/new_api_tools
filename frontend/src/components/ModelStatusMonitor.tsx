@@ -3,7 +3,12 @@ import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
 import { mergeFilteredModelOrder } from '../lib/modelStatusOrder'
-import { chunkModelNames, normalizeModelStatusMaxBatch } from '../lib/modelStatusBatch'
+import {
+  chunkModelNames,
+  mapWithConcurrency,
+  MODEL_STATUS_BATCH_MAX_CONCURRENCY,
+  normalizeModelStatusMaxBatch,
+} from '../lib/modelStatusBatch'
 import { RefreshCw, Loader2, Timer, ChevronDown, Settings2, Check, Clock, Palette, Moon, Sun, Minimize2, Maximize2, Zap, Terminal, Leaf, Droplets, HelpCircle, Copy, X, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, ArrowUpDown, GripVertical, Search, Filter, Layers, Plus, Pencil, Trash2, FolderPlus, Tag, KeyRound } from 'lucide-react'
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable'
@@ -146,6 +151,19 @@ interface TokenGroup {
   models: string[]
 }
 
+interface TokenGroupSyncResult {
+  groups: TokenGroup[]
+  groupFilter: string
+}
+
+function isTokenGroup(value: unknown): value is TokenGroup {
+  if (typeof value !== 'object' || value === null) return false
+  const group = value as Record<string, unknown>
+  return typeof group.group_name === 'string' && group.group_name.trim().length > 0
+    && typeof group.model_count === 'number' && Number.isInteger(group.model_count) && group.model_count >= 0
+    && Array.isArray(group.models) && group.models.every(model => typeof model === 'string')
+}
+
 // Custom user-defined model group
 interface CustomModelGroup {
   id: string
@@ -252,6 +270,13 @@ const GROUP_COLORS = [
 ]
 
 const MODEL_GROUP_KEY = 'model_status_group_filter'
+const TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES = 5
+
+function tokenGroupModelsForFilter(groups: TokenGroup[], filter: string): string[] {
+  if (!filter.startsWith('token:')) return []
+  const groupName = filter.slice(6)
+  return groups.find(group => group.group_name === groupName)?.models ?? []
+}
 
 // Get model logo component based on model name
 function getModelLogo(modelName: string): IconComponent | null {
@@ -482,6 +507,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const [customOrder, setCustomOrder] = useState<string[]>(() => {
     return readStoredStringArray(CUSTOM_ORDER_KEY) ?? []
   })
+  const [sortReconciliationRequired, setSortReconciliationRequired] = useState(false)
 
   const [showModelSelector, setShowModelSelector] = useState(false)
   const [showIntervalDropdown, setShowIntervalDropdown] = useState(false)
@@ -512,6 +538,10 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const configMutationIdsRef = useRef({ timeWindow: 0, theme: 0, refreshInterval: 0, sort: 0, siteTitle: 0 })
   const statusRequestIdRef = useRef(0)
   const statusRequestControllerRef = useRef<AbortController | null>(null)
+  const tokenGroupRequestIdRef = useRef(0)
+  const tokenGroupRequestControllerRef = useRef<AbortController | null>(null)
+  const groupFilterRef = useRef(groupFilter)
+  const automaticStatusRefreshCountRef = useRef(0)
   const persistedTimeWindowRef = useRef(timeWindow)
   const persistedThemeRef = useRef(theme)
   const persistedRefreshIntervalRef = useRef(refreshInterval)
@@ -520,6 +550,9 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const persistedSiteTitleRef = useRef('')
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
+  const activeTokenGroupModels = useMemo(() => {
+    return tokenGroupModelsForFilter(tokenGroups, groupFilter)
+  }, [groupFilter, tokenGroups])
 
   const getAuthHeaders = useCallback((): Record<string, string> => {
     if (isEmbed) {
@@ -545,9 +578,15 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     selectedModelsRef.current = selectedModels
   }, [selectedModels])
 
+  useEffect(() => {
+    groupFilterRef.current = groupFilter
+  }, [groupFilter])
+
   useEffect(() => () => {
     statusRequestIdRef.current += 1
     statusRequestControllerRef.current?.abort()
+    tokenGroupRequestIdRef.current += 1
+    tokenGroupRequestControllerRef.current?.abort()
   }, [])
 
   // Fullscreen change listener
@@ -655,8 +694,43 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     return saveAttempt
   }, [saveConfigMutation])
 
+  const reloadAuthoritativeSortConfig = useCallback(async (mutationId: number): Promise<boolean> => {
+    try {
+      const response = await fetch(`${apiUrl}/api/model-status/config/selected`, {
+        headers: getAuthHeaders(),
+      })
+      const data = await requireSuccessfulResponse(response)
+      const mode = data.sort_mode
+      if (mode !== 'default' && mode !== 'availability' && mode !== 'custom') {
+        throw new Error('Invalid authoritative sort mode')
+      }
+      if (!Array.isArray(data.custom_order) || !data.custom_order.every(value => typeof value === 'string')) {
+        throw new Error('Invalid authoritative custom order')
+      }
+
+      const authoritativeOrder = [...data.custom_order] as string[]
+      persistedSortModeRef.current = mode
+      persistedCustomOrderRef.current = authoritativeOrder
+      writeStoredValue(SORT_MODE_KEY, mode)
+      writeStoredValue(CUSTOM_ORDER_KEY, JSON.stringify(authoritativeOrder))
+      if (mutationId === configMutationIdsRef.current.sort) {
+        setSortMode(mode)
+        setCustomOrder(authoritativeOrder)
+        setSortReconciliationRequired(false)
+      }
+      return true
+    } catch (error) {
+      console.error('Failed to reload authoritative sort configuration:', error)
+      if (mutationId === configMutationIdsRef.current.sort) {
+        setSortReconciliationRequired(true)
+      }
+      showToast('error', '排序回滚结果不确定，无法读取服务端配置；请刷新页面后再排序')
+      return false
+    }
+  }, [apiUrl, getAuthHeaders, showToast])
+
   // Save sort config to backend cache
-  const saveSortConfigToBackend = useCallback((mode: SortMode, order?: string[]): Promise<boolean> => {
+  const saveSortConfigToBackend = useCallback((mode: SortMode, order: string[] | undefined, mutationId: number): Promise<boolean> => {
     const saveAttempt = sortSaveQueueRef.current.then(async () => {
       const previousPersistedOrder = [...persistedCustomOrderRef.current]
       let customOrderChanged = false
@@ -667,7 +741,10 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
           '自定义排序',
           'PUT',
         )
-        if (!orderSaved) return false
+        if (!orderSaved) {
+          await reloadAuthoritativeSortConfig(mutationId)
+          return false
+        }
         customOrderChanged = true
       }
 
@@ -685,6 +762,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
             'PUT',
           )
         }
+        await reloadAuthoritativeSortConfig(mutationId)
         return false
       }
 
@@ -696,7 +774,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     })
     sortSaveQueueRef.current = saveAttempt.then(() => undefined)
     return saveAttempt
-  }, [saveConfigMutation])
+  }, [reloadAuthoritativeSortConfig, saveConfigMutation])
 
   // Load config from backend on mount
   const loadConfigFromBackend = useCallback(async (signal?: AbortSignal): Promise<string[] | null> => {
@@ -771,19 +849,45 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   }, [apiUrl, getAuthHeaders])
 
   // 加载令牌分组列表
-  const fetchTokenGroups = useCallback(async (signal?: AbortSignal) => {
+  const fetchTokenGroups = useCallback(async (): Promise<TokenGroupSyncResult | null | undefined> => {
+    const requestId = ++tokenGroupRequestIdRef.current
+    tokenGroupRequestControllerRef.current?.abort()
+    const controller = new AbortController()
+    tokenGroupRequestControllerRef.current = controller
+
     try {
       const response = await fetch(`${apiUrl}${getApiPrefix()}/token-groups`, {
         headers: getAuthHeaders(),
-        signal,
+        signal: controller.signal,
       })
       const data = await requireSuccessfulResponse(response)
-      if (Array.isArray(data.data)) {
-        setTokenGroups(data.data)
+      if (!Array.isArray(data.data) || !data.data.every(isTokenGroup)) {
+        throw new Error('Invalid token group response')
       }
+
+      if (requestId !== tokenGroupRequestIdRef.current) return undefined
+      const groups = data.data as TokenGroup[]
+      setTokenGroups(groups)
+
+      let nextGroupFilter = groupFilterRef.current
+      if (nextGroupFilter.startsWith('token:') && !groups.some(group => `token:${group.group_name}` === nextGroupFilter)) {
+        nextGroupFilter = 'all'
+        groupFilterRef.current = nextGroupFilter
+        setGroupFilter(nextGroupFilter)
+        writeStoredValue(MODEL_GROUP_KEY, nextGroupFilter)
+      }
+
+      return { groups, groupFilter: nextGroupFilter }
     } catch (error) {
-      if (signal?.aborted || isAbortError(error)) return
+      if (controller.signal.aborted || requestId !== tokenGroupRequestIdRef.current || isAbortError(error)) {
+        return undefined
+      }
       console.error('Failed to fetch token groups:', error)
+      return null
+    } finally {
+      if (requestId === tokenGroupRequestIdRef.current && tokenGroupRequestControllerRef.current === controller) {
+        tokenGroupRequestControllerRef.current = null
+      }
     }
   }, [apiUrl, getApiPrefix, getAuthHeaders])
 
@@ -830,7 +934,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         }
       }
       // 同时加载令牌分组
-      await fetchTokenGroups(signal)
+      await fetchTokenGroups()
     } catch (error) {
       if (signal?.aborted || isAbortError(error)) return
       console.error('Failed to fetch available models:', error)
@@ -839,17 +943,12 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   // Fetch model statuses
   // forceRefresh: bypass cache to get fresh data (used for manual refresh)
-  const fetchModelStatuses = useCallback(async (forceRefresh = false) => {
+  const fetchModelStatuses = useCallback(async (forceRefresh = false, tokenGroupModelsOverride?: readonly string[]) => {
     // 计算实际要请求状态的模型集合：
     //   - 用户手工选中的 selectedModels（基础）
     //   - 当前过滤器若为某个密钥分组（token:X），把该分组下的全部模型并入
     // 这样选中密钥分组时，分组下所有模型会自动出现在监控视图中，无需手动勾选。
-    const tokenGroupModels = (() => {
-      if (!groupFilter.startsWith('token:')) return [] as string[]
-      const name = groupFilter.slice(6)
-      const tg = tokenGroups.find(g => g.group_name === name)
-      return tg ? tg.models : []
-    })()
+    const tokenGroupModels = tokenGroupModelsOverride ?? activeTokenGroupModels
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
     const requestId = ++statusRequestIdRef.current
     statusRequestControllerRef.current?.abort()
@@ -875,17 +974,21 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     try {
       // Add no_cache=true when force refreshing to bypass backend cache
       const cacheParam = forceRefresh ? '&no_cache=true' : ''
-      const chunkResults = await Promise.all(chunkModelNames(fetchSet, maxBatch).map(async modelNames => {
-        const response = await fetch(`${apiUrl}${getApiPrefix()}/status/batch?window=${timeWindow}${cacheParam}`, {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify(modelNames),
-          signal: controller.signal,
-        })
-        const data = await requireSuccessfulResponse(response)
-        if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
-        return data.data as ModelStatus[]
-      }))
+      const chunkResults = await mapWithConcurrency(
+        chunkModelNames(fetchSet, maxBatch),
+        MODEL_STATUS_BATCH_MAX_CONCURRENCY,
+        async modelNames => {
+          const response = await fetch(`${apiUrl}${getApiPrefix()}/status/batch?window=${timeWindow}${cacheParam}`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(modelNames),
+            signal: controller.signal,
+          })
+          const data = await requireSuccessfulResponse(response)
+          if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
+          return data.data as ModelStatus[]
+        },
+      )
       if (requestId !== statusRequestIdRef.current) return
       setModelStatuses(chunkResults.flat())
       setInitialLoading(false)
@@ -903,7 +1006,25 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         setRefreshing(false)
       }
     }
-  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, timeWindow, isEmbed, showToast, groupFilter, tokenGroups, availableModels.length, maxBatch])
+  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, activeTokenGroupModels, timeWindow, isEmbed, showToast, availableModels.length, maxBatch])
+
+  const refreshStatusesWithLatestTokenGroups = useCallback(async (forceRefresh: boolean) => {
+    const tokenGroupSync = await fetchTokenGroups()
+    if (tokenGroupSync === undefined) return
+    const tokenGroupModels = tokenGroupSync === null
+      ? undefined
+      : tokenGroupModelsForFilter(tokenGroupSync.groups, tokenGroupSync.groupFilter)
+    await fetchModelStatuses(forceRefresh, tokenGroupModels)
+  }, [fetchModelStatuses, fetchTokenGroups])
+
+  const runAutomaticRefresh = useCallback(async () => {
+    automaticStatusRefreshCountRef.current += 1
+    if (automaticStatusRefreshCountRef.current % TOKEN_GROUP_SYNC_EVERY_STATUS_REFRESHES === 0) {
+      await refreshStatusesWithLatestTokenGroups(true)
+      return
+    }
+    await fetchModelStatuses(true)
+  }, [fetchModelStatuses, refreshStatusesWithLatestTokenGroups])
 
   // Initial load
   useEffect(() => {
@@ -917,6 +1038,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const prevSelectedModels = useRef<string[]>([])
   const prevTimeWindow = useRef<string>(timeWindow)
   const prevGroupFilter = useRef<string>(groupFilter)
+  const prevActiveTokenGroupModels = useRef<string[]>(activeTokenGroupModels)
 
   // Handle model selection and time window changes
   useEffect(() => {
@@ -926,6 +1048,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       prevSelectedModels.current = selectedModels
       prevTimeWindow.current = timeWindow
       prevGroupFilter.current = groupFilter
+      prevActiveTokenGroupModels.current = activeTokenGroupModels
       fetchModelStatuses(false)  // Use cache on initial load
       return
     }
@@ -939,19 +1062,21 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     const groupFilterChanged = groupFilter !== prevGroupFilter.current
     const tokenGroupSwitched =
       groupFilterChanged && (groupFilter.startsWith('token:') || prevGroupFilter.current.startsWith('token:'))
+    const tokenGroupModelsChanged = !sameStringArray(activeTokenGroupModels, prevActiveTokenGroupModels.current)
 
     // Update refs
     prevSelectedModels.current = selectedModels
     prevTimeWindow.current = timeWindow
     prevGroupFilter.current = groupFilter
+    prevActiveTokenGroupModels.current = activeTokenGroupModels
 
-    if (modelsChanged || tokenGroupSwitched) {
+    if (modelsChanged || tokenGroupSwitched || tokenGroupModelsChanged) {
       // Models selection changed - fetch fresh data for new models
       fetchModelStatuses(true)
     } else if (windowChanged) {
       fetchModelStatuses(false)
     }
-  }, [selectedModels, timeWindow, groupFilter, fetchModelStatuses])
+  }, [selectedModels, timeWindow, groupFilter, activeTokenGroupModels, fetchModelStatuses])
 
   // Auto refresh countdown
   useEffect(() => {
@@ -961,7 +1086,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       setCountdown(prev => {
         if (prev <= 1) {
           // Auto refresh should also get fresh data
-          fetchModelStatuses(true)
+          void runAutomaticRefresh()
           return refreshIntervalRef.current
         }
         return prev - 1
@@ -969,7 +1094,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }, 1000)
 
     return () => clearInterval(timer)
-  }, [refreshInterval, fetchModelStatuses])
+  }, [refreshInterval, runAutomaticRefresh])
 
   // Reset countdown when interval changes
   useEffect(() => {
@@ -978,7 +1103,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   const handleRefresh = () => {
     setCountdown(refreshIntervalRef.current)
-    fetchModelStatuses(true)
+    void refreshStatusesWithLatestTokenGroups(true)
   }
 
   // DnD sensors
@@ -1045,6 +1170,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   // Handle group filter change
   const handleGroupFilterChange = useCallback((gid: string) => {
+    groupFilterRef.current = gid
     setGroupFilter(gid)
     writeStoredValue(MODEL_GROUP_KEY, gid)
   }, [])
@@ -1155,11 +1281,15 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     order: string[] | undefined,
     successMessage: string,
   ) => {
+    if (sortReconciliationRequired) {
+      showToast('error', '排序配置尚未完成对账，请刷新页面读取服务端权威配置')
+      return
+    }
     const mutationId = ++configMutationIdsRef.current.sort
     setSortMode(mode)
     if (order !== undefined) setCustomOrder(order)
 
-    const saved = await saveSortConfigToBackend(mode, order)
+    const saved = await saveSortConfigToBackend(mode, order, mutationId)
     if (mutationId !== configMutationIdsRef.current.sort) return
     if (!saved) {
       const persistedMode = persistedSortModeRef.current
@@ -1171,7 +1301,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       return
     }
     showToast('success', successMessage)
-  }, [saveSortConfigToBackend, showToast])
+  }, [saveSortConfigToBackend, showToast, sortReconciliationRequired])
 
   // Handle drag end for reordering
   const handleDragEnd = (event: DragEndEvent) => {
@@ -1849,7 +1979,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
           onSave={async (groups) => {
             const saved = await saveCustomGroups(groups)
             // Reset filter if the active group was deleted
-            if (saved && groupFilter !== 'all' && !groups.find(g => g.id === groupFilter)) {
+            if (saved && groupFilter !== 'all' && !groupFilter.startsWith('token:') && !groups.find(g => g.id === groupFilter)) {
               handleGroupFilterChange('all')
             }
             return saved

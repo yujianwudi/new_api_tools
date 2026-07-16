@@ -6,7 +6,7 @@
 #   3. 手动部署: 在 .env 中设置不可变 repo@sha256 digest 后运行 docker compose up -d
 #
 # 更新方式:
-#   docker compose pull && docker compose down && docker compose up -d
+#   使用固定安装器或 ./deploy.sh 执行事务更新，以便候选版本失败时恢复旧部署。
 
 services:
   newapi-tools:
