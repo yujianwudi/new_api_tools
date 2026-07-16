@@ -1,0 +1,501 @@
+name: Recover Release Image From Existing Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vMAJOR.MINOR.PATCH tag to rebuild and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-recovery-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  validate:
+    name: Validate existing release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      major_minor: ${{ steps.identity.outputs.major_minor }}
+      tag_oid: ${{ steps.identity.outputs.tag_oid }}
+      tag_commit: ${{ steps.identity.outputs.tag_commit }}
+      date: ${{ steps.identity.outputs.date }}
+
+    steps:
+      - name: Checkout trusted recovery workflow branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate immutable release identity
+        id: identity
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == "refs/heads/main" ]] || {
+            echo "release recovery must be dispatched from main, not ${GITHUB_REF}" >&2
+            exit 1
+          }
+
+          tag="${REQUESTED_TAG}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag must use strict vMAJOR.MINOR.PATCH syntax: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          major_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+
+          git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"
+          [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] || {
+            echo "release tag must be annotated: $tag" >&2
+            exit 1
+          }
+          tag_oid="$(git rev-parse --verify "refs/tags/${tag}")"
+          tag_commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            echo "release tag commit is not reachable from origin/main: $tag_commit" >&2
+            exit 1
+          }
+
+          git checkout --detach "$tag_commit"
+          [[ "$(git rev-parse HEAD)" == "$tag_commit" ]] || {
+            echo "checked out commit does not match $tag: $tag_commit" >&2
+            exit 1
+          }
+
+          source_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' \
+            backend/internal/buildinfo/buildinfo.go)"
+          [[ "$source_version" == "$version" ]] || {
+            echo "release tag $tag does not match source version $source_version" >&2
+            exit 1
+          }
+          release_doc="RELEASE_${version}.md"
+          [[ -f "$release_doc" ]] || {
+            echo "missing release document: $release_doc" >&2
+            exit 1
+          }
+          grep -Fxq "# NewAPI Tools v${version} 发行说明" "$release_doc"
+          grep -Fq "NEWAPI_TOOLS_REF=${tag} \\" "$release_doc"
+          grep -Fxq "# NewAPI Tools v${version}" README.md
+          bash tests/supply_chain_pins_test.sh
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "major_minor=${major_minor}"
+            echo "tag_oid=${tag_oid}"
+            echo "tag_commit=${tag_commit}"
+            echo "date=$(git show -s --format=%cI "$tag_commit")"
+          } >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Test and security gates
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify validated checkout
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
+
+      - name: Validate deployment configuration
+        env:
+          NEWAPI_TOOLS_IMAGE: ghcr.io/yujianwudi/new_api_tools@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        run: |
+          bash -n deploy.sh install.sh setup-log-db.sh
+          bash tests/deploy_dsn_test.sh
+          bash tests/setup_log_db_safety_test.sh
+          bash tests/supply_chain_pins_test.sh
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.host.yml config --quiet
+          LOG_NETWORK=example-log-network docker compose -f docker-compose.yml -f docker-compose.logdb.yml config --quiet
+          LOG_NETWORK=example-log-network docker compose -f docker-compose.yml -f docker-compose.host.yml -f docker-compose.logdb.yml config --quiet
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Run Go tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Run Go race detector
+        working-directory: backend
+        run: go test -race ./...
+
+      - name: Run Go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: Scan reachable Go vulnerabilities
+        working-directory: backend
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Test static redemption generator
+        run: node tests/index_expiry_validation_test.mjs
+
+      - name: Test browser secret storage guards
+        run: node tests/frontend_secret_storage_test.mjs
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Test frontend control-plane reliability guards
+        run: node tests/frontend_control_plane_reliability_test.mjs
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Type-check frontend
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Audit production dependencies
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+  build:
+    name: Build release (${{ matrix.platform }})
+    needs: [validate, quality]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Revalidate release identity before package write
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_TAG_OID: ${{ needs.validate.outputs.tag_oid }}
+          EXPECTED_TAG_COMMIT: ${{ needs.validate.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_TAG_COMMIT" ]]
+          git fetch --force --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}" 2>/dev/null)" == "tag" ]]
+          [[ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}")" == "$EXPECTED_TAG_OID" ]]
+          [[ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]
+          remote_tag_oid="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+          [[ "$remote_tag_oid" == "$EXPECTED_TAG_OID" ]]
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release platform by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.created=${{ needs.validate.outputs.date }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.tag_commit }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=new_api_tools
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          build-args: |
+            APP_VERSION=${{ needs.validate.outputs.version }}
+            VCS_REF=${{ needs.validate.outputs.tag_commit }}
+            BUILD_DATE=${{ needs.validate.outputs.date }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-digests-${{ matrix.runner }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release manifest
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ghcr-publish-minor-${{ needs.validate.outputs.major_minor }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      manifest_digest: ${{ steps.publish.outputs.manifest_digest }}
+
+    steps:
+      - name: Checkout validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          pattern: release-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and verify release manifest
+        id: publish
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_MAJOR_MINOR: ${{ needs.validate.outputs.major_minor }}
+          EXPECTED_TAG_OID: ${{ needs.validate.outputs.tag_oid }}
+          EXPECTED_TAG_COMMIT: ${{ needs.validate.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_TAG_COMMIT" ]]
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --force --no-tags origin "+refs/tags/v${RELEASE_MAJOR_MINOR}.*:refs/tags/v${RELEASE_MAJOR_MINOR}.*"
+          git fetch --force --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}" 2>/dev/null)" == "tag" ]] || {
+            echo "release tag is no longer annotated: $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}")" == "$EXPECTED_TAG_OID" ]] || {
+            echo "release tag object changed after validation: $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]] || {
+            echo "release tag commit changed after validation: $RELEASE_TAG" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$EXPECTED_TAG_COMMIT" refs/remotes/origin/main
+
+          versions=()
+          while IFS= read -r candidate_tag; do
+            if [[ "$candidate_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+                  "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" == "$RELEASE_MAJOR_MINOR" ]]; then
+              [[ "$(git cat-file -t "refs/tags/${candidate_tag}" 2>/dev/null)" == "tag" ]] || continue
+              candidate_commit="$(git rev-parse --verify "refs/tags/${candidate_tag}^{commit}")"
+              git merge-base --is-ancestor "$candidate_commit" refs/remotes/origin/main || continue
+              candidate_version="${candidate_tag#v}"
+              candidate_source="$(git show "${candidate_commit}:backend/internal/buildinfo/buildinfo.go" 2>/dev/null)" || continue
+              candidate_source_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' <<< "$candidate_source")"
+              [[ "$candidate_source_version" == "$candidate_version" ]] || continue
+              git show "${candidate_commit}:RELEASE_${candidate_version}.md" 2>/dev/null |
+                grep -Fxq "# NewAPI Tools v${candidate_version} 发行说明" || continue
+              git show "${candidate_commit}:README.md" 2>/dev/null |
+                grep -Fxq "# NewAPI Tools v${candidate_version}" || continue
+              versions+=("$candidate_version")
+            fi
+          done < <(git for-each-ref --format='%(refname:short)' "refs/tags/v${RELEASE_MAJOR_MINOR}.*")
+          (( ${#versions[@]} > 0 )) || {
+            echo "no valid annotated release tags found for v${RELEASE_MAJOR_MINOR}.x" >&2
+            exit 1
+          }
+          latest_version="$(printf '%s\n' "${versions[@]}" | sort -V | tail -n 1)"
+          publish_minor=false
+          [[ "$RELEASE_TAG" == "v${latest_version}" ]] && publish_minor=true
+
+          remote_tag_oid="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+          [[ "$remote_tag_oid" == "$EXPECTED_TAG_OID" ]] || {
+            echo "remote release tag changed before manifest publication: $RELEASE_TAG" >&2
+            exit 1
+          }
+
+          mapfile -t digests < <(find /tmp/digests -maxdepth 1 -type f -printf '%f\n' | sort)
+          (( ${#digests[@]} == 2 )) || {
+            echo "expected exactly two platform digests, found ${#digests[@]}" >&2
+            exit 1
+          }
+          image="${REGISTRY}/${IMAGE_NAME}"
+          sources=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "invalid platform digest filename: $digest" >&2
+              exit 1
+            }
+            sources+=("${image}@sha256:${digest}")
+          done
+
+          existing_error="$(mktemp)"
+          if docker buildx imagetools inspect \
+            "${image}:${RELEASE_VERSION}" >/dev/null 2>"$existing_error"; then
+            echo "refusing to overwrite existing release image tag: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          grep -Eiq '404|manifest unknown|not found' "$existing_error" || {
+            cat "$existing_error" >&2
+            echo "could not prove the release image tag is absent: $RELEASE_VERSION" >&2
+            exit 1
+          }
+
+          tag_args=(-t "${image}:${RELEASE_VERSION}")
+          if [[ "$publish_minor" == true ]]; then
+            tag_args+=(-t "${image}:${RELEASE_MAJOR_MINOR}")
+          fi
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+
+          manifest_file="$(mktemp)"
+          docker buildx imagetools inspect --raw "${image}:${RELEASE_VERSION}" > "$manifest_file"
+          jq -e '
+            [.manifests[]
+              | select((.platform.os // "unknown") != "unknown")
+              | "\(.platform.os)/\(.platform.architecture)"]
+            | sort == ["linux/amd64", "linux/arm64"]
+          ' "$manifest_file"
+
+          mapfile -t platform_entries < <(
+            jq -r '.manifests[]
+              | select(.platform.os == "linux" and
+                  (.platform.architecture == "amd64" or .platform.architecture == "arm64"))
+              | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "$manifest_file" | sort
+          )
+          (( ${#platform_entries[@]} == 2 ))
+          for entry in "${platform_entries[@]}"; do
+            read -r platform platform_digest <<< "$entry"
+            image_config="$(docker buildx imagetools inspect "${image}@${platform_digest}" --format '{{json .Image}}')"
+            jq -e --arg revision "$EXPECTED_TAG_COMMIT" --arg version "$RELEASE_VERSION" '
+              (.config.Labels // {})["org.opencontainers.image.revision"] == $revision and
+              (.config.Labels // {})["org.opencontainers.image.version"] == $version
+            ' <<< "$image_config"
+
+            mapfile -t attestation_digests < <(
+              jq -r --arg subject "$platform_digest" '.manifests[]
+                | select((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest" and
+                    (.annotations["vnd.docker.reference.digest"] // "") == $subject)
+                | .digest' "$manifest_file"
+            )
+            (( ${#attestation_digests[@]} > 0 )) || {
+              echo "missing attestations for $platform ($platform_digest)" >&2
+              exit 1
+            }
+            predicate_types=""
+            for attestation_digest in "${attestation_digests[@]}"; do
+              predicate_types+="$(docker buildx imagetools inspect --raw "${image}@${attestation_digest}" |
+                jq -r '.layers[]?.annotations["in-toto.io/predicate-type"] // empty')"
+              predicate_types+=$'\n'
+            done
+            grep -Fxq 'https://spdx.dev/Document' <<< "$predicate_types" || {
+              echo "missing SBOM attestation for $platform" >&2
+              exit 1
+            }
+            grep -Eq '^https://slsa\.dev/provenance/' <<< "$predicate_types" || {
+              echo "missing provenance attestation for $platform" >&2
+              exit 1
+            }
+          done
+
+          manifest_digest() {
+            docker buildx imagetools inspect "$1" |
+              awk '$1 == "Digest:" { print $2; exit }'
+          }
+          version_digest="$(manifest_digest "${image}:${RELEASE_VERSION}")"
+          [[ "$version_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$publish_minor" == true ]]; then
+            minor_digest="$(manifest_digest "${image}:${RELEASE_MAJOR_MINOR}")"
+            [[ "$minor_digest" == "$version_digest" ]] || {
+              echo "release and minor tags resolve to different manifests" >&2
+              exit 1
+            }
+          fi
+
+          echo "manifest_digest=${version_digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Recovered release image"
+            echo
+            echo "- Tag: \`${RELEASE_TAG}\`"
+            echo "- Commit: \`${EXPECTED_TAG_COMMIT}\`"
+            echo "- Manifest: \`${version_digest}\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Minor alias updated: \`${publish_minor}\`"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"

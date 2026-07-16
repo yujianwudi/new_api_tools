@@ -290,6 +290,74 @@ workflow_dependabot_path_count="$(grep -cF "      - '.github/dependabot.yml'" \
 [[ "$workflow_dependabot_path_count" == "2" ]] ||
   fail 'build workflow push and pull_request paths must include .github/dependabot.yml'
 
+workflow_directory_path_count="$(grep -cF "      - '.github/workflows/**'" \
+  .github/workflows/build.yml || true)"
+[[ "$workflow_directory_path_count" == "2" ]] ||
+  fail 'build workflow push and pull_request paths must cover every workflow definition'
+
+# Release publication is intentionally fail-closed around annotated tag
+# identity. The normal tag workflow and the manual recovery path must both
+# serialize mutable manifest aliases and must never rebuild from a tag ref
+# after the validated tag object has been recorded.
+grep -Fq \
+  'git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"' \
+  .github/workflows/build.yml ||
+  fail 'tag workflow must exact-fetch the annotated tag before object validation'
+build_tag_fetch_line="$(grep -nF \
+  'git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"' \
+  .github/workflows/build.yml | head -n 1 | cut -d: -f1)"
+build_tag_type_line="$(grep -nF \
+  'git cat-file -t "refs/tags/${tag}"' \
+  .github/workflows/build.yml | head -n 1 | cut -d: -f1)"
+[[ -n "$build_tag_fetch_line" && -n "$build_tag_type_line" &&
+   "$build_tag_fetch_line" -lt "$build_tag_type_line" ]] ||
+  fail 'tag workflow must restore the annotated tag ref before checking its type'
+
+recovery_commit_checkout_count="$(grep -cF \
+  'ref: ${{ needs.validate.outputs.tag_commit }}' \
+  .github/workflows/release-recovery.yml || true)"
+[[ "$recovery_commit_checkout_count" == "3" ]] ||
+  fail 'release recovery quality, build, and publish jobs must checkout the validated commit'
+if grep -Fq 'ref: refs/tags/${{ inputs.tag }}' .github/workflows/release-recovery.yml; then
+  fail 'release recovery must not checkout an input tag after identity validation'
+fi
+if grep -Fq 'VCS_REF=${{ github.sha }}' .github/workflows/release-recovery.yml; then
+  fail 'release recovery must not stamp the control-workflow commit into release images'
+fi
+grep -Fq 'ghcr-publish-minor-' .github/workflows/build.yml ||
+  fail 'normal image publication must use the shared GHCR publication lock'
+grep -Fq 'group: ghcr-publish-minor-' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must use the shared GHCR publication lock'
+grep -Fq 'latest=false' .github/workflows/build.yml ||
+  fail 'release tags must not implicitly move the latest image alias'
+grep -Fq 'publish_minor=false' .github/workflows/build.yml ||
+  fail 'normal tag publication must guard the mutable major.minor alias'
+grep -Fq 'publish_minor=false' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must guard the mutable major.minor alias'
+grep -Fq 'refusing to overwrite existing release image tag' .github/workflows/build.yml ||
+  fail 'normal release publication must keep exact version image tags immutable'
+grep -Fq 'refusing to overwrite existing release image tag' \
+  .github/workflows/release-recovery.yml ||
+  fail 'release recovery must keep exact version image tags immutable'
+grep -Fq 'candidate_source_version=' .github/workflows/build.yml ||
+  fail 'normal release publication must ignore invalid higher-version tags'
+grep -Fq 'candidate_source_version=' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must ignore invalid higher-version tags'
+grep -Fq 'Run Go race detector' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must repeat the Go race quality gate'
+grep -Fq 'npm audit --omit=dev --audit-level=high' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must repeat the production dependency audit'
+grep -Fq 'in-toto.io/predicate-type' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must verify SBOM and provenance attestations'
+
+release_alias_line="$(grep -nF 'id: release_alias' .github/workflows/build.yml |
+  tail -n 1 | cut -d: -f1)"
+release_metadata_line="$(grep -nF 'id: meta' .github/workflows/build.yml |
+  tail -n 1 | cut -d: -f1)"
+[[ -n "$release_alias_line" && -n "$release_metadata_line" &&
+   "$release_alias_line" -lt "$release_metadata_line" ]] ||
+  fail 'minor alias eligibility must be decided before release metadata tags are generated'
+
 # Every remote GitHub Action and reusable workflow must use a full commit SHA.
 while IFS= read -r workflow; do
   while IFS= read -r line; do

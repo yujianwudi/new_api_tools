@@ -22,7 +22,7 @@ on:
       - 'README.md'
       - 'RELEASE_*.md'
       - '.github/dependabot.yml'
-      - '.github/workflows/build.yml'
+      - '.github/workflows/**'
       - '!**/.gitignore'
   pull_request:
     branches: [main]
@@ -41,7 +41,7 @@ on:
       - 'README.md'
       - 'RELEASE_*.md'
       - '.github/dependabot.yml'
-      - '.github/workflows/build.yml'
+      - '.github/workflows/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -56,6 +56,10 @@ jobs:
     name: Test and security gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      release_tag_oid: ${{ steps.release_identity.outputs.tag_oid }}
+      release_tag_commit: ${{ steps.release_identity.outputs.tag_commit }}
+      release_major_minor: ${{ steps.release_identity.outputs.major_minor }}
     permissions:
       contents: read
 
@@ -67,6 +71,7 @@ jobs:
           fetch-depth: 0
 
       - name: Validate release tag identity
+        id: release_identity
         if: github.ref_type == 'tag'
         shell: bash
         run: |
@@ -76,6 +81,12 @@ jobs:
             exit 1
           fi
           version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          major_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+
+          # actions/checkout can leave an annotated tag event checked out at
+          # its commit without materializing the tag object locally. Fetch the
+          # exact immutable tag ref before verifying its object type.
+          git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"
 
           [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] || {
             echo "release tag must be annotated: $tag" >&2
@@ -119,6 +130,12 @@ jobs:
             echo "README version does not match $tag" >&2
             exit 1
           }
+
+          {
+            echo "tag_oid=$(git rev-parse --verify "refs/tags/${tag}")"
+            echo "tag_commit=${tag_commit}"
+            echo "major_minor=${major_minor}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate deployment configuration
         env:
@@ -280,12 +297,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: [quality, build]
+    concurrency:
+      group: ${{ github.ref_type == 'tag' && format('ghcr-publish-minor-{0}', needs.quality.outputs.release_major_minor) || 'ghcr-publish-main' }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
 
     steps:
+      - name: Checkout release identity
+        if: github.ref_type == 'tag'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -303,15 +331,95 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Revalidate release identity and minor alias
+        if: github.ref_type == 'tag'
+        id: release_alias
+        shell: bash
+        env:
+          EXPECTED_TAG_OID: ${{ needs.quality.outputs.release_tag_oid }}
+          EXPECTED_TAG_COMMIT: ${{ needs.quality.outputs.release_tag_commit }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag must use strict vMAJOR.MINOR.PATCH syntax: $tag" >&2
+            exit 1
+          fi
+          major_minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          version="${tag#v}"
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --force --no-tags origin "+refs/tags/v${major_minor}.*:refs/tags/v${major_minor}.*"
+          git fetch --force --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}"
+
+          [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] || {
+            echo "release tag is no longer annotated: $tag" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse --verify "refs/tags/${tag}")" == "$EXPECTED_TAG_OID" ]] || {
+            echo "release tag object changed after validation: $tag" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse --verify "refs/tags/${tag}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]] || {
+            echo "release tag commit changed after validation: $tag" >&2
+            exit 1
+          }
+
+          versions=()
+          while IFS= read -r candidate_tag; do
+            if [[ "$candidate_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+                  "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" == "$major_minor" ]]; then
+              [[ "$(git cat-file -t "refs/tags/${candidate_tag}" 2>/dev/null)" == "tag" ]] || continue
+              candidate_commit="$(git rev-parse --verify "refs/tags/${candidate_tag}^{commit}")"
+              git merge-base --is-ancestor "$candidate_commit" refs/remotes/origin/main || continue
+              candidate_version="${candidate_tag#v}"
+              candidate_source="$(git show "${candidate_commit}:backend/internal/buildinfo/buildinfo.go" 2>/dev/null)" || continue
+              candidate_source_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' <<< "$candidate_source")"
+              [[ "$candidate_source_version" == "$candidate_version" ]] || continue
+              git show "${candidate_commit}:RELEASE_${candidate_version}.md" 2>/dev/null |
+                grep -Fxq "# NewAPI Tools v${candidate_version} 发行说明" || continue
+              git show "${candidate_commit}:README.md" 2>/dev/null |
+                grep -Fxq "# NewAPI Tools v${candidate_version}" || continue
+              versions+=("$candidate_version")
+            fi
+          done < <(git for-each-ref --format='%(refname:short)' "refs/tags/v${major_minor}.*")
+          (( ${#versions[@]} > 0 )) || {
+            echo "no valid annotated release tags found for v${major_minor}.x" >&2
+            exit 1
+          }
+          latest_version="$(printf '%s\n' "${versions[@]}" | sort -V | tail -n 1)"
+          publish_minor=false
+          [[ "$tag" == "v${latest_version}" ]] && publish_minor=true
+          echo "publish_minor=${publish_minor}" >> "$GITHUB_OUTPUT"
+
+          remote_tag_oid="$(git ls-remote --refs origin "refs/tags/${tag}" | awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')"
+          [[ "$remote_tag_oid" == "$EXPECTED_TAG_OID" ]] || {
+            echo "remote release tag changed before manifest publication: $tag" >&2
+            exit 1
+          }
+
+          existing_error="$(mktemp)"
+          if docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:${version}" >/dev/null 2>"$existing_error"; then
+            echo "refusing to overwrite existing release image tag: $version" >&2
+            exit 1
+          fi
+          grep -Eiq '404|manifest unknown|not found' "$existing_error" || {
+            cat "$existing_error" >&2
+            echo "could not prove the release image tag is absent: $version" >&2
+            exit 1
+          }
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.ref_type == 'tag' && steps.release_alias.outputs.publish_minor == 'true' }}
             type=sha,prefix=,enable=${{ github.ref_type != 'tag' }}
 
       - name: Create manifest list and push
