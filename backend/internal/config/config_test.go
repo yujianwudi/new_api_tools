@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -60,6 +61,17 @@ func TestAPIKeyRoleIsValidated(t *testing.T) {
 	t.Setenv("API_KEY_ROLE", "")
 	if role := Load().APIKeyRole; role != "" {
 		t.Fatalf("empty APIKeyRole = %q, want fail-closed empty role", role)
+	}
+}
+
+func TestAPIKeyRoleDefaultsToViewerWhenUnset(t *testing.T) {
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("API_KEY_ROLE", "temporary")
+	if err := os.Unsetenv("API_KEY_ROLE"); err != nil {
+		t.Fatal(err)
+	}
+	if role := Load().APIKeyRole; role != "viewer" {
+		t.Fatalf("default APIKeyRole = %q, want viewer", role)
 	}
 }
 

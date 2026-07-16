@@ -15,8 +15,8 @@ const genericUnavailableMessage = "Requested data is temporarily unavailable"
 var (
 	logURLCredentialPattern    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@`)
 	logMySQLCredentialPattern  = regexp.MustCompile(`\b([^:\s/]+):([^@\s]+)@tcp\(`)
-	logSecretAssignmentPattern = regexp.MustCompile(`(?i)\b(password|passwd|pwd|x-api-key|api[_-]?key|jwt[_-]?secret|token|secret)\s*=\s*("[^"]*"|'[^']*'|[^\s,;&]+)`)
-	logSecretColonPattern      = regexp.MustCompile(`(?i)(["']?\b(password|passwd|pwd|x-api-key|api[_-]?key|jwt[_-]?secret|token|secret)\b["']?\s*:\s*)("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|[^\s,;}\]]+)`)
+	logSecretAssignmentPattern = regexp.MustCompile(`(?i)\b(password|passwd|pwd|x-api-key|api[_-]?key|jwt[_-]?secret|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret)\s*=\s*("[^"]*"|'[^']*'|[^\s,;&]+)`)
+	logSecretColonPattern      = regexp.MustCompile(`(?i)(["']?\b(password|passwd|pwd|x-api-key|api[_-]?key|jwt[_-]?secret|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret)\b["']?\s*:\s*)("([^"\\]|\\.)*"|'([^'\\]|\\.)*'|[^\s,;}\]]+)`)
 	logBearerPattern           = regexp.MustCompile(`(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]+`)
 	logBasicPattern            = regexp.MustCompile(`(?i)\b(Basic)\s+[A-Za-z0-9._~+/=-]+`)
 )

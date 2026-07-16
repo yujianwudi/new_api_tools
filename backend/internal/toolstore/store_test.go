@@ -27,6 +27,7 @@ var publishedMigrationChecksums = [...]string{
 	4: "9bb558d10420426eb7adf8558397562aa9c466eee0650c3914ee1e62e98b497e",
 	5: "893e236c9ae0bff35164ae5dd85875cbac819e38b5da1f25e56b36bd20499fd0",
 	6: "eb327500f42f69382e84e92ae60796150951b3f4f993a676dfb625921f1131d6",
+	7: "46bf2630ba99b331e05928bd77d19057a488796918c6c613f728b4e40b10f5af",
 }
 
 func newTestStore(t *testing.T) (*Store, string) {
@@ -215,8 +216,8 @@ func TestInitMigratesRiskEventIdempotencyFromVersion5(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.SchemaVersion != 6 {
-		t.Fatalf("schema version after v5 upgrade = %d, want 6", health.SchemaVersion)
+	if health.SchemaVersion != latestSchemaVersion {
+		t.Fatalf("schema version after v5 upgrade = %d, want %d", health.SchemaVersion, latestSchemaVersion)
 	}
 	legacyEvent, err := upgraded.GetRiskCaseEvent(context.Background(), eventID)
 	if err != nil {
@@ -332,6 +333,47 @@ func TestInitRejectsTamperedAppliedSchemaObject(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), `schema object "operation_audit_no_update" is incompatible`) {
 		t.Fatalf("Init() error = %v, want tampered trigger rejection", err)
+	}
+}
+
+func TestInitRejectsUnexpectedTriggersOnManagedTables(t *testing.T) {
+	tests := []struct {
+		name      string
+		tableName string
+	}{
+		{name: "migration table", tableName: "risk_cases"},
+		{name: "migration ledger", tableName: "schema_migrations"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, path := newTestStore(t)
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store.db = nil
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			triggerName := "unexpected_" + tt.tableName + "_trigger"
+			if _, err := db.Exec(fmt.Sprintf(`CREATE TRIGGER %s
+				AFTER INSERT ON %s BEGIN SELECT 1; END`, triggerName, tt.tableName)); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := Init(path)
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			want := fmt.Sprintf("toolstore managed table %q has unexpected trigger %q", tt.tableName, triggerName)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("Init() error = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
@@ -757,6 +799,39 @@ func TestUpdateRiskCaseWithEventReplayFingerprintsUpdateAndEvent(t *testing.T) {
 		t.Fatalf("transition replay changed state: first=%+v/%+v replay=%+v/%+v",
 			firstCase, firstEvent, replayedCase, replayedEvent)
 	}
+	now = now.Add(time.Minute)
+	laterCase, err := store.UpdateRiskCase(ctx, RiskCaseUpdate{
+		ID: created.ID, Title: "Transition after mitigation", Severity: RiskSeverityMedium,
+		Status: RiskCaseMitigated, Assignee: "analyst-2", Summary: "mitigation completed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	replayedAfterLaterUpdate, replayedEvent, err := store.UpdateRiskCaseWithEvent(ctx, update, eventInput)
+	if err != nil {
+		t.Fatalf("transition replay after later update error = %v", err)
+	}
+	firstJSON, err := json.Marshal(firstCase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedJSON, err := json.Marshal(replayedAfterLaterUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(replayedJSON) != string(firstJSON) || replayedEvent.ID != firstEvent.ID {
+		t.Fatalf("transition replay did not return persisted original result: first=%+v/%+v replay=%+v/%+v",
+			firstCase, firstEvent, replayedAfterLaterUpdate, replayedEvent)
+	}
+	if _, err := store.db.Exec(`UPDATE risk_case_transition_replays
+		SET request_fingerprint = lower(hex(randomblob(32))) WHERE idempotency_key = ?`, eventInput.IdempotencyKey); err == nil {
+		t.Fatal("risk transition replay metadata update unexpectedly succeeded")
+	}
+	if _, err := store.db.Exec(`DELETE FROM risk_case_transition_replays
+		WHERE idempotency_key = ?`, eventInput.IdempotencyKey); err == nil {
+		t.Fatal("risk transition replay metadata delete unexpectedly succeeded")
+	}
 
 	changedUpdate := update
 	changedUpdate.Summary = "different transition payload"
@@ -772,7 +847,7 @@ func TestUpdateRiskCaseWithEventReplayFingerprintsUpdateAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Summary != update.Summary || !stored.UpdatedAt.Equal(firstCase.UpdatedAt) {
+	if stored.Summary != laterCase.Summary || !stored.UpdatedAt.Equal(laterCase.UpdatedAt) {
 		t.Fatalf("conflicting replay mutated risk case: %+v", stored)
 	}
 	var eventCount int
@@ -782,6 +857,40 @@ func TestUpdateRiskCaseWithEventReplayFingerprintsUpdateAndEvent(t *testing.T) {
 	if eventCount != 1 {
 		t.Fatalf("transition event count = %d, want 1", eventCount)
 	}
+}
+
+func TestUpdateRiskCaseWithEventRejectsReplayWithoutImmutableMetadata(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	created, err := store.CreateRiskCase(ctx, RiskCaseInput{
+		CaseKey: "risk-transition-no-metadata", Title: "Legacy transition",
+		SubjectType: "user", SubjectID: "42", Severity: RiskSeverityHigh, Status: RiskCaseOpen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventInput := RiskCaseEventInput{
+		CaseID: created.ID, EventType: "investigation_started", Actor: "analyst-1",
+		DetailsJSON: json.RawMessage(`{"queue":"legacy"}`), IdempotencyKey: "legacy-transition-event",
+	}
+	if _, err := store.AppendRiskCaseEvent(ctx, eventInput); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.UpdateRiskCaseWithEvent(ctx, RiskCaseUpdate{
+		ID: created.ID, Title: created.Title, Severity: RiskSeverityCritical,
+		Status: RiskCaseInvestigating, Assignee: "analyst-1", Summary: "reviewing legacy evidence",
+	}, eventInput)
+	if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "replay metadata is missing") {
+		t.Fatalf("metadata-free replay error = %v, want fail-closed ErrConflict", err)
+	}
+	stored, err := store.GetRiskCase(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != RiskCaseOpen || stored.Summary != "" {
+		t.Fatalf("metadata-free replay mutated risk case: %+v", stored)
+	}
+	assertTableCount(t, store, "risk_case_transition_replays", 0)
 }
 
 func TestUpdateRiskCaseRejectsCloseBeforePersistedOpenTime(t *testing.T) {

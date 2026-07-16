@@ -220,9 +220,33 @@ var migrations = []migration{
 				ON risk_case_events(idempotency_key) WHERE idempotency_key IS NOT NULL`,
 		},
 	},
+	{
+		version: 7,
+		name:    "risk transition replay metadata",
+		statements: []string{
+			`CREATE TABLE risk_case_transition_replays (
+				idempotency_key TEXT PRIMARY KEY CHECK(length(trim(idempotency_key)) > 0),
+				event_id INTEGER NOT NULL UNIQUE REFERENCES risk_case_events(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+				request_fingerprint TEXT NOT NULL CHECK(
+					length(request_fingerprint) = 64 AND
+					request_fingerprint NOT GLOB '*[^0-9a-f]*'
+				),
+				result_case_json TEXT NOT NULL CHECK(json_valid(result_case_json) AND json_type(result_case_json) = 'object'),
+				created_at INTEGER NOT NULL CHECK(created_at >= 0)
+			)`,
+			`CREATE TRIGGER risk_case_transition_replays_no_update
+				BEFORE UPDATE ON risk_case_transition_replays BEGIN
+					SELECT RAISE(ABORT, 'risk_case_transition_replays is append-only');
+				END`,
+			`CREATE TRIGGER risk_case_transition_replays_no_delete
+				BEFORE DELETE ON risk_case_transition_replays BEGIN
+					SELECT RAISE(ABORT, 'risk_case_transition_replays is append-only');
+				END`,
+		},
+	},
 }
 
-const latestSchemaVersion = 6
+const latestSchemaVersion = 7
 
 const migrationLedgerCreateStatement = `CREATE TABLE schema_migrations (
 	version INTEGER PRIMARY KEY,
@@ -693,6 +717,52 @@ func (s *Store) validateAppliedMigrationObjects(ctx context.Context) error {
 			normalizeSchemaSQL(statement.String) != normalizeSchemaSQL(want.statement) {
 			return fmt.Errorf("toolstore schema object %q is incompatible", name)
 		}
+	}
+	return s.validateManagedTableTriggers(ctx, expected)
+}
+
+// validateManagedTableTriggers rejects triggers that are not part of the
+// immutable migration set. An otherwise valid trigger can still change,
+// suppress, or exfiltrate writes, so same-name object validation alone is not
+// sufficient for tables owned by Tool Store.
+func (s *Store) validateManagedTableTriggers(ctx context.Context, expected map[string]schemaObjectDefinition) error {
+	managedTables := map[string]struct{}{
+		"schema_migrations": {},
+	}
+	allowedTriggers := make(map[string]string)
+	for name, object := range expected {
+		switch object.objectType {
+		case "table":
+			managedTables[name] = struct{}{}
+		case "trigger":
+			allowedTriggers[name] = object.tableName
+		}
+	}
+	for _, name := range migrationLedgerProtectionNames() {
+		allowedTriggers[name] = "schema_migrations"
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT name, tbl_name
+		FROM sqlite_schema WHERE type = 'trigger' ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("inspect toolstore triggers: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, tableName string
+		if err := rows.Scan(&name, &tableName); err != nil {
+			return fmt.Errorf("scan toolstore trigger: %w", err)
+		}
+		if _, managed := managedTables[tableName]; !managed {
+			continue
+		}
+		allowedTable, allowed := allowedTriggers[name]
+		if !allowed || allowedTable != tableName {
+			return fmt.Errorf("toolstore managed table %q has unexpected trigger %q", tableName, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate toolstore triggers: %w", err)
 	}
 	return nil
 }

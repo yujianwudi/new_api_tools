@@ -1425,7 +1425,7 @@ LOG_NETWORK=${LOG_NETWORK:-}
 # 认证配置
 ADMIN_PASSWORD=$(dotenv_quote "$ADMIN_PASSWORD")
 API_KEY=$(dotenv_quote "$API_KEY")
-API_KEY_ROLE=${API_KEY_ROLE:-operator}
+API_KEY_ROLE=${API_KEY_ROLE:-viewer}
 
 # 服务配置
 FRONTEND_PORT=${FRONTEND_PORT}

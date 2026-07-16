@@ -2,6 +2,7 @@ package toolstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -99,6 +100,14 @@ func (s *Store) UpdateRiskCaseWithEvent(ctx context.Context, update RiskCaseUpda
 		return RiskCase{}, RiskCaseEvent{}, fmt.Errorf("%w: event case_id must match update id", ErrInvalid)
 	}
 	event.IdempotencyKey = strings.TrimSpace(event.IdempotencyKey)
+	var requestFingerprint string
+	var err error
+	if event.IdempotencyKey != "" {
+		requestFingerprint, err = riskCaseTransitionFingerprint(update, event)
+		if err != nil {
+			return RiskCase{}, RiskCaseEvent{}, err
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return RiskCase{}, RiskCaseEvent{}, fmt.Errorf("begin risk case transition: %w", err)
@@ -108,17 +117,25 @@ func (s *Store) UpdateRiskCaseWithEvent(ctx context.Context, update RiskCaseUpda
 		existingEvent, replayErr := getRiskCaseEventByIdempotencyKey(ctx, tx, event.IdempotencyKey)
 		switch {
 		case replayErr == nil:
-			current, getErr := getRiskCase(ctx, tx, update.ID)
+			if !riskCaseEventMatchesInput(existingEvent, event) {
+				return RiskCase{}, RiskCaseEvent{}, replayConflict("risk case transition")
+			}
+			replay, getErr := getRiskCaseTransitionReplay(ctx, tx, event.IdempotencyKey)
+			if errors.Is(getErr, ErrNotFound) {
+				return RiskCase{}, RiskCaseEvent{}, fmt.Errorf(
+					"%w: risk case transition replay metadata is missing", ErrConflict)
+			}
 			if getErr != nil {
 				return RiskCase{}, RiskCaseEvent{}, getErr
 			}
-			if !riskCaseEventMatchesInput(existingEvent, event) || !riskCaseMatchesUpdate(current, update) {
+			if replay.EventID != existingEvent.ID || replay.RequestFingerprint != requestFingerprint ||
+				replay.ResultCase.ID != existingEvent.CaseID || !riskCaseMatchesUpdate(replay.ResultCase, update) {
 				return RiskCase{}, RiskCaseEvent{}, replayConflict("risk case transition")
 			}
 			if err := tx.Commit(); err != nil {
 				return RiskCase{}, RiskCaseEvent{}, fmt.Errorf("commit risk case transition replay: %w", err)
 			}
-			return current, existingEvent, nil
+			return replay.ResultCase, existingEvent, nil
 		case !errors.Is(replayErr, ErrNotFound):
 			return RiskCase{}, RiskCaseEvent{}, replayErr
 		}
@@ -131,10 +148,131 @@ func (s *Store) UpdateRiskCaseWithEvent(ctx context.Context, update RiskCaseUpda
 	if err != nil {
 		return RiskCase{}, RiskCaseEvent{}, err
 	}
+	if event.IdempotencyKey != "" {
+		if err := s.recordRiskCaseTransitionReplay(ctx, tx, event.IdempotencyKey,
+			requestFingerprint, updated, createdEvent.ID); err != nil {
+			return RiskCase{}, RiskCaseEvent{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return RiskCase{}, RiskCaseEvent{}, fmt.Errorf("commit risk case transition: %w", err)
 	}
 	return updated, createdEvent, nil
+}
+
+type riskCaseTransitionReplay struct {
+	EventID            int64
+	RequestFingerprint string
+	ResultCase         RiskCase
+}
+
+type riskCaseTransitionFingerprintPayload struct {
+	Version          int            `json:"version"`
+	CaseID           int64          `json:"case_id"`
+	Title            string         `json:"title"`
+	Severity         RiskSeverity   `json:"severity"`
+	Status           RiskCaseStatus `json:"status"`
+	Assignee         string         `json:"assignee"`
+	Summary          string         `json:"summary"`
+	ClosedAtMillis   *int64         `json:"closed_at_millis"`
+	EventType        string         `json:"event_type"`
+	Actor            string         `json:"actor"`
+	DetailsJSON      string         `json:"details_json"`
+	IdempotencyKey   string         `json:"idempotency_key"`
+	OccurredAtMillis *int64         `json:"occurred_at_millis"`
+}
+
+func riskCaseTransitionFingerprint(update RiskCaseUpdate, event RiskCaseEventInput) (string, error) {
+	if update.ID <= 0 || event.CaseID != update.ID {
+		return "", fmt.Errorf("%w: event case_id must match update id", ErrInvalid)
+	}
+	title, err := requireText("title", update.Title)
+	if err != nil {
+		return "", err
+	}
+	if !validSeverity(update.Severity) {
+		return "", fmt.Errorf("%w: unsupported risk severity %q", ErrInvalid, update.Severity)
+	}
+	if err := validateRiskClosure(update.Status, update.ClosedAt); err != nil {
+		return "", err
+	}
+	eventType, err := requireText("event_type", event.EventType)
+	if err != nil {
+		return "", err
+	}
+	actor, err := requireText("actor", event.Actor)
+	if err != nil {
+		return "", err
+	}
+	details, err := normalizedJSON("details_json", event.DetailsJSON)
+	if err != nil {
+		return "", err
+	}
+
+	var closedAtMillis *int64
+	if closedAt := normalizeOptionalTime(update.ClosedAt); closedAt != nil {
+		value := closedAt.UnixMilli()
+		closedAtMillis = &value
+	}
+	var occurredAtMillis *int64
+	if !event.OccurredAt.IsZero() {
+		value := event.OccurredAt.UTC().Truncate(time.Millisecond).UnixMilli()
+		occurredAtMillis = &value
+	}
+	payload := riskCaseTransitionFingerprintPayload{
+		Version: 1, CaseID: update.ID, Title: title, Severity: update.Severity,
+		Status: update.Status, Assignee: strings.TrimSpace(update.Assignee),
+		Summary: strings.TrimSpace(update.Summary), ClosedAtMillis: closedAtMillis,
+		EventType: eventType, Actor: actor, DetailsJSON: string(details),
+		IdempotencyKey: strings.TrimSpace(event.IdempotencyKey), OccurredAtMillis: occurredAtMillis,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode risk case transition fingerprint: %w", err)
+	}
+	fingerprint := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", fingerprint), nil
+}
+
+func (s *Store) recordRiskCaseTransitionReplay(ctx context.Context, executor execQueryer,
+	idempotencyKey, requestFingerprint string, resultCase RiskCase, eventID int64,
+) error {
+	resultJSON, err := json.Marshal(resultCase)
+	if err != nil {
+		return fmt.Errorf("encode risk case transition result: %w", err)
+	}
+	result, err := executor.ExecContext(ctx, `INSERT INTO risk_case_transition_replays(
+		idempotency_key, event_id, request_fingerprint, result_case_json, created_at
+	) VALUES (?, ?, ?, ?, ?)`, idempotencyKey, eventID, requestFingerprint, resultJSON, dbTime(s.clock()))
+	if err != nil {
+		return fmt.Errorf("record risk case transition replay: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read risk case transition replay result: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("record risk case transition replay: expected one row, wrote %d", rows)
+	}
+	return nil
+}
+
+func getRiskCaseTransitionReplay(ctx context.Context, queryer queryRower, idempotencyKey string) (riskCaseTransitionReplay, error) {
+	var replay riskCaseTransitionReplay
+	var resultJSON string
+	err := queryer.QueryRowContext(ctx, `SELECT event_id, request_fingerprint, result_case_json
+		FROM risk_case_transition_replays WHERE idempotency_key = ?`, idempotencyKey).
+		Scan(&replay.EventID, &replay.RequestFingerprint, &resultJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return riskCaseTransitionReplay{}, ErrNotFound
+	}
+	if err != nil {
+		return riskCaseTransitionReplay{}, fmt.Errorf("get risk case transition replay: %w", err)
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &replay.ResultCase); err != nil {
+		return riskCaseTransitionReplay{}, fmt.Errorf("decode risk case transition result: %w", err)
+	}
+	return replay, nil
 }
 
 func (s *Store) updateRiskCase(ctx context.Context, executor execQueryer, update RiskCaseUpdate) (RiskCase, error) {

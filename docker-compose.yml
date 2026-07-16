@@ -35,7 +35,7 @@ services:
       - DB_MAX_IDLE_CONNS=${DB_MAX_IDLE_CONNS:-}
       # 认证
       - API_KEY=${API_KEY}
-      - API_KEY_ROLE=${API_KEY_ROLE:-operator}
+      - API_KEY_ROLE=${API_KEY_ROLE:-viewer}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - JWT_SECRET_KEY=${JWT_SECRET}
       - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}

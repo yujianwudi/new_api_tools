@@ -37,7 +37,7 @@
 - `operator`：常规运营写操作。
 - `admin`：永久删除、价格快照等高风险操作。
 - 管理密码登录当前签发 admin JWT。
-- API Key 角色由 `API_KEY_ROLE` 配置，默认 `operator`。
+- API Key 角色由 `API_KEY_ROLE` 配置，默认最小权限的 `viewer`；写操作需显式提升。
 
 ### 健康、指标和请求追踪
 

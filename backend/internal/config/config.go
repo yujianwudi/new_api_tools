@@ -121,7 +121,7 @@ func Load() *Config {
 
 		// Authentication
 		APIKey:             getEnvStr("API_KEY", ""),
-		APIKeyRole:         getEnvStrDefaultIfUnset("API_KEY_ROLE", "operator"),
+		APIKeyRole:         getEnvStrDefaultIfUnset("API_KEY_ROLE", "viewer"),
 		AdminPassword:      getEnvStr("ADMIN_PASSWORD", ""),
 		JWTSecretKey:       getEnvStrMulti([]string{"JWT_SECRET_KEY", "JWT_SECRET"}, ""),
 		JWTAlgorithm:       "HS256",

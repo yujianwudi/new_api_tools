@@ -1910,7 +1910,7 @@ migrate_env_file() {
   fi
 
   if ! grep -q '^API_KEY_ROLE=' "$env_file" 2>/dev/null; then
-    echo "API_KEY_ROLE=operator" >> "$env_file"
+    echo "API_KEY_ROLE=viewer" >> "$env_file"
     migrated=true
   fi
 
