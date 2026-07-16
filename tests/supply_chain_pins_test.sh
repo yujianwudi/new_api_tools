@@ -324,9 +324,13 @@ fi
 if grep -Fq 'VCS_REF=${{ github.sha }}' .github/workflows/release-recovery.yml; then
   fail 'release recovery must not stamp the control-workflow commit into release images'
 fi
-grep -Fq 'ghcr-publish-minor-' .github/workflows/build.yml ||
+grep -Fq \
+  "      group: \${{ github.ref_type == 'tag' && format('ghcr-publish-minor-{0}', needs.quality.outputs.release_major_minor) || 'ghcr-publish-main' }}" \
+  .github/workflows/build.yml ||
   fail 'normal image publication must use the shared GHCR publication lock'
-grep -Fq 'group: ghcr-publish-minor-' .github/workflows/release-recovery.yml ||
+grep -Fq \
+  '      group: ghcr-publish-minor-${{ needs.validate.outputs.major_minor }}' \
+  .github/workflows/release-recovery.yml ||
   fail 'release recovery must use the shared GHCR publication lock'
 grep -Fq 'latest=false' .github/workflows/build.yml ||
   fail 'release tags must not implicitly move the latest image alias'
@@ -343,6 +347,11 @@ grep -Fq 'candidate_source_version=' .github/workflows/build.yml ||
   fail 'normal release publication must ignore invalid higher-version tags'
 grep -Fq 'candidate_source_version=' .github/workflows/release-recovery.yml ||
   fail 'release recovery must ignore invalid higher-version tags'
+grep -Fq 'NEWAPI_TOOLS_REF=${candidate_tag} \\' .github/workflows/build.yml ||
+  fail 'normal release publication must require the candidate installer ref marker'
+grep -Fq 'NEWAPI_TOOLS_REF=${candidate_tag} \\' \
+  .github/workflows/release-recovery.yml ||
+  fail 'release recovery must require the candidate installer ref marker'
 grep -Fq 'Run Go race detector' .github/workflows/release-recovery.yml ||
   fail 'release recovery must repeat the Go race quality gate'
 grep -Fq 'npm audit --omit=dev --audit-level=high' .github/workflows/release-recovery.yml ||

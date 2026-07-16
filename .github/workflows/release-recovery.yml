@@ -372,6 +372,8 @@ jobs:
               [[ "$candidate_source_version" == "$candidate_version" ]] || continue
               git show "${candidate_commit}:RELEASE_${candidate_version}.md" 2>/dev/null |
                 grep -Fxq "# NewAPI Tools v${candidate_version} 发行说明" || continue
+              git show "${candidate_commit}:RELEASE_${candidate_version}.md" 2>/dev/null |
+                grep -Fq "NEWAPI_TOOLS_REF=${candidate_tag} \\" || continue
               git show "${candidate_commit}:README.md" 2>/dev/null |
                 grep -Fxq "# NewAPI Tools v${candidate_version}" || continue
               versions+=("$candidate_version")
