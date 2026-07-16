@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, type ReactNode } from 'react'
+import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import {
@@ -15,6 +15,15 @@ import {
 } from './ui/dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table'
 import { cn, isCloudflareIp } from '../lib/utils'
+import {
+    clearIdempotencyKey,
+    getOrCreateIdempotencyKey,
+    idempotencyHeader,
+    mutationResponseRequiresReconciliation,
+    type IdempotencyOperation,
+} from '../lib/idempotency'
+
+const legacyRiskMutationUIEnabled = false
 
 // ── 类型定义 ──────────────────────────────────────────
 
@@ -178,7 +187,7 @@ export interface UserAnalysisDialogProps {
 export function UserAnalysisDialog({
     open, onOpenChange,
     userId, username,
-    source, contextData,
+    source: _source, contextData: _contextData,
     showRecentLogs = true,
     showIPSwitchAnalysis = true,
     headerExtra,
@@ -203,6 +212,8 @@ export function UserAnalysisDialog({
     const [analysisLoading, setAnalysisLoading] = useState(false)
     const [linuxDoLookupLoading, setLinuxDoLookupLoading] = useState<string | null>(null)
     const [mutating, setMutating] = useState(false)
+    const banOperationRef = useRef<IdempotencyOperation | null>(null)
+    const currentUserIdRef = useRef(userId)
     const [banConfirmDialog, setBanConfirmDialog] = useState<{
         open: boolean
         type: 'ban' | 'unban'
@@ -210,8 +221,7 @@ export function UserAnalysisDialog({
         username: string
         displayName?: string
         reason: string
-        disableTokens: boolean
-    }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true })
+    }>({ open: false, type: 'ban', userId: 0, username: '', reason: '' })
     const [reportDialog, setReportDialog] = useState({
         open: false,
         reasonPreset: '',
@@ -222,28 +232,39 @@ export function UserAnalysisDialog({
     const [reportChecking, setReportChecking] = useState(false)
 
     // ── 获取分析数据 ──
-    const fetchUserAnalysis = useCallback(async () => {
-        if (!userId || !open) return
+    const fetchUserAnalysis = useCallback(async (
+        requestedUserId: number,
+        requestedWindow: string,
+        signal: AbortSignal,
+    ) => {
         setAnalysisLoading(true)
         try {
             const endTimeParam = endTime ? `&end_time=${endTime}` : ''
             const response = await fetch(
-                `${apiUrl}/api/risk/users/${userId}/analysis?window=${analysisWindow}${endTimeParam}`,
-                { headers: getAuthHeaders() }
+                `${apiUrl}/api/risk/users/${requestedUserId}/analysis?window=${requestedWindow}${endTimeParam}`,
+                { headers: getAuthHeaders(), signal }
             )
             const res = await response.json()
+            if (signal.aborted) return
             if (res.success) {
-                setAnalysis(res.data)
+                const nextAnalysis = res.data as UserAnalysis
+                if (nextAnalysis?.user?.id !== requestedUserId) {
+                    setAnalysis(null)
+                    showToast('error', '分析响应与当前用户不一致，已拒绝显示')
+                    return
+                }
+                setAnalysis(nextAnalysis)
             } else {
                 showToast('error', res.message || '加载分析失败')
             }
         } catch (e) {
+            if (signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return
             console.error('Failed to fetch user analysis:', e)
             showToast('error', '加载分析失败')
         } finally {
-            setAnalysisLoading(false)
+            if (!signal.aborted) setAnalysisLoading(false)
         }
-    }, [apiUrl, getAuthHeaders, userId, analysisWindow, open, showToast, endTime])
+    }, [apiUrl, getAuthHeaders, showToast, endTime])
 
     // Reset window when dialog opens with a new initialWindow
     useEffect(() => {
@@ -253,11 +274,23 @@ export function UserAnalysisDialog({
     }, [open, userId, initialWindow])
 
     useEffect(() => {
-        if (open && userId) {
+        if (!open || !userId) {
             setAnalysis(null)
-            fetchUserAnalysis()
+            setAnalysisLoading(false)
+            return
         }
+        const controller = new AbortController()
+        setAnalysis(null)
+        void fetchUserAnalysis(userId, analysisWindow, controller.signal)
+        return () => controller.abort()
     }, [open, userId, analysisWindow, fetchUserAnalysis])
+
+    useEffect(() => {
+        currentUserIdRef.current = userId
+        setBanConfirmDialog(prev => prev.open && (!open || prev.userId !== userId)
+            ? { ...prev, open: false }
+            : prev)
+    }, [open, userId])
 
     // ── 白名单操作 ──
     const addToWhitelist = async (uid: number) => {
@@ -378,37 +411,53 @@ export function UserAnalysisDialog({
 
     // ── 封禁/解封 API ──
     const handleBanConfirm = async () => {
-        setMutating(true)
+        const reason = banConfirmDialog.reason.trim()
+        if (reason.length < 3) {
+            showToast('error', banConfirmDialog.type === 'ban' ? '请选择封禁原因' : '请选择解封原因')
+            return
+        }
+        const targetUserId = banConfirmDialog.userId
+        if (!banConfirmDialog.open || !analysis || analysis.user.id !== userId || targetUserId !== userId) {
+            setBanConfirmDialog(prev => ({ ...prev, open: false }))
+            showToast('error', '当前用户已变化，请重新打开确认窗口')
+            return
+        }
         const isBan = banConfirmDialog.type === 'ban'
-        const endpoint = isBan ? 'ban' : 'unban'
+        const action = isBan ? 'disable' : 'enable'
+        const requestBody = { reason }
+        const fingerprint = JSON.stringify({ action: `user.${action}`, user_id: targetUserId, ...requestBody })
+        const idempotencyKey = getOrCreateIdempotencyKey(banOperationRef, fingerprint, 'user-analysis.status')
+
+        setMutating(true)
         try {
-            const response = await fetch(`${apiUrl}/api/users/${banConfirmDialog.userId}/${endpoint}`, {
+            const response = await fetch(`${apiUrl}/api/control-plane/users/${targetUserId}/${action}`, {
                 method: 'POST',
-                headers: getAuthHeaders(),
-                body: JSON.stringify({
-                    reason: banConfirmDialog.reason || null,
-                    ...(isBan
-                        ? { disable_tokens: banConfirmDialog.disableTokens }
-                        : {}),
-                    context: { source, ...contextData },
-                }),
+                headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
+                body: JSON.stringify(requestBody),
             })
             const res = await response.json()
             if (res.success) {
+                clearIdempotencyKey(banOperationRef)
                 showToast('success', res.message || (isBan ? '已封禁' : '已解封'))
-                setBanConfirmDialog(prev => ({ ...prev, open: false }))
-                onOpenChange(false)
+                setBanConfirmDialog(prev => prev.userId === targetUserId ? { ...prev, open: false } : prev)
+                if (currentUserIdRef.current === targetUserId) onOpenChange(false)
                 if (isBan) onBanned?.()
                 else onUnbanned?.()
             } else {
-                showToast('error', res.message || (isBan ? '封禁失败' : '解封失败'))
+                showToast('error', mutationResponseRequiresReconciliation(res)
+                    ? '操作结果不确定，请先对账，切勿修改内容后重新提交'
+                    : res.error?.message || res.message || (isBan ? '封禁失败' : '解封失败'))
             }
         } catch (e) {
-            console.error(`Failed to ${endpoint} user:`, e)
-            showToast('error', isBan ? '封禁失败' : '解封失败')
+            console.error(`Failed to ${action} user:`, e)
+            showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
         } finally {
             setMutating(false)
         }
+    }
+
+    const closeBanConfirmDialog = () => {
+        setBanConfirmDialog(prev => ({ ...prev, open: false }))
     }
 
     const reportPreviewIPs = analysis?.top_ips.slice(0, 10) || []
@@ -833,36 +882,40 @@ export function UserAnalysisDialog({
                             </div>
                             <div className="flex gap-3">
                                 <Button variant="outline" onClick={() => onOpenChange(false)} disabled={mutating}>取消</Button>
-                                <Button
-                                    variant="outline"
-                                    onClick={() => void openReportDialog()}
-                                    disabled={!analysis || mutating || analysisLoading || reportChecking}
-                                    className="bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200"
-                                >
-                                    {reportChecking ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RadioTower className="h-4 w-4 mr-2" />}
-                                    通报
-                                </Button>
-                                {analysis?.user.in_whitelist ? (
-                                    <Button
-                                        variant="outline"
-                                        onClick={() => { if (!analysis) return; removeFromWhitelist(analysis.user.id) }}
-                                        disabled={mutating || analysisLoading}
-                                        className="bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200"
-                                    >
-                                        <ShieldX className="h-4 w-4 mr-2" />
-                                        移除白名单
-                                    </Button>
-                                ) : (
-                                    <Button
-                                        variant="outline"
-                                        onClick={() => { if (!analysis) return; addToWhitelist(analysis.user.id) }}
-                                        disabled={mutating || analysisLoading}
-                                        className="bg-purple-50 hover:bg-purple-100 text-purple-700 border-purple-200"
-                                    >
-                                        <ShieldCheck className="h-4 w-4 mr-2" />
-                                        加入白名单
-                                    </Button>
-                                )}
+                                {legacyRiskMutationUIEnabled ? (
+                                    <>
+                                        <Button
+                                            variant="outline"
+                                            onClick={() => void openReportDialog()}
+                                            disabled={!analysis || mutating || analysisLoading || reportChecking}
+                                            className="bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200"
+                                        >
+                                            {reportChecking ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RadioTower className="h-4 w-4 mr-2" />}
+                                            通报
+                                        </Button>
+                                        {analysis?.user.in_whitelist ? (
+                                            <Button
+                                                variant="outline"
+                                                onClick={() => { if (!analysis) return; removeFromWhitelist(analysis.user.id) }}
+                                                disabled={mutating || analysisLoading}
+                                                className="bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200"
+                                            >
+                                                <ShieldX className="h-4 w-4 mr-2" />
+                                                移除白名单
+                                            </Button>
+                                        ) : (
+                                            <Button
+                                                variant="outline"
+                                                onClick={() => { if (!analysis) return; addToWhitelist(analysis.user.id) }}
+                                                disabled={mutating || analysisLoading}
+                                                className="bg-purple-50 hover:bg-purple-100 text-purple-700 border-purple-200"
+                                            >
+                                                <ShieldCheck className="h-4 w-4 mr-2" />
+                                                加入白名单
+                                            </Button>
+                                        )}
+                                    </>
+                                ) : null}
                                 {analysis?.user.status === 2 ? (
                                     <Button
                                         onClick={() => {
@@ -870,10 +923,10 @@ export function UserAnalysisDialog({
                                             setBanConfirmDialog({
                                                 open: true, type: 'unban', userId: analysis.user.id,
                                                 username: analysis.user.username, displayName: analysis.user.display_name || undefined,
-                                                reason: '', disableTokens: false,
+                                                reason: '',
                                             })
                                         }}
-                                        disabled={mutating || analysisLoading}
+                                        disabled={!analysis || analysis.user.id !== userId || mutating || analysisLoading}
                                         className="min-w-28 bg-green-600 hover:bg-green-700"
                                     >
                                         <ShieldCheck className="h-4 w-4 mr-2" />
@@ -887,10 +940,10 @@ export function UserAnalysisDialog({
                                             setBanConfirmDialog({
                                                 open: true, type: 'ban', userId: analysis.user.id,
                                                 username: analysis.user.username, displayName: analysis.user.display_name || undefined,
-                                                reason: '', disableTokens: true,
+                                                reason: '',
                                             })
                                         }}
-                                        disabled={mutating || analysisLoading}
+                                        disabled={!analysis || analysis.user.id !== userId || mutating || analysisLoading}
                                         className="min-w-28"
                                     >
                                         <ShieldBan className="h-4 w-4 mr-2" />
@@ -904,7 +957,7 @@ export function UserAnalysisDialog({
             </Dialog>
 
             {/* ── Abuse Broadcast Report Dialog ── */}
-            <Dialog open={reportDialog.open} onOpenChange={(o) => setReportDialog(prev => ({ ...prev, open: o }))}>
+            {legacyRiskMutationUIEnabled ? <Dialog open={reportDialog.open} onOpenChange={(o) => setReportDialog(prev => ({ ...prev, open: o }))}>
                 <DialogContent className="max-w-[640px] w-full rounded-xl gap-5 p-6 overflow-visible">
                     <DialogHeader className="space-y-2">
                         <DialogTitle className="flex items-center gap-2 text-lg">
@@ -989,10 +1042,16 @@ export function UserAnalysisDialog({
                         </Button>
                     </DialogFooter>
                 </DialogContent>
-            </Dialog>
+            </Dialog> : null}
 
             {/* ── Ban Confirm Dialog ── */}
-            <Dialog open={banConfirmDialog.open} onOpenChange={(o) => setBanConfirmDialog(prev => ({ ...prev, open: o }))}>
+            <Dialog
+                open={banConfirmDialog.open}
+                onOpenChange={(open) => {
+                    if (open) setBanConfirmDialog(prev => ({ ...prev, open: true }))
+                    else closeBanConfirmDialog()
+                }}
+            >
                 <DialogContent className="max-w-[600px] w-full rounded-xl gap-6 p-6 overflow-visible">
                     <DialogHeader className="space-y-2">
                         <DialogTitle className="flex items-center gap-2 text-lg">
@@ -1023,30 +1082,21 @@ export function UserAnalysisDialog({
                                     <option key={option.value} value={option.value}>{option.label}</option>
                                 ))}
                             </Select>
+                            <p className="text-xs text-muted-foreground">必填；原因会随幂等键写入控制平面审计。</p>
                         </div>
 
-                        {banConfirmDialog.type === 'ban' ? (
-                            <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
-                                <input
-                                    type="checkbox"
-                                    checked={banConfirmDialog.disableTokens}
-                                    onChange={(e) => setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))}
-                                    className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                                />
-                                同时禁用该用户所有令牌
-                            </label>
-                        ) : (
-                            <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
-                                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
-                                <span>解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。</span>
-                            </div>
-                        )}
+                        <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+                            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+                            <span>{banConfirmDialog.type === 'ban'
+                                ? '封禁只更新用户状态，不会批量禁用 Token；如需处置令牌，请在 NewAPI 管理端逐个复核。'
+                                : '解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。'}</span>
+                        </div>
                     </div>
 
                     <DialogFooter className="gap-2 sm:gap-0 mt-2">
                         <Button
                             variant="ghost"
-                            onClick={() => setBanConfirmDialog(prev => ({ ...prev, open: false }))}
+                            onClick={closeBanConfirmDialog}
                             disabled={mutating}
                             className="flex-1 sm:flex-none"
                         >
@@ -1055,7 +1105,7 @@ export function UserAnalysisDialog({
                         {banConfirmDialog.type === 'ban' ? (
                             <Button
                                 variant="destructive"
-                                disabled={mutating}
+                                disabled={mutating || banConfirmDialog.reason.trim().length < 3 || !analysis || analysis.user.id !== userId || banConfirmDialog.userId !== userId}
                                 className="flex-1 sm:flex-none min-w-[100px]"
                                 onClick={handleBanConfirm}
                             >
@@ -1065,7 +1115,7 @@ export function UserAnalysisDialog({
                         ) : (
                             <Button
                                 className="bg-green-600 hover:bg-green-700 flex-1 sm:flex-none min-w-[100px]"
-                                disabled={mutating}
+                                disabled={mutating || banConfirmDialog.reason.trim().length < 3 || !analysis || analysis.user.id !== userId || banConfirmDialog.userId !== userId}
                                 onClick={handleBanConfirm}
                             >
                                 {mutating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ShieldCheck className="h-4 w-4 mr-2" />}

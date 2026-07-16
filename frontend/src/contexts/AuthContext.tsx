@@ -70,6 +70,16 @@ interface AuthProviderProps {
   children: ReactNode
 }
 
+interface LoginResponse {
+  success: boolean
+  token?: unknown
+  expires_at?: unknown
+}
+
+function isLoginResponse(value: unknown): value is LoginResponse {
+  return typeof value === 'object' && value !== null && typeof (value as { success?: unknown }).success === 'boolean'
+}
+
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setToken] = useState<string | null>(() => {
     // v0.2.0 stops accepting long-lived admin bearer tokens from localStorage.
@@ -139,16 +149,38 @@ export function AuthProvider({ children }: AuthProviderProps) {
       throw new Error('service_unavailable')
     }
 
-    const data = await response.json()
-    if (data.success && data.token) {
+    let data: unknown
+    try {
+      data = await response.json()
+    } catch (error) {
+      console.error('Login response was not valid JSON:', error)
+      throw new Error('service_unavailable')
+    }
+    if (!isLoginResponse(data)) {
+      throw new Error('service_unavailable')
+    }
+    if (data.success) {
+      if (typeof data.token !== 'string' || data.token.trim() === '') {
+        throw new Error('service_unavailable')
+      }
       const newToken = data.token
       // Parse expires_at or default 24 hours
-      let expiryTime: number
-      if (data.expires_at) {
+      const now = Date.now()
+      const fallbackExpiry = now + 86400 * 1000
+      let expiryTime = fallbackExpiry
+      if (data.expires_at !== undefined && data.expires_at !== null && data.expires_at !== '') {
+        if (typeof data.expires_at !== 'string' && typeof data.expires_at !== 'number') {
+          throw new Error('service_unavailable')
+        }
         const parsedExpiry = new Date(data.expires_at).getTime()
-        expiryTime = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now() + 86400 * 1000
-      } else {
-        expiryTime = Date.now() + 86400 * 1000
+        if (!Number.isFinite(parsedExpiry)) {
+          throw new Error('service_unavailable')
+        }
+        if (parsedExpiry <= now) {
+          logout()
+          return false
+        }
+        expiryTime = parsedExpiry
       }
 
       persistSessionAuth(newToken, expiryTime)
@@ -157,7 +189,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
     // 2xx 但 success=false：按密码/凭证错误处理
     return false
-  }, [])
+  }, [logout])
 
   // Set global logout function for API interceptor
   useEffect(() => {

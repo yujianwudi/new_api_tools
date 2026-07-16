@@ -140,7 +140,7 @@ func RegisterModelStatusEmbedRoutes(r *gin.Engine) {
 		g.POST("/status/batch", GetPublicMultipleModelsStatusHandler)
 		g.GET("/status/all", GetPublicAllModelsStatusHandler)
 		g.GET("/config", GetEmbedConfig)
-		g.GET("/config/selected", GetSelectedModels)
+		g.GET("/config/selected", GetPublicSelectedModels)
 		g.GET("/token-groups", GetPublicTokenGroupsForModelStatus)
 	}
 
@@ -155,7 +155,7 @@ func RegisterModelStatusEmbedRoutes(r *gin.Engine) {
 		e.POST("/status/batch", GetPublicMultipleModelsStatusHandler)
 		e.GET("/status/all", GetPublicAllModelsStatusHandler)
 		e.GET("/config", GetEmbedConfig)
-		e.GET("/config/selected", GetSelectedModels)
+		e.GET("/config/selected", GetPublicSelectedModels)
 		e.GET("/token-groups", GetPublicTokenGroupsForModelStatus)
 	}
 }
@@ -373,8 +373,23 @@ func sanitizeModelNames(values []string, maxModels int) ([]string, string) {
 	return result, ""
 }
 
+func sanitizeSelectedModelNames(values []string) ([]string, string) {
+	if len(values) == 0 {
+		return []string{}, ""
+	}
+	return sanitizeModelNames(values, authenticatedModelStatusMaxBatch)
+}
+
 // GET /selected
 func GetSelectedModels(c *gin.Context) {
+	respondSelectedModels(c, authenticatedModelStatusMaxBatch)
+}
+
+func GetPublicSelectedModels(c *gin.Context) {
+	respondSelectedModels(c, config.Get().PublicModelMaxBatch)
+}
+
+func respondSelectedModels(c *gin.Context, maxBatch int) {
 	svc := service.NewModelStatusService()
 	config := svc.GetConfig()
 	c.JSON(http.StatusOK, gin.H{
@@ -387,6 +402,7 @@ func GetSelectedModels(c *gin.Context) {
 		"custom_order":     config["custom_order"],
 		"custom_groups":    config["custom_groups"],
 		"site_title":       config["site_title"],
+		"max_batch":        maxBatch,
 	})
 }
 
@@ -399,11 +415,16 @@ func SetSelectedModels(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
 		return
 	}
+	validatedModels, errMessage := sanitizeSelectedModelNames(req.Models)
+	if errMessage != "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", errMessage, ""))
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetSelectedModels(req.Models)
+	svc.SetSelectedModels(validatedModels)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    req.Models,
+		"data":    validatedModels,
 		"message": "Selected models updated",
 	})
 }

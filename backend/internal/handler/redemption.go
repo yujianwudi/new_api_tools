@@ -7,21 +7,25 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
 
 // RegisterRedemptionRoutes registers /api/redemptions endpoints
-func RegisterRedemptionRoutes(r *gin.RouterGroup) {
+func RegisterRedemptionRoutes(r *gin.RouterGroup, mutationHandler *MutationHandler) {
+	if mutationHandler == nil {
+		panic("redemption routes require the audited NewAPI mutation handler")
+	}
 	g := r.Group("/redemptions")
 	{
-		g.POST("/generate", GenerateRedemptionCodes)
+		g.POST("/generate", auth.RequireRole(auth.RoleAdmin), mutationHandler.GenerateRedemptionCodes)
 		g.GET("", ListRedemptionCodes)
 		g.GET("/statistics", GetRedemptionStatistics)
-		g.POST("/batch-delete", BatchDeleteRedemptionCodes)
-		g.DELETE("/batch", BatchDeleteRedemptionCodes)
-		g.POST("/batch", BatchDeleteRedemptionCodes)
-		g.DELETE("/:id", DeleteRedemptionCode)
+		g.POST("/batch-delete", mutationHandler.BatchDeleteRedemptionCodes)
+		g.DELETE("/batch", mutationHandler.BatchDeleteRedemptionCodes)
+		g.POST("/batch", mutationHandler.BatchDeleteRedemptionCodes)
+		g.DELETE("/:id", mutationHandler.DeleteRedemptionCode)
 	}
 }
 

@@ -11,6 +11,13 @@ import { Select } from './ui/select'
 import { Input } from './ui/input'
 import { cn, isCloudflareIp } from '../lib/utils'
 import { UserAnalysisDialog, BAN_REASONS, UNBAN_REASONS, RISK_FLAG_LABELS } from './UserAnalysisDialog'
+import {
+  clearIdempotencyKey,
+  getOrCreateIdempotencyKey,
+  idempotencyHeader,
+  mutationResponseRequiresReconciliation,
+  type IdempotencyOperation,
+} from '../lib/idempotency'
 
 type WindowKey = '1h' | '3h' | '6h' | '12h' | '24h' | '3d' | '7d'
 type SortKey = 'requests' | 'quota' | 'failure_rate'
@@ -119,8 +126,6 @@ interface BanRecordItem {
   operator: string
   reason: string
   context: Record<string, any> & {
-    disable_tokens?: boolean
-    enable_tokens?: boolean
     token_id?: number
     token_name?: string
     source?: string
@@ -194,8 +199,6 @@ const VIEW_PATH_MAP: Record<string, 'leaderboards' | 'banned_list' | 'ip_monitor
   'banned_list': 'banned_list',
   'audit': 'audit_logs',
   'audit_logs': 'audit_logs',
-  'ai': 'ai_ban',
-  'ai_ban': 'ai_ban',
 }
 
 const PATH_VIEW_MAP: Record<string, string> = {
@@ -244,7 +247,6 @@ export function RealtimeRanking() {
     { id: 'ip_monitoring' as const, label: 'IP 监控', icon: Globe },
     { id: 'banned_list' as const, label: '封禁列表', icon: ShieldBan },
     { id: 'audit_logs' as const, label: '审计日志', icon: Clock },
-    { id: 'ai_ban' as const, label: 'AI 封禁', icon: AlertTriangle },
   ], [])
 
   // 滑动指示器状态
@@ -283,6 +285,7 @@ export function RealtimeRanking() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [selected, setSelected] = useState<{ item: LeaderboardItem; window: WindowKey; endTime?: number } | null>(null)
   const [mutating, setMutating] = useState(false)
+  const banOperationRef = useRef<IdempotencyOperation | null>(null)
 
   // 封禁列表状态
   const [bannedUsers, setBannedUsers] = useState<BannedUserItem[]>([])
@@ -334,8 +337,6 @@ export function RealtimeRanking() {
   const [userIpsData, setUserIpsData] = useState<Array<{ ip: string; request_count: number; first_seen: number; last_seen: number }>>([])
   const [userIpsLoading, setUserIpsLoading] = useState(false)
 
-  const [enableAllDialogOpen, setEnableAllDialogOpen] = useState(false)
-  const [enableAllLoading, setEnableAllLoading] = useState(false)
   const [expandedSharedIps, setExpandedSharedIps] = useState<Set<string>>(new Set())
   const [expandedTokens, setExpandedTokens] = useState<Set<number>>(new Set())
 
@@ -357,8 +358,7 @@ export function RealtimeRanking() {
     username: string
     displayName?: string
     reason: string
-    disableTokens: boolean
-  }>({ open: false, type: 'ban', userId: 0, username: '', reason: '', disableTokens: true })
+  }>({ open: false, type: 'ban', userId: 0, username: '', reason: '' })
 
   // AI 自动封禁状态
   const [aiConfig, setAiConfig] = useState<{
@@ -673,18 +673,6 @@ export function RealtimeRanking() {
       setBannedLoading(false)
     }
   }, [apiUrl, getAuthHeaders, showToast, bannedSearch])
-
-  const fetchIPStats = useCallback(async () => {
-    try {
-      const response = await fetch(`${apiUrl}/api/ip/stats`, { headers: getAuthHeaders() })
-      const res = await response.json()
-      if (res.success) {
-        setIpStats(res.data)
-      }
-    } catch (e) {
-      console.error('Failed to fetch IP stats:', e)
-    }
-  }, [apiUrl, getAuthHeaders])
 
   const fetchIPData = useCallback(async (showSuccessToast = false, resetPage = false, forceRefresh = false) => {
     setIpLoading(true)
@@ -1212,59 +1200,6 @@ export function RealtimeRanking() {
     fetchUserIps(userId, ipWindow)
   }
 
-  const handleEnableAllIPRecording = async () => {
-    setEnableAllLoading(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/ip/enable-all`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-      })
-      const res = await response.json()
-      if (res.success) {
-        showToast('success', res.message || '已开启所有用户 IP 记录')
-        setEnableAllDialogOpen(false)
-        fetchIPStats()
-      } else {
-        showToast('error', res.message || '操作失败')
-      }
-    } catch (e) {
-      console.error('Failed to enable all IP recording:', e)
-      showToast('error', '操作失败')
-    } finally {
-      setEnableAllLoading(false)
-    }
-  }
-
-  const handleDisableToken = async (tokenId: number, tokenName: string) => {
-    setConfirmDialog({
-      open: true,
-      title: '禁用令牌',
-      description: `确定要禁用令牌 "${tokenName}" 吗？`,
-      confirmText: '禁用',
-      variant: 'destructive',
-      onConfirm: async () => {
-        setConfirmDialog(prev => ({ ...prev, open: false }))
-        try {
-          const response = await fetch(`${apiUrl}/api/users/tokens/${tokenId}/disable`, {
-            method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({ reason: 'IP 监控检测到多 IP 使用', context: { source: 'ip_monitoring' } }),
-          })
-          const res = await response.json()
-          if (res.success) {
-            showToast('success', res.message || '令牌已禁用')
-            fetchIPData()
-          } else {
-            showToast('error', res.message || '禁用失败')
-          }
-        } catch (e) {
-          console.error('Failed to disable token:', e)
-          showToast('error', '禁用令牌失败')
-        }
-      }
-    })
-  }
-
   const handleQuickBanUser = (userId: number, username: string) => {
     openUserAnalysisFromIP(userId, username)
   }
@@ -1505,6 +1440,54 @@ export function RealtimeRanking() {
       else next.add(tokenId)
       return next
     })
+  }
+
+  const closeBanConfirmDialog = () => {
+    setBanConfirmDialog((previous) => ({ ...previous, open: false }))
+  }
+
+  const handleBanMutation = async () => {
+    const reason = banConfirmDialog.reason.trim()
+    if (reason.length < 3) {
+      showToast('error', banConfirmDialog.type === 'ban' ? '请选择封禁原因' : '请选择解封原因')
+      return
+    }
+
+    const isBan = banConfirmDialog.type === 'ban'
+    const action = isBan ? 'disable' : 'enable'
+    const requestBody = { reason }
+    const fingerprint = JSON.stringify({ action: `user.${action}`, user_id: banConfirmDialog.userId, ...requestBody })
+    const idempotencyKey = getOrCreateIdempotencyKey(banOperationRef, fingerprint, 'realtime.user.status')
+
+    setMutating(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/control-plane/users/${banConfirmDialog.userId}/${action}`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
+        body: JSON.stringify(requestBody),
+      })
+      const result = await response.json()
+      if (result.success) {
+        clearIdempotencyKey(banOperationRef)
+        showToast('success', result.message || (isBan ? '已封禁' : '已解封'))
+        setBanConfirmDialog((previous) => ({ ...previous, open: false }))
+        setDialogOpen(false)
+        void Promise.all([
+          fetchLeaderboards(),
+          fetchBannedUsers(isBan ? 1 : bannedPage),
+          fetchBanRecords(isBan ? 1 : recordsPage),
+        ])
+      } else {
+        showToast('error', mutationResponseRequiresReconciliation(result)
+          ? '操作结果不确定，请先对账，切勿修改内容后重新提交'
+          : result.error?.message || result.message || (isBan ? '封禁失败' : '解封失败'))
+      }
+    } catch (error) {
+      console.error(`Failed to ${action} user:`, error)
+      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
+    } finally {
+      setMutating(false)
+    }
   }
 
   const metricLabel = SORT_LABELS[sortBy]
@@ -2045,7 +2028,6 @@ export function RealtimeRanking() {
                                         username: user.username,
                                         displayName: user.display_name || undefined,
                                         reason: '',
-                                        disableTokens: false,
                                       })
                                     }}
                                   >
@@ -2513,15 +2495,9 @@ export function RealtimeRanking() {
                       <Globe className="h-6 w-6 text-blue-500" />
                     </div>
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="w-full mt-3 h-8 text-xs"
-                    onClick={() => setEnableAllDialogOpen(true)}
-                    disabled={ipStats?.enabled_percentage === 100}
-                  >
-                    全部开启
-                  </Button>
+                  <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">
+                    此处仅展示旁路观测结果；批量开启 IP 记录请在 NewAPI 管理端复核执行。
+                  </p>
                 </CardContent>
               </Card>
 
@@ -2765,15 +2741,6 @@ export function RealtimeRanking() {
                                   </TableCell>
                                   <TableCell className="py-3 text-center">
                                     <div className="flex items-center gap-1 justify-center">
-                                      <Button
-                                        variant="ghost"
-                                        size="icon"
-                                        className="h-8 w-8 text-red-500 hover:text-red-600 hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all"
-                                        onClick={() => handleDisableToken(item.token_id, item.token_name || `Token#${item.token_id}`)}
-                                        title="禁用令牌"
-                                      >
-                                        <Ban className="h-4 w-4" />
-                                      </Button>
                                       <Button
                                         variant="ghost"
                                         size="icon"
@@ -3543,7 +3510,6 @@ export function RealtimeRanking() {
                           userId: aiAssessResult.user_id,
                           username: aiAssessResult.username,
                           reason: `[AI建议] ${aiAssessResult.assessment.reason}`,
-                          disableTokens: true,
                         })
                       }}
                     >
@@ -4174,26 +4140,6 @@ export function RealtimeRanking() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={enableAllDialogOpen} onOpenChange={setEnableAllDialogOpen}>
-        <DialogContent className="max-w-md rounded-xl">
-          <DialogHeader>
-            <DialogTitle>确认开启所有用户 IP 记录</DialogTitle>
-            <DialogDescription>
-              此操作将为所有用户开启 IP 记录功能。当前有 {ipStats?.disabled_count || 0} 个用户未开启。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button variant="outline" onClick={() => setEnableAllDialogOpen(false)} disabled={enableAllLoading}>
-              取消
-            </Button>
-            <Button onClick={handleEnableAllIPRecording} disabled={enableAllLoading}>
-              {enableAllLoading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-              确认开启
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       {selected && (
         <UserAnalysisDialog
           open={dialogOpen}
@@ -4242,7 +4188,13 @@ export function RealtimeRanking() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={banConfirmDialog.open} onOpenChange={(open) => setBanConfirmDialog(prev => ({ ...prev, open }))}>
+      <Dialog
+        open={banConfirmDialog.open}
+        onOpenChange={(open) => {
+          if (open) setBanConfirmDialog((previous) => ({ ...previous, open: true }))
+          else closeBanConfirmDialog()
+        }}
+      >
         <DialogContent className="max-w-[600px] w-full rounded-xl gap-6 p-6 overflow-visible">
           <DialogHeader className="space-y-2">
             <DialogTitle className="flex items-center gap-2 text-lg">
@@ -4279,30 +4231,21 @@ export function RealtimeRanking() {
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </Select>
+              <p className="text-xs text-muted-foreground">必填；原因会随幂等键写入控制平面审计。</p>
             </div>
 
-            {banConfirmDialog.type === 'ban' ? (
-              <label className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none bg-muted/30 p-2 rounded-md border border-transparent hover:border-border">
-                <input
-                  type="checkbox"
-                  checked={banConfirmDialog.disableTokens}
-                  onChange={(e) => setBanConfirmDialog(prev => ({ ...prev, disableTokens: e.target.checked }))}
-                  className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                />
-                同时禁用该用户所有令牌
-              </label>
-            ) : (
-              <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
-                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
-                <span>解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。</span>
-              </div>
-            )}
+            <div className="flex items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-muted-foreground">
+              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-yellow-600" />
+              <span>{banConfirmDialog.type === 'ban'
+                ? '封禁只更新用户状态，不会批量禁用 Token；如需处置令牌，请在 NewAPI 管理端逐个复核。'
+                : '解封只恢复用户状态。已禁用 Token 会保持禁用，请在 NewAPI 管理端逐个复核后再启用。'}</span>
+            </div>
           </div>
 
           <DialogFooter className="gap-2 sm:gap-0 mt-2">
             <Button
               variant="ghost"
-              onClick={() => setBanConfirmDialog(prev => ({ ...prev, open: false }))}
+              onClick={closeBanConfirmDialog}
               disabled={mutating}
               className="flex-1 sm:flex-none"
             >
@@ -4311,42 +4254,9 @@ export function RealtimeRanking() {
             {banConfirmDialog.type === 'ban' ? (
               <Button
                 variant="destructive"
-                disabled={mutating}
+                disabled={mutating || banConfirmDialog.reason.trim().length < 3}
                 className="flex-1 sm:flex-none min-w-[100px]"
-                onClick={async () => {
-                  setMutating(true)
-                  try {
-                    const response = await fetch(`${apiUrl}/api/users/${banConfirmDialog.userId}/ban`, {
-                      method: 'POST',
-                      headers: getAuthHeaders(),
-                      body: JSON.stringify({
-                        reason: banConfirmDialog.reason || null,
-                        disable_tokens: banConfirmDialog.disableTokens,
-                        context: {
-                          source: 'risk_center',
-                          window: selected?.window,
-                          generated_at: generatedAt,
-                        },
-                      }),
-                    })
-                    const res = await response.json()
-                    if (res.success) {
-                      showToast('success', res.message || '已封禁')
-                      setBanConfirmDialog(prev => ({ ...prev, open: false }))
-                      setDialogOpen(false)
-                      fetchLeaderboards()
-                      fetchBannedUsers(1)
-                      fetchBanRecords(1)
-                    } else {
-                      showToast('error', res.message || '封禁失败')
-                    }
-                  } catch (e) {
-                    console.error('Failed to ban user:', e)
-                    showToast('error', '封禁失败')
-                  } finally {
-                    setMutating(false)
-                  }
-                }}
+                onClick={handleBanMutation}
               >
                 {mutating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ShieldBan className="h-4 w-4 mr-2" />}
                 确认封禁
@@ -4354,38 +4264,8 @@ export function RealtimeRanking() {
             ) : (
               <Button
                 className="bg-green-600 hover:bg-green-700 flex-1 sm:flex-none min-w-[100px]"
-                disabled={mutating}
-                onClick={async () => {
-                  setMutating(true)
-                  try {
-                    const response = await fetch(`${apiUrl}/api/users/${banConfirmDialog.userId}/unban`, {
-                      method: 'POST',
-                      headers: getAuthHeaders(),
-                      body: JSON.stringify({
-                        reason: banConfirmDialog.reason || null,
-                        context: {
-                          source: 'risk_center',
-                        },
-                      }),
-                    })
-                    const res = await response.json()
-                    if (res.success) {
-                      showToast('success', res.message || '已解封')
-                      setBanConfirmDialog(prev => ({ ...prev, open: false }))
-                      setDialogOpen(false)
-                      fetchLeaderboards()
-                      fetchBannedUsers(bannedPage)
-                      fetchBanRecords(recordsPage)
-                    } else {
-                      showToast('error', res.message || '解封失败')
-                    }
-                  } catch (e) {
-                    console.error('Failed to unban user:', e)
-                    showToast('error', '解封失败')
-                  } finally {
-                    setMutating(false)
-                  }
-                }}
+                disabled={mutating || banConfirmDialog.reason.trim().length < 3}
+                onClick={handleBanMutation}
               >
                 {mutating ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ShieldCheck className="h-4 w-4 mr-2" />}
                 确认解封

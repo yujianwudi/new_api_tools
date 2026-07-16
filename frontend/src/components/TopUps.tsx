@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useToast } from './Toast'
 import { useAuth } from '../contexts/AuthContext'
 import { CreditCard, Loader2, RefreshCw, Copy, ExternalLink, CheckCircle2, Clock, XCircle, Search, Calendar, Filter, Download, BarChart3, ListOrdered, ShieldCheck, AlertTriangle } from 'lucide-react'
@@ -102,6 +102,10 @@ export function TopUps() {
   const [endDate, setEndDate] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const recordsRequestSequence = useRef(0)
+  const statisticsRequestSequence = useRef(0)
+  const recordsAbortController = useRef<AbortController | null>(null)
+  const statisticsAbortController = useRef<AbortController | null>(null)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const getAuthHeaders = useCallback(() => ({
@@ -127,20 +131,38 @@ export function TopUps() {
   }, [apiUrl, getAuthHeaders])
 
   const fetchStatistics = useCallback(async () => {
+    const requestSequence = ++statisticsRequestSequence.current
+    statisticsAbortController.current?.abort()
+    const controller = new AbortController()
+    statisticsAbortController.current = controller
     setStatsLoading(true)
     try {
       const params = new URLSearchParams()
       if (startDate) params.append('start_date', startDate)
       if (endDate) params.append('end_date', endDate)
-      const response = await fetch(`${apiUrl}/api/top-ups/statistics?${params.toString()}`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/top-ups/statistics?${params.toString()}`, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
       const data = await response.json()
+      if (requestSequence !== statisticsRequestSequence.current) return
       if (data.success) setStatistics(data.data)
     } catch (error) {
+      if (controller.signal.aborted || requestSequence !== statisticsRequestSequence.current) return
       console.error('Failed to fetch statistics:', error)
-    } finally { setStatsLoading(false) }
+    } finally {
+      if (requestSequence === statisticsRequestSequence.current) {
+        if (statisticsAbortController.current === controller) statisticsAbortController.current = null
+        setStatsLoading(false)
+      }
+    }
   }, [apiUrl, getAuthHeaders, startDate, endDate])
 
   const fetchRecords = useCallback(async () => {
+    const requestSequence = ++recordsRequestSequence.current
+    recordsAbortController.current?.abort()
+    const controller = new AbortController()
+    recordsAbortController.current = controller
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: page.toString(), page_size: pageSize.toString() })
@@ -152,8 +174,12 @@ export function TopUps() {
       if (startDate) params.append('start_date', startDate)
       if (endDate) params.append('end_date', endDate)
 
-      const response = await fetch(`${apiUrl}/api/top-ups?${params.toString()}`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/top-ups?${params.toString()}`, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
       const data = await response.json()
+      if (requestSequence !== recordsRequestSequence.current) return
       if (data.success) {
         const result: PaginatedResponse = data.data
         setRecords(Array.isArray(result?.items) ? result.items : [])
@@ -161,14 +187,26 @@ export function TopUps() {
         setTotalPages(typeof result?.total_pages === 'number' ? result.total_pages : 1)
       } else { showToast('error', data.error?.message || '获取充值记录失败') }
     } catch (error) {
+      if (controller.signal.aborted || requestSequence !== recordsRequestSequence.current) return
       showToast('error', '网络错误，请重试')
       console.error('Failed to fetch records:', error)
-    } finally { setLoading(false) }
+    } finally {
+      if (requestSequence === recordsRequestSequence.current) {
+        if (recordsAbortController.current === controller) recordsAbortController.current = null
+        setLoading(false)
+      }
+    }
   }, [apiUrl, getAuthHeaders, page, pageSize, statusFilter, paymentMethodFilter, paymentProviderFilter, tradeNoSearch, usernameSearch, startDate, endDate, showToast])
 
   useEffect(() => { fetchRecords() }, [fetchRecords])
   useEffect(() => { fetchStatistics() }, [fetchStatistics])
   useEffect(() => { setPage(1) }, [statusFilter, paymentMethodFilter, paymentProviderFilter, tradeNoSearch, usernameSearch, startDate, endDate])
+  useEffect(() => () => {
+    recordsRequestSequence.current += 1
+    statisticsRequestSequence.current += 1
+    recordsAbortController.current?.abort()
+    statisticsAbortController.current?.abort()
+  }, [])
 
   const handleRefresh = async () => {
     setRefreshing(true)
@@ -490,6 +528,7 @@ export function TopUps() {
                                 <Button
                                   variant="ghost"
                                   size="icon"
+                                  aria-label={`复制交易号 ${record.trade_no}`}
                                   className="h-6 w-6 ml-1 flex-shrink-0"
                                   onClick={async () => {
                                     try {

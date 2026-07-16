@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,9 @@ type DatabaseEngine string
 const (
 	MySQL      DatabaseEngine = "mysql"
 	PostgreSQL DatabaseEngine = "postgresql"
+
+	defaultRedemptionMaxQuotaPerCode int64 = 50_000_000
+	defaultRedemptionMaxTotalQuota   int64 = 500_000_000
 )
 
 // Config holds all application configuration
@@ -47,6 +51,7 @@ type Config struct {
 
 	// Authentication
 	APIKey             string        `json:"api_key"`
+	APIKeyRole         string        `json:"api_key_role"`
 	AdminPassword      string        `json:"admin_password"`
 	JWTSecretKey       string        `json:"jwt_secret_key"`
 	JWTAlgorithm       string        `json:"jwt_algorithm"`
@@ -65,20 +70,28 @@ type Config struct {
 	PublicModelMaxBodyBytes      int64 `json:"public_model_max_body_bytes"`
 	PublicModelRequestsPerMinute int   `json:"public_model_requests_per_minute"`
 
+	// Financial safety limits for audited redemption creation, expressed in
+	// NewAPI quota units (500,000 units currently represent US$1).
+	RedemptionMaxQuotaPerCode int64 `json:"redemption_max_quota_per_code"`
+	RedemptionMaxTotalQuota   int64 `json:"redemption_max_total_quota"`
+
 	// NewAPI
-	NewAPIBaseURL          string `json:"newapi_base_url"`
-	NewAPIRedisDisabled    bool   `json:"newapi_redis_disabled"`
-	AllowUnsafeBatchDelete bool   `json:"allow_unsafe_batch_delete"`
-	AllowUnsafeHardDelete  bool   `json:"allow_unsafe_hard_delete"`
-	EnforceIPRecording     bool   `json:"enforce_ip_recording"`
-	NewAPIKey              string `json:"newapi_api_key"`
+	NewAPIBaseURL          string        `json:"newapi_base_url"`
+	NewAPIRedisDisabled    bool          `json:"newapi_redis_disabled"`
+	AllowUnsafeBatchDelete bool          `json:"allow_unsafe_batch_delete"`
+	AllowUnsafeHardDelete  bool          `json:"allow_unsafe_hard_delete"`
+	NewAPIAdminAccessToken string        `json:"newapi_admin_access_token"`
+	NewAPIAdminUserID      int           `json:"newapi_admin_user_id"`
+	ObservabilityToken     string        `json:"-"`
+	LogFreshnessMaxAge     time.Duration `json:"log_freshness_max_age"`
 
 	// Logging
 	LogFile  string `json:"log_file"`
 	LogLevel string `json:"log_level"`
 
 	// Data directory (for persistent local storage)
-	DataDir string `json:"data_dir"`
+	DataDir       string `json:"data_dir"`
+	ToolStorePath string `json:"tool_store_path"`
 
 	// LinuxDo Lookup proxy (optional, e.g. socks5://user:pass@host:port)
 	LinuxDoProxyURL string `json:"linuxdo_proxy_url"`
@@ -108,6 +121,7 @@ func Load() *Config {
 
 		// Authentication
 		APIKey:             getEnvStr("API_KEY", ""),
+		APIKeyRole:         getEnvStrDefaultIfUnset("API_KEY_ROLE", "viewer"),
 		AdminPassword:      getEnvStr("ADMIN_PASSWORD", ""),
 		JWTSecretKey:       getEnvStrMulti([]string{"JWT_SECRET_KEY", "JWT_SECRET"}, ""),
 		JWTAlgorithm:       "HS256",
@@ -126,20 +140,31 @@ func Load() *Config {
 		PublicModelMaxBodyBytes:      int64(getEnvInt("PUBLIC_MODEL_MAX_BODY_BYTES", 16*1024)),
 		PublicModelRequestsPerMinute: getEnvInt("PUBLIC_MODEL_REQUESTS_PER_MINUTE", 30),
 
+		// Redemption financial guardrails default to US$100 per code and
+		// US$1,000 per operation in NewAPI's current quota units.
+		RedemptionMaxQuotaPerCode: getEnvInt64("REDEMPTION_MAX_QUOTA_PER_CODE", defaultRedemptionMaxQuotaPerCode),
+		RedemptionMaxTotalQuota:   getEnvInt64("REDEMPTION_MAX_TOTAL_QUOTA", defaultRedemptionMaxTotalQuota),
+
 		// NewAPI
 		NewAPIBaseURL:          getEnvStrMulti([]string{"NEWAPI_BASEURL", "NEWAPI_BASE_URL"}, "http://localhost:3000"),
 		NewAPIRedisDisabled:    getEnvBool("NEWAPI_REDIS_DISABLED", false),
 		AllowUnsafeBatchDelete: getEnvBool("ALLOW_UNSAFE_BATCH_DELETE", false),
 		AllowUnsafeHardDelete:  getEnvBool("ALLOW_UNSAFE_HARD_DELETE", false),
-		EnforceIPRecording:     getEnvBool("ENFORCE_IP_RECORDING", false),
-		NewAPIKey:              getEnvStrMulti([]string{"NEWAPI_API_KEY", "API_KEY"}, ""),
+		// Keep the legacy NEWAPI_API_KEY name as a compatibility alias, but never
+		// fall back to this tool's API_KEY. The two credentials protect different
+		// trust boundaries and must not be sent to each other's services.
+		NewAPIAdminAccessToken: getEnvStrMulti([]string{"NEWAPI_ADMIN_ACCESS_TOKEN", "NEWAPI_API_KEY"}, ""),
+		NewAPIAdminUserID:      getEnvInt("NEWAPI_ADMIN_USER_ID", 0),
+		ObservabilityToken:     getEnvStr("OBSERVABILITY_TOKEN", ""),
+		LogFreshnessMaxAge:     time.Duration(getEnvInt("LOG_FRESHNESS_MAX_SECONDS", 900)) * time.Second,
 
 		// Logging
 		LogFile:  getEnvStr("LOG_FILE", ""),
 		LogLevel: getEnvStr("LOG_LEVEL", "info"),
 
 		// Data
-		DataDir: getEnvStr("DATA_DIR", "./data"),
+		DataDir:       getEnvStr("DATA_DIR", "./data"),
+		ToolStorePath: getEnvStr("TOOL_STORE_PATH", ""),
 
 		// LinuxDo proxy
 		LinuxDoProxyURL: getEnvStrMulti([]string{"LINUXDO_PROXY_URL", "LINUXDO_PROXY"}, ""),
@@ -174,6 +199,13 @@ func Load() *Config {
 	if cfg.LoginMaxAttempts < 1 {
 		cfg.LoginMaxAttempts = 8
 	}
+	switch strings.ToLower(strings.TrimSpace(cfg.APIKeyRole)) {
+	case "viewer", "operator", "admin":
+		cfg.APIKeyRole = strings.ToLower(strings.TrimSpace(cfg.APIKeyRole))
+	default:
+		log.Error().Str("api_key_role", cfg.APIKeyRole).Msg("API_KEY_ROLE is invalid; API key authentication will be rejected")
+		cfg.APIKeyRole = ""
+	}
 	if cfg.LoginAttemptWindow <= 0 {
 		cfg.LoginAttemptWindow = 15 * time.Minute
 	}
@@ -194,6 +226,18 @@ func Load() *Config {
 	}
 	if cfg.PublicModelRequestsPerMinute < 1 || cfg.PublicModelRequestsPerMinute > 600 {
 		cfg.PublicModelRequestsPerMinute = 30
+	}
+	if cfg.RedemptionMaxQuotaPerCode <= 0 {
+		cfg.RedemptionMaxQuotaPerCode = defaultRedemptionMaxQuotaPerCode
+	}
+	if cfg.RedemptionMaxTotalQuota <= 0 {
+		cfg.RedemptionMaxTotalQuota = defaultRedemptionMaxTotalQuota
+	}
+	if cfg.LogFreshnessMaxAge < time.Minute || cfg.LogFreshnessMaxAge > 24*time.Hour {
+		cfg.LogFreshnessMaxAge = 15 * time.Minute
+	}
+	if strings.TrimSpace(cfg.ToolStorePath) == "" {
+		cfg.ToolStorePath = filepath.Join(cfg.DataDir, "control-plane.db")
 	}
 
 	// Set timezone
@@ -386,9 +430,25 @@ func getEnvStr(key, defaultVal string) string {
 	return defaultVal
 }
 
+func getEnvStrDefaultIfUnset(key, defaultVal string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return defaultVal
+}
+
 func getEnvInt(key string, defaultVal int) int {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return defaultVal
+}
+
+func getEnvInt64(key string, defaultVal int64) int64 {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
 			return i
 		}
 	}

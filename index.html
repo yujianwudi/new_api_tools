@@ -348,7 +348,17 @@
             z-index: 1;
         }
 
-        .segmented-control input { display: none; }
+        .segmented-control input {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+        }
+
+        .segmented-control input:focus-visible + span {
+            outline: 2px solid #c4b5fd;
+            outline-offset: 2px;
+        }
 
         .segmented-control input:checked + span {
             color: white;
@@ -756,14 +766,14 @@
         </header>
 
         <!-- 导航切换 -->
-        <div class="nav-tabs">
-            <button class="nav-item active" onclick="switchMainView('generator')" id="tab-generator">
+        <div class="nav-tabs" aria-label="兑换码工具视图">
+            <button type="button" class="nav-item active" aria-pressed="true" aria-controls="viewGenerator" onclick="switchMainView('generator')" id="tab-generator">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 2v8"></path><path d="M12 18v4"></path><path d="M4.93 4.93l1.41 1.41"></path><path d="M17.66 17.66l1.41 1.41"></path><path d="M2 12h8"></path><path d="M18 12h4"></path><path d="M4.93 19.07l1.41-1.41"></path><path d="M17.66 6.34l1.41-1.41"></path>
                 </svg>
                 生成器
             </button>
-            <button class="nav-item" onclick="switchMainView('history')" id="tab-history">
+            <button type="button" class="nav-item" aria-pressed="false" aria-controls="viewHistory" onclick="switchMainView('history')" id="tab-history">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline>
                 </svg>
@@ -772,7 +782,7 @@
         </div>
 
         <!-- 视图 1: 生成器 -->
-        <div id="viewGenerator" class="view-section active">
+        <div id="viewGenerator" class="view-section active" role="region" aria-labelledby="tab-generator">
             <div class="grid">
                 <!-- 基础信息 -->
                 <div class="form-group">
@@ -811,7 +821,7 @@
                 <!-- 数据库类型选择 -->
                 <div class="form-group grid-full">
                     <label>数据库类型</label>
-                    <div class="segmented-control" style="width: fit-content;">
+                    <div class="segmented-control" role="radiogroup" aria-label="数据库类型" style="width: fit-content;">
                         <label>
                             <input type="radio" name="dbType" value="mysql" checked>
                             <span>MySQL</span>
@@ -832,7 +842,7 @@
                             </svg>
                             额度设置
                         </div>
-                        <div class="segmented-control">
+                        <div class="segmented-control" role="radiogroup" aria-label="额度模式">
                             <label>
                                 <input type="radio" name="quotaMode" value="fixed" checked onchange="toggleQuotaMode()">
                                 <span>固定</span>
@@ -855,11 +865,11 @@
                                     <input type="number" id="fixedAmount" value="1" min="0" step="0.5" placeholder="输入金额">
                                 </div>
                                 <div class="chips">
-                                    <div class="chip" onclick="setFixedAmount(1)">$1</div>
-                                    <div class="chip" onclick="setFixedAmount(5)">$5</div>
-                                    <div class="chip" onclick="setFixedAmount(10)">$10</div>
-                                    <div class="chip" onclick="setFixedAmount(50)">$50</div>
-                                    <div class="chip" onclick="setFixedAmount(100)">$100</div>
+                                    <button type="button" class="chip" onclick="setFixedAmount(1)">$1</button>
+                                    <button type="button" class="chip" onclick="setFixedAmount(5)">$5</button>
+                                    <button type="button" class="chip" onclick="setFixedAmount(10)">$10</button>
+                                    <button type="button" class="chip" onclick="setFixedAmount(50)">$50</button>
+                                    <button type="button" class="chip" onclick="setFixedAmount(100)">$100</button>
                                 </div>
                                 <div class="hint">1 USD = 500,000 Token</div>
                             </div>
@@ -894,7 +904,7 @@
                             </svg>
                             过期时间
                         </div>
-                        <div class="segmented-control">
+                        <div class="segmented-control" role="radiogroup" aria-label="过期模式">
                             <label>
                                 <input type="radio" name="expireMode" value="never" checked onchange="toggleExpireMode()">
                                 <span>永久</span>
@@ -930,10 +940,10 @@
                                     <input type="number" id="expireDays" value="30" min="1" step="1" placeholder="有效天数">
                                 </div>
                                 <div class="chips">
-                                    <div class="chip" onclick="setExpireDays(7)">7天</div>
-                                    <div class="chip" onclick="setExpireDays(30)">30天</div>
-                                    <div class="chip" onclick="setExpireDays(90)">90天</div>
-                                    <div class="chip" onclick="setExpireDays(365)">1年</div>
+                                    <button type="button" class="chip" onclick="setExpireDays(7)">7天</button>
+                                    <button type="button" class="chip" onclick="setExpireDays(30)">30天</button>
+                                    <button type="button" class="chip" onclick="setExpireDays(90)">90天</button>
+                                    <button type="button" class="chip" onclick="setExpireDays(365)">1年</button>
                                 </div>
                             </div>
                         </div>
@@ -993,7 +1003,7 @@
         </div>
 
         <!-- 视图 2: 历史记录 -->
-        <div id="viewHistory" class="view-section history-container">
+        <div id="viewHistory" class="view-section history-container" role="region" aria-labelledby="tab-history" hidden>
              <div class="history-header">
                  <div class="history-stats">
                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1013,7 +1023,7 @@
     </div>
 
     <!-- Toast 通知 -->
-    <div id="toast" class="toast">
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true">
         <div id="toastIcon"></div>
         <span id="toastMsg">操作成功</span>
     </div>
@@ -1028,6 +1038,7 @@
         const KEY_REJECTION_LIMIT = Math.floor(256 / KEY_RANDOM_ALPHABET.length) * KEY_RANDOM_ALPHABET.length;
         const MAX_QUOTA_VALUE = 2147483647;
         let redemptionHistory = [];
+        let toastTimer = null;
         // v0.2.0 no longer persists bearer keys/SQL in localStorage. Remove
         // legacy plaintext history left by earlier versions.
         try { localStorage.removeItem('redemption_history'); } catch (_) {}
@@ -1035,16 +1046,26 @@
         // --- 视图切换逻辑 ---
         function switchMainView(viewName) {
             // 更新 Tab 状态
-            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            document.getElementById(`tab-${viewName}`).classList.add('active');
+            document.querySelectorAll('.nav-item').forEach(el => {
+                const active = el.id === `tab-${viewName}`;
+                el.classList.toggle('active', active);
+                el.setAttribute('aria-pressed', String(active));
+            });
 
             // 更新视图显示
-            document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.view-section').forEach(el => {
+                el.classList.remove('active');
+                el.hidden = true;
+            });
             
             if (viewName === 'generator') {
-                document.getElementById('viewGenerator').classList.add('active');
+                const generatorView = document.getElementById('viewGenerator');
+                generatorView.hidden = false;
+                generatorView.classList.add('active');
             } else {
-                document.getElementById('viewHistory').classList.add('active');
+                const historyView = document.getElementById('viewHistory');
+                historyView.hidden = false;
+                historyView.classList.add('active');
                 HistoryManager.render(); // 切换时刷新列表
             }
         }
@@ -1052,9 +1073,15 @@
         // --- 历史记录管理 ---
         const HistoryManager = {
             save: (record) => {
-                redemptionHistory.unshift(record);
+                redemptionHistory.unshift({
+                    id: record.id,
+                    timestamp: record.timestamp,
+                    name: record.name,
+                    count: record.count,
+                    desc: record.desc,
+                });
                 if (redemptionHistory.length > MAX_HISTORY) redemptionHistory.pop();
-                // 敏感 Key/SQL 只保留在当前页面内存中，刷新或关闭页面即清除。
+                // 历史对象只保留非敏感元数据；Key 与 SQL 不进入历史记录。
             },
             
             load: () => {
@@ -1102,23 +1129,11 @@
                                 <div class="history-meta">
                                     <span class="meta-badge">${new Date(item.timestamp).toLocaleString()}</span>
                                     <span class="meta-badge">${item.count} 个</span>
-                                    <span class="meta-badge" style="color:#818cf8">${item.desc}</span>
+                                    <span class="meta-badge" style="color:#818cf8">${escapeHtml(item.desc)}</span>
                                 </div>
                             </div>
                         </div>
                         <div class="history-actions">
-                            <button class="btn-xs" onclick="copyHistorySQL('${item.id}')">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                复制 SQL
-                            </button>
-                            <button class="btn-xs" onclick="copyHistoryKeys('${item.id}')">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                                复制 Keys
-                            </button>
-                            <button class="btn-xs" onclick="downloadHistoryKeys('${item.id}')">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                                下载
-                            </button>
                             <button class="btn-xs delete" onclick="HistoryManager.delete('${item.id}')" style="margin-left: auto;">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                                 删除
@@ -1139,43 +1154,6 @@
         function confirmClearHistory() {
             if(confirm('确定要清空所有历史记录吗？')) {
                 HistoryManager.clear();
-            }
-        }
-
-        // 历史记录操作动作
-        function copyHistorySQL(id) {
-            const item = HistoryManager.load().find(i => i.id === id);
-            if(item && item.sql) {
-                navigator.clipboard.writeText(item.sql).then(() => {
-                    showToast('SQL 语句已复制到剪贴板');
-                }).catch(() => {
-                    showToast('复制失败，请手动复制', 'error');
-                });
-            }
-        }
-
-        function copyHistoryKeys(id) {
-            const item = HistoryManager.load().find(i => i.id === id);
-            if(item && item.keys) {
-                navigator.clipboard.writeText(item.keys.join('\n')).then(() => {
-                    showToast(`已复制 ${item.keys.length} 个 Key`);
-                });
-            }
-        }
-
-        function downloadHistoryKeys(id) {
-            const item = HistoryManager.load().find(i => i.id === id);
-            if(item && item.keys) {
-                 const filename = `${item.name}_${new Date(item.timestamp).toISOString().slice(0,10).replace(/-/g,'')}.txt`;
-                 const blob = new Blob([item.keys.join('\n')], { type: 'text/plain' });
-                 const url = URL.createObjectURL(blob);
-                 const a = document.createElement('a');
-                 a.href = url;
-                 a.download = filename;
-                 document.body.appendChild(a);
-                 a.click();
-                 document.body.removeChild(a);
-                 URL.revokeObjectURL(url);
             }
         }
 
@@ -1360,10 +1338,14 @@
             
             iconDiv.innerHTML = iconHtml;
             msgSpan.textContent = msg;
+            toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+            toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
             toast.className = 'toast show';
 
-            setTimeout(() => {
+            if (toastTimer !== null) clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => {
                 toast.classList.remove('show');
+                toastTimer = null;
             }, 3000);
         }
         
@@ -1513,12 +1495,36 @@
                 timestamp: Date.now(),
                 name: name,
                 count: count,
-                desc: desc,
-                keys: [...generatedKeys], // 创建副本
-                sql: sql
+                desc: desc
             });
 
             showToast(`成功生成 ${count} 个兑换码！`);
+        }
+
+        async function copyText(text) {
+            try {
+                if (navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                }
+            } catch (_) {
+                // Fall through to the local textarea path when permission is denied.
+            }
+
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                return document.execCommand('copy');
+            } catch (_) {
+                return false;
+            } finally {
+                document.body.removeChild(textarea);
+            }
         }
 
         function copyToClipboard() {
@@ -1527,9 +1533,9 @@
                 showToast('请先生成内容', 'error');
                 return;
             }
-            output.select();
-            document.execCommand('copy');
-            showToast('已复制 SQL 到剪贴板');
+            copyText(output.value).then(copied => {
+                showToast(copied ? '已复制 SQL 到剪贴板' : '复制失败，请手动复制', copied ? 'success' : 'error');
+            });
         }
 
         function copyKeys() {
@@ -1538,8 +1544,8 @@
                 return;
             }
             const keysText = generatedKeys.join('\n');
-            navigator.clipboard.writeText(keysText).then(() => {
-                 showToast(`已复制 ${generatedKeys.length} 个 Key`);
+            copyText(keysText).then(copied => {
+                showToast(copied ? `已复制 ${generatedKeys.length} 个 Key` : '复制失败，请手动复制', copied ? 'success' : 'error');
             });
         }
         

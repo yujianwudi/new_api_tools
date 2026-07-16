@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -68,6 +69,39 @@ func TestListCodesUsesDatabaseStatusAsPrimaryState(t *testing.T) {
 		if got[id] != status {
 			t.Fatalf("redemption %d status = %q, want %q", id, got[id], status)
 		}
+	}
+}
+
+func TestListCodesNeverReturnsStoredRedemptionKey(t *testing.T) {
+	installRedemptionSchema(t)
+	db := database.Get().DB
+	const rawKey = "sk-redemption-secret-value"
+	if _, err := db.Exec(`INSERT INTO redemptions
+		(id, user_id, key, status, name, quota, created_time, redeemed_time, used_user_id, expired_time)
+		VALUES (1, 1, ?, 1, 'sensitive', 500000, 1, 0, 0, 0)`, rawKey); err != nil {
+		t.Fatalf("insert redemption: %v", err)
+	}
+
+	result, err := ListCodes(ListRedemptionParams{Page: 1, PageSize: 20})
+	if err != nil {
+		t.Fatalf("ListCodes returned error: %v", err)
+	}
+	if len(result.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(result.Items))
+	}
+	item := result.Items[0]
+	if item.Key == rawKey || !strings.HasPrefix(item.Key, "redacted:") {
+		t.Fatalf("redemption key was not redacted: %q", item.Key)
+	}
+	if len(item.KeyFingerprint) != 64 || strings.Contains(item.KeyFingerprint, rawKey) {
+		t.Fatalf("invalid key fingerprint: %q", item.KeyFingerprint)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if strings.Contains(string(encoded), rawKey) {
+		t.Fatalf("stored redemption key leaked in response JSON: %s", encoded)
 	}
 }
 

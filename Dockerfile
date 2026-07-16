@@ -7,10 +7,8 @@
 #   - Go 编译缓存: /root/.cache/go-build
 #   使用 docker buildx build 或 DOCKER_BUILDKIT=1 启用缓存挂载
 
-# syntax=docker/dockerfile:1
-
 # Stage 1: 构建前端
-FROM node:22-alpine3.23 AS frontend-builder
+FROM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS frontend-builder
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -19,8 +17,11 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: 构建 Go 后端
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23 AS backend-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS backend-builder
 ARG TARGETARCH
+ARG APP_VERSION=0.5.0
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
 WORKDIR /build
 RUN apk add --no-cache git ca-certificates tzdata
 
@@ -34,12 +35,12 @@ COPY backend/ .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X github.com/new-api-tools/backend/internal/buildinfo.Version=${APP_VERSION} -X github.com/new-api-tools/backend/internal/buildinfo.Commit=${VCS_REF} -X github.com/new-api-tools/backend/internal/buildinfo.BuildDate=${BUILD_DATE}" \
     -o /build/server \
     ./cmd/server
 
 # Stage 3: 最终镜像 (Nginx + Go binary)
-FROM alpine:3.23.5
+FROM alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 WORKDIR /app
 
 # 安装 Nginx 和运行时依赖
@@ -62,19 +63,19 @@ RUN addgroup -S -g 10001 appgroup && \
     chown -R nginx:nginx /run/nginx /var/lib/nginx /var/log/nginx && \
     chmod 755 /app/data
 
-# 预下载 GeoIP 数据库（多镜像源，任一成功即可；失败不阻塞构建，运行时会自动重试）
-# 注意: docker-compose 挂载 ./data:/app/data 时，此预下载文件会被覆盖
-#       Go 后端会在运行时自动检测并下载缺失的数据库
-RUN curl -sL --connect-timeout 30 --max-time 120 \
-    -o /app/data/geoip/GeoLite2-City.mmdb \
-    "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb" \
-    || curl -sL --connect-timeout 30 --max-time 120 \
-    -o /app/data/geoip/GeoLite2-City.mmdb \
-    "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb" \
-    || curl -sL --connect-timeout 30 --max-time 120 \
-    -o /app/data/geoip/GeoLite2-City.mmdb \
-    "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb" \
-    || echo "[GeoIP] Build-time download failed, will auto-download at runtime"
+# Bundle one immutable, checksum-verified GeoIP snapshot outside /app/data so
+# the persistent data volume cannot hide it. Runtime network updates are off by
+# default and require explicit GEOIP_AUTO_DOWNLOAD/GEOIP_AUTO_UPDATE opt-in.
+ARG GEOIP_SOURCE_COMMIT=a83d44508ee6831c2770b2c4be91f9850ec429d7
+ARG GEOIP_SHA256=168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf
+RUN mkdir -p /usr/share/GeoIP && \
+    (curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 120 \
+       -o /usr/share/GeoIP/GeoLite2-City.mmdb \
+       "https://raw.githubusercontent.com/adysec/IP_database/${GEOIP_SOURCE_COMMIT}/geolite/GeoLite2-City.mmdb" || \
+     curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 30 --max-time 120 \
+       -o /usr/share/GeoIP/GeoLite2-City.mmdb \
+       "https://cdn.jsdelivr.net/gh/adysec/IP_database@${GEOIP_SOURCE_COMMIT}/geolite/GeoLite2-City.mmdb") && \
+    echo "${GEOIP_SHA256}  /usr/share/GeoIP/GeoLite2-City.mmdb" | sha256sum -c -
 
 RUN chown -R appuser:appgroup /app/data
 
@@ -101,6 +102,9 @@ stderr_logfile=/dev/stderr\nstderr_logfile_maxbytes=0\n' > /etc/supervisord.conf
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl --fail --silent --show-error http://localhost:8080/api/health || exit 1
+    CMD ready="$(curl --fail --silent --show-error http://localhost:8080/readyz 2>/dev/null)" && \
+      printf '%s' "$ready" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' && \
+      printf '%s' "$ready" | grep -Eq '"main_database"[[:space:]]*:[[:space:]]*"ok"' && \
+      printf '%s' "$ready" | grep -Eq '"tool_store"[[:space:]]*:[[:space:]]*"ok"'
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]

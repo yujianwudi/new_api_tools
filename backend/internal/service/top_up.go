@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/util"
 )
@@ -373,17 +375,89 @@ func ListTopUpRecords(params ListTopUpParams) (*PaginatedTopUps, error) {
 	}, nil
 }
 
-// CountTopUps returns the total number of top-ups matching the filter.
-// Used by ExportTopUpsToCSV to enforce the export size cap before streaming.
-func CountTopUps(params ListTopUpParams) (int64, error) {
+// TopUpExportSnapshot is the immutable database view used by one export. The
+// count and stream share the same read transaction, while MaxID is also pinned
+// into the SELECT as an explicit monotonic boundary.
+type TopUpExportSnapshot struct {
+	Total int64
+	MaxID int64
+}
+
+// TopUpExportResult reports what was actually accepted by the CSV writer. A
+// truncated result must never be presented or audited as a complete export.
+type TopUpExportResult struct {
+	RowsWritten int64
+	Truncated   bool
+}
+
+// TopUpExportPlan keeps the count and stream on one repeatable-read snapshot.
+// Call Close on every path, including size-limit and audit-precondition exits.
+type TopUpExportPlan struct {
+	Snapshot      TopUpExportSnapshot
+	tx            *sqlx.Tx
+	whereSQL      string
+	whereArgs     []interface{}
+	selectColumns string
+	maxIDArg      string
+}
+
+// PrepareTopUpExport establishes the fixed export snapshot before response
+// headers are sent, allowing the handler to reject oversized requests without
+// racing a later streaming query.
+func PrepareTopUpExport(ctx context.Context, params ListTopUpParams) (*TopUpExportPlan, error) {
 	db := database.Get()
-	whereSQL, args, _ := buildTopUpWhere(params)
-	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM top_ups t LEFT JOIN users u ON t.user_id = u.id WHERE %s", whereSQL)
-	var total int64
-	if err := db.DB.Get(&total, countSQL, args...); err != nil {
-		return 0, fmt.Errorf("count query failed: %w", err)
+	whereSQL, args, nextArg := buildTopUpWhere(params)
+	selectColumns := topUpSelectColumns()
+
+	options := &sql.TxOptions{ReadOnly: true}
+	// Production uses MySQL or PostgreSQL. SQLite-backed unit tests leave Config
+	// nil and use the driver's default serializable read transaction.
+	if db.Config != nil {
+		options.Isolation = sql.LevelRepeatableRead
 	}
-	return total, nil
+	tx, err := db.DB.BeginTxx(ctx, options)
+	if err != nil {
+		return nil, fmt.Errorf("begin export snapshot: %w", err)
+	}
+
+	plan := &TopUpExportPlan{
+		tx:            tx,
+		whereSQL:      whereSQL,
+		whereArgs:     append([]interface{}(nil), args...),
+		selectColumns: selectColumns,
+		maxIDArg:      db.Placeholder(nextArg),
+	}
+	countSQL := fmt.Sprintf("SELECT COUNT(*), COALESCE(MAX(t.id), 0) FROM top_ups t LEFT JOIN users u ON t.user_id = u.id WHERE %s", whereSQL)
+	if err := tx.QueryRowxContext(ctx, countSQL, args...).Scan(&plan.Snapshot.Total, &plan.Snapshot.MaxID); err != nil {
+		_ = plan.Close()
+		return nil, fmt.Errorf("count export snapshot: %w", err)
+	}
+	return plan, nil
+}
+
+// Close releases the read snapshot. The transaction is read-only, so rollback
+// is the correct cheap close operation even after a successful stream.
+func (p *TopUpExportPlan) Close() error {
+	if p == nil || p.tx == nil {
+		return nil
+	}
+	tx := p.tx
+	p.tx = nil
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return err
+	}
+	return nil
+}
+
+// CountTopUps returns a count from a fixed snapshot. Export handlers should use
+// PrepareTopUpExport directly so the same snapshot remains open for streaming.
+func CountTopUps(params ListTopUpParams) (int64, error) {
+	plan, err := PrepareTopUpExport(context.Background(), params)
+	if err != nil {
+		return 0, err
+	}
+	defer plan.Close()
+	return plan.Snapshot.Total, nil
 }
 
 // ErrExportTooLarge is returned when an export request exceeds the row cap.
@@ -400,13 +474,26 @@ var TopUpExportLimit int64 = 100000
 // responsible for setting response headers and (recommended) running CountTopUps
 // first to short-circuit oversized exports — this function only flips on the
 // limit if the count exceeds it mid-stream.
-func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams) error {
-	db := database.Get()
-	whereSQL, args, _ := buildTopUpWhere(params)
+func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams) (TopUpExportResult, error) {
+	plan, err := PrepareTopUpExport(ctx, params)
+	if err != nil {
+		return TopUpExportResult{Truncated: true}, err
+	}
+	defer plan.Close()
+	return plan.WriteCSV(ctx, w)
+}
+
+// WriteCSV streams the prepared snapshot and returns the actual written-row
+// count. Scan, iterator, context, and writer errors fail immediately.
+func (p *TopUpExportPlan) WriteCSV(ctx context.Context, w io.Writer) (TopUpExportResult, error) {
+	result := TopUpExportResult{}
+	if p == nil || p.tx == nil {
+		return TopUpExportResult{Truncated: true}, errors.New("top-up export plan is closed")
+	}
 
 	// UTF-8 BOM so Excel (especially zh-CN locale) auto-detects encoding.
 	if _, err := w.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
-		return err
+		return TopUpExportResult{Truncated: true}, err
 	}
 
 	csvW := csv.NewWriter(w)
@@ -416,28 +503,35 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 		"交易号", "支付方式", "支付渠道", "状态", "归一状态", "完成耗时(秒)", "异常标记", "创建时间", "完成时间",
 	}
 	if err := csvW.Write(header); err != nil {
-		return err
+		return TopUpExportResult{Truncated: true}, err
 	}
 
-	selectSQL := fmt.Sprintf(`SELECT %s FROM top_ups t LEFT JOIN users u ON t.user_id = u.id WHERE %s ORDER BY t.create_time DESC`, topUpSelectColumns(), whereSQL)
+	boundedWhereSQL := fmt.Sprintf("(%s) AND t.id <= %s", p.whereSQL, p.maxIDArg)
+	args := append(append([]interface{}(nil), p.whereArgs...), p.Snapshot.MaxID)
+	selectSQL := fmt.Sprintf(`SELECT %s FROM top_ups t LEFT JOIN users u ON t.user_id = u.id WHERE %s ORDER BY t.create_time DESC, t.id DESC`, p.selectColumns, boundedWhereSQL)
 
-	rows, err := db.DB.QueryxContext(ctx, selectSQL, args...)
+	rows, err := p.tx.QueryxContext(ctx, selectSQL, args...)
 	if err != nil {
-		return fmt.Errorf("export query failed: %w", err)
+		return TopUpExportResult{Truncated: true}, fmt.Errorf("export query failed: %w", err)
 	}
 	defer rows.Close()
 
-	var written int64
 	now := time.Now().Unix()
 	for rows.Next() {
+		if result.RowsWritten >= TopUpExportLimit {
+			result.Truncated = true
+			break
+		}
 		// Surface ctx cancellation (timeout / client disconnect) without finishing the loop.
 		if err := ctx.Err(); err != nil {
-			return err
+			result.Truncated = true
+			return result, err
 		}
 
 		var rec TopUpRecord
 		if err := rows.StructScan(&rec); err != nil {
-			continue
+			result.Truncated = true
+			return result, fmt.Errorf("scan export row: %w", err)
 		}
 		enrichTopUpRecord(&rec, now, defaultPendingAnomalyHours)
 
@@ -470,29 +564,37 @@ func ExportTopUpsToCSV(ctx context.Context, w io.Writer, params ListTopUpParams)
 			createTimeStr,
 			completeTimeStr,
 		}); err != nil {
-			return err
+			result.Truncated = true
+			return result, err
 		}
 
-		written++
-		if written >= TopUpExportLimit {
+		result.RowsWritten++
+		if result.RowsWritten >= TopUpExportLimit {
 			// 写满上限就停手，不再吐第 100001 行 —— handler 的 CountTopUps 预检通常已经
 			// 把超限请求挡在 400 上，这里只是兜底 race（count 之后又有新插入）。
 			break
 		}
 		// Periodic flush so the browser begins receiving bytes promptly.
-		if written%500 == 0 {
+		if result.RowsWritten%500 == 0 {
 			csvW.Flush()
 			if err := csvW.Error(); err != nil {
-				return err
+				result.Truncated = true
+				return result, err
 			}
 		}
 	}
 
 	if err := rows.Err(); err != nil {
-		return err
+		result.Truncated = true
+		return result, fmt.Errorf("iterate export rows: %w", err)
 	}
 	csvW.Flush()
-	return csvW.Error()
+	if err := csvW.Error(); err != nil {
+		result.Truncated = true
+		return result, err
+	}
+	result.Truncated = result.Truncated || result.RowsWritten != p.Snapshot.Total
+	return result, nil
 }
 
 // GetTopUpStatistics returns aggregate top-up statistics

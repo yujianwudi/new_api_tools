@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,18 +34,6 @@ func TestGenerateRandomSecretFailsClosedWhenEntropyUnavailable(t *testing.T) {
 	_ = generateRandomSecret(32)
 }
 
-func TestIPRecordingEnforcementIsExplicitOptIn(t *testing.T) {
-	t.Setenv("ENFORCE_IP_RECORDING", "")
-	if loaded := Load(); loaded.EnforceIPRecording {
-		t.Fatal("IP recording enforcement must be disabled by default")
-	}
-
-	t.Setenv("ENFORCE_IP_RECORDING", "true")
-	if loaded := Load(); !loaded.EnforceIPRecording {
-		t.Fatal("explicit ENFORCE_IP_RECORDING=true was not honored")
-	}
-}
-
 func TestLoadPreservesLoginBackoffMaxBaseInvariant(t *testing.T) {
 	t.Setenv("JWT_SECRET_KEY", "test-secret")
 	t.Setenv("LOGIN_BACKOFF_BASE_MS", "60000")
@@ -55,6 +45,56 @@ func TestLoadPreservesLoginBackoffMaxBaseInvariant(t *testing.T) {
 	}
 	if loaded.LoginBackoffMax != loaded.LoginBackoffBase {
 		t.Fatalf("LoginBackoffMax = %s, want at least base %s", loaded.LoginBackoffMax, loaded.LoginBackoffBase)
+	}
+}
+
+func TestAPIKeyRoleIsValidated(t *testing.T) {
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("API_KEY_ROLE", "viewer")
+	if role := Load().APIKeyRole; role != "viewer" {
+		t.Fatalf("APIKeyRole = %q", role)
+	}
+	t.Setenv("API_KEY_ROLE", "superuser")
+	if role := Load().APIKeyRole; role != "" {
+		t.Fatalf("invalid APIKeyRole = %q, want fail-closed empty role", role)
+	}
+	t.Setenv("API_KEY_ROLE", "")
+	if role := Load().APIKeyRole; role != "" {
+		t.Fatalf("empty APIKeyRole = %q, want fail-closed empty role", role)
+	}
+}
+
+func TestAPIKeyRoleDefaultsToViewerWhenUnset(t *testing.T) {
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("API_KEY_ROLE", "temporary")
+	if err := os.Unsetenv("API_KEY_ROLE"); err != nil {
+		t.Fatal(err)
+	}
+	if role := Load().APIKeyRole; role != "viewer" {
+		t.Fatalf("default APIKeyRole = %q, want viewer", role)
+	}
+}
+
+func TestObservabilityDefaultsAreFailClosedAndBounded(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("OBSERVABILITY_TOKEN", "")
+	t.Setenv("LOG_FRESHNESS_MAX_SECONDS", "1")
+	t.Setenv("DATA_DIR", dataDir)
+	t.Setenv("TOOL_STORE_PATH", "")
+
+	loaded := Load()
+	if loaded.ObservabilityToken != "" {
+		t.Fatal("metrics token must be empty unless explicitly configured")
+	}
+	if loaded.LogFreshnessMaxAge != 15*time.Minute {
+		t.Fatalf("freshness max age = %s, want bounded default", loaded.LogFreshnessMaxAge)
+	}
+	if loaded.DataDir != dataDir {
+		t.Fatalf("data dir = %q, want %q", loaded.DataDir, dataDir)
+	}
+	if loaded.ToolStorePath != filepath.Join(loaded.DataDir, "control-plane.db") {
+		t.Fatalf("tool store path = %q", loaded.ToolStorePath)
 	}
 }
 

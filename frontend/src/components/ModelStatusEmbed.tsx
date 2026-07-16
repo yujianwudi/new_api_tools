@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '../lib/utils'
+import { chunkModelNames, normalizeModelStatusMaxBatch } from '../lib/modelStatusBatch'
 import { Loader2, Timer, Activity, Zap, Sun, Moon, Minimize2, Terminal, Leaf, Droplets, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, Layers, Tag, KeyRound, ChevronDown } from 'lucide-react'
 import {
   OpenAI, Gemini, DeepSeek, SiliconCloud, Groq, Ollama, Claude, Mistral,
@@ -876,11 +877,14 @@ interface ModelStatusEmbedProps {
   defaultTheme?: ThemeId
 }
 
+const PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH = 50
+
 export function ModelStatusEmbed({
   refreshInterval: defaultRefreshInterval = 60,
   defaultTheme,
 }: ModelStatusEmbedProps) {
   const [selectedModels, setSelectedModels] = useState<string[]>([])
+  const [maxBatch, setMaxBatch] = useState(PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
   const [loading, setLoading] = useState(true)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -892,6 +896,8 @@ export function ModelStatusEmbed({
   const [tokenGroups, setTokenGroups] = useState<EmbedTokenGroup[]>([])
   const [groupFilter, setGroupFilter] = useState('all')
   const [siteTitle, setSiteTitle] = useState('')
+  const statusRequestIdRef = useRef(0)
+  const statusRequestControllerRef = useRef<AbortController | null>(null)
 
   // Tooltip state - lifted to parent to avoid z-index/transform issues
   const [hoveredSlot, setHoveredSlot] = useState<SlotStatus | null>(null)
@@ -910,12 +916,16 @@ export function ModelStatusEmbed({
   }, [])
 
   // Load config from backend
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (signal: AbortSignal) => {
     try {
-      const response = await fetch(`${apiUrl}/api/model-status/embed/config/selected`)
+      const response = await fetch(`${apiUrl}/api/model-status/embed/config/selected`, { signal })
       const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
+      }
+      setMaxBatch(normalizeModelStatusMaxBatch(data.max_batch, PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH))
       if (data.success) {
-        if (Array.isArray(data.data) && data.data.length > 0) {
+        if (Array.isArray(data.data)) {
           setSelectedModels(data.data)
         }
         if (data.time_window) {
@@ -943,25 +953,34 @@ export function ModelStatusEmbed({
         }
         // 加载令牌分组
         try {
-          const tgResponse = await fetch(`${apiUrl}/api/model-status/embed/token-groups`)
+          const tgResponse = await fetch(`${apiUrl}/api/model-status/embed/token-groups`, { signal })
           const tgData = await tgResponse.json()
-          if (tgData.success && Array.isArray(tgData.data)) {
+          if (tgResponse.ok && tgData.success && Array.isArray(tgData.data)) {
             setTokenGroups(tgData.data)
           }
-        } catch {
+        } catch (error) {
+          if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return []
           // 令牌分组加载失败不影响主流程
         }
         return data.data || []
       }
     } catch (error) {
+      if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return []
       console.error('Failed to load config from backend:', error)
     }
     return []
   }, [apiUrl])
 
   useEffect(() => {
-    loadConfig()
+    const controller = new AbortController()
+    void loadConfig(controller.signal)
+    return () => controller.abort()
   }, [loadConfig])
+
+  useEffect(() => () => {
+    statusRequestIdRef.current += 1
+    statusRequestControllerRef.current?.abort()
+  }, [])
 
   // Fetch model statuses
   // Embed page always uses cache to reduce database load
@@ -975,30 +994,47 @@ export function ModelStatusEmbed({
       return tg ? tg.models : []
     })()
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
+    const requestId = ++statusRequestIdRef.current
+    statusRequestControllerRef.current?.abort()
 
     if (fetchSet.length === 0) {
+      statusRequestControllerRef.current = null
       setModelStatuses([])
       setLoading(false)
       return
     }
 
+    const controller = new AbortController()
+    statusRequestControllerRef.current = controller
     try {
-      const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${timeWindow}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(fetchSet),
-      })
-      const data = await response.json()
-      if (data.success) {
-        setModelStatuses(data.data ?? [])
-        setLastUpdate(new Date())
-      }
+      const chunkResults = await Promise.all(chunkModelNames(fetchSet, maxBatch).map(async modelNames => {
+        const response = await fetch(`${apiUrl}/api/model-status/embed/status/batch?window=${timeWindow}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(modelNames),
+          signal: controller.signal,
+        })
+        const data = await response.json()
+        if (!response.ok || !data.success) {
+          throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
+        }
+        if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
+        return data.data as ModelStatus[]
+      }))
+      if (requestId !== statusRequestIdRef.current) return
+      setModelStatuses(chunkResults.flat())
+      setLastUpdate(new Date())
     } catch (error) {
+      if (controller.signal.aborted || requestId !== statusRequestIdRef.current || (error instanceof DOMException && error.name === 'AbortError')) return
+      controller.abort()
       console.error('Failed to fetch model statuses:', error)
     } finally {
-      setLoading(false)
+      if (requestId === statusRequestIdRef.current) {
+        statusRequestControllerRef.current = null
+        setLoading(false)
+      }
     }
-  }, [apiUrl, selectedModels, timeWindow, groupFilter, tokenGroups])
+  }, [apiUrl, selectedModels, timeWindow, groupFilter, tokenGroups, maxBatch])
 
   useEffect(() => {
     fetchModelStatuses()

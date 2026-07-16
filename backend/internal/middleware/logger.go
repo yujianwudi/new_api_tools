@@ -13,7 +13,7 @@ func RequestLoggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Skip logging for health check endpoints
 		path := c.Request.URL.Path
-		if path == "/api/health" || path == "/api/health/db" {
+		if path == "/api/health" || path == "/api/health/db" || path == "/livez" || path == "/readyz" || path == "/metrics" {
 			c.Next()
 			return
 		}
@@ -28,18 +28,19 @@ func RequestLoggerMiddleware() gin.HandlerFunc {
 		duration := time.Since(start)
 		statusCode := c.Writer.Status()
 		method := c.Request.Method
+		requestID := RequestID(c)
 
 		// Log based on status code (matching Python's behavior)
 		switch {
 		case statusCode >= 500:
-			logger.L.APIError(method, path, statusCode, "服务器内部错误", clientIP)
+			logger.L.APIError(method, path, statusCode, "服务器内部错误", clientIP, requestID)
 		case statusCode == 401:
 			// 401 is normal flow (token expired etc), use WARN level
-			logger.L.APIWarn(method, path, statusCode, "认证失败", clientIP)
+			logger.L.APIWarn(method, path, statusCode, "认证失败", clientIP, requestID)
 		case statusCode >= 400:
-			logger.L.APIError(method, path, statusCode, "客户端错误", clientIP)
+			logger.L.APIError(method, path, statusCode, "客户端错误", clientIP, requestID)
 		default:
-			logger.L.API(method, path, statusCode, duration, clientIP)
+			logger.L.API(method, path, statusCode, duration, clientIP, requestID)
 		}
 	}
 }

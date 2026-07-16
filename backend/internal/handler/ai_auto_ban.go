@@ -46,29 +46,20 @@ func GetAIBanConfig(c *gin.Context) {
 
 // POST /api/ai-ban/config
 func SaveAIBanConfig(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
-	var req map[string]interface{}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
-		return
-	}
-	svc := service.NewAIAutoBanService()
-	if err := svc.SaveConfig(c.Request.Context(), req); err != nil {
-		respondHandlerError(c, http.StatusBadRequest, "SAVE_ERROR", "Unable to save AI auto-ban configuration", "AI auto-ban configuration save", err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "配置已保存",
-		"data":    svc.GetConfig(),
-	})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"AUDITED_CONFIGURATION_REQUIRED",
+		"AI auto-ban configuration is read-only until it is migrated to the audited Tool Store",
+		"",
+	))
 }
 
 // POST /api/ai-ban/reset-api-health
 func ResetAPIHealth(c *gin.Context) {
-	svc := service.NewAIAutoBanService()
-	data := svc.ResetAPIHealth()
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"AUDITED_CONFIGURATION_REQUIRED",
+		"AI provider health mutation is disabled until it is recorded in the Tool Store",
+		"",
+	))
 }
 
 // GET /api/ai-ban/audit-logs
@@ -87,9 +78,11 @@ func GetAuditLogs(c *gin.Context) {
 
 // DELETE /api/ai-ban/audit-logs
 func ClearAuditLogs(c *gin.Context) {
-	svc := service.NewAIAutoBanService()
-	data := svc.ClearAuditLogs()
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"APPEND_ONLY_AUDIT_REQUIRED",
+		"Legacy AI audit deletion is disabled; v0.5 audit records are append-only",
+		"",
+	))
 }
 
 // GET /api/ai-ban/groups
@@ -147,9 +140,11 @@ func ManualAssess(c *gin.Context) {
 	if req.Window == "" {
 		req.Window = "1h"
 	}
-	svc := service.NewAIAutoBanService()
-	data := svc.ManualAssess(req.UserID, req.Window)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NOT_IMPLEMENTED",
+		"AI user assessment is not implemented",
+		"",
+	))
 }
 
 // POST /api/ai-ban/scan
@@ -159,18 +154,20 @@ func RunAIBanScan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
 		return
 	}
-	limit := parseLimit(c, 10, 100)
-
-	svc := service.NewAIAutoBanService()
-	data := svc.RunScan(window, limit)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NOT_IMPLEMENTED",
+		"AI risk scanning is not implemented",
+		"",
+	))
 }
 
 // POST /api/ai-ban/test-connection
 func TestAIConnection(c *gin.Context) {
-	svc := service.NewAIAutoBanService()
-	data := svc.TestConnection(c.Request.Context())
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NOT_IMPLEMENTED",
+		"AI connection testing is not implemented",
+		"",
+	))
 }
 
 // GET /api/ai-ban/whitelist
@@ -182,30 +179,20 @@ func GetAIBanWhitelist(c *gin.Context) {
 
 // POST /api/ai-ban/whitelist/add
 func AddToAIBanWhitelist(c *gin.Context) {
-	var req struct {
-		UserID int64 `json:"user_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	svc := service.NewAIAutoBanService()
-	data := svc.AddToWhitelist(req.UserID)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"RISK_CASE_WORKFLOW_REQUIRED",
+		"AI whitelist mutation is disabled; record reviewed exceptions as Tool Store risk cases",
+		"",
+	))
 }
 
 // POST /api/ai-ban/whitelist/remove
 func RemoveFromAIBanWhitelist(c *gin.Context) {
-	var req struct {
-		UserID int64 `json:"user_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	svc := service.NewAIAutoBanService()
-	data := svc.RemoveFromWhitelist(req.UserID)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"RISK_CASE_WORKFLOW_REQUIRED",
+		"AI whitelist mutation is disabled; record reviewed exceptions as Tool Store risk cases",
+		"",
+	))
 }
 
 // GET /api/ai-ban/whitelist/search
@@ -226,34 +213,18 @@ func SearchUserForAIWhitelist(c *gin.Context) {
 
 // POST /api/ai-ban/models or /api/ai-ban/fetch-models
 func FetchAIModels(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
-	var req struct {
-		BaseURL      string `json:"base_url"`
-		APIKey       string `json:"api_key"`
-		ForceRefresh bool   `json:"force_refresh"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
-		return
-	}
-	svc := service.NewAIAutoBanService()
-	result := svc.FetchModels(c.Request.Context(), req.BaseURL, req.APIKey, req.ForceRefresh)
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"AUDITED_EXTERNAL_CALL_REQUIRED",
+		"External AI model discovery is disabled until intent and outcome auditing is available",
+		"",
+	))
 }
 
 // POST /api/ai-ban/test-model
 func TestAIModel(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
-	var req struct {
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
-		Model   string `json:"model"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
-		return
-	}
-	svc := service.NewAIAutoBanService()
-	result := svc.TestModel(c.Request.Context(), req.BaseURL, req.APIKey, req.Model)
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"AUDITED_EXTERNAL_CALL_REQUIRED",
+		"Billable AI model tests are disabled until reason, idempotency, and outcome auditing are available",
+		"",
+	))
 }

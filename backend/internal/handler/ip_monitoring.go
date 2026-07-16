@@ -105,13 +105,11 @@ func GetMultiIPUsers(c *gin.Context) {
 
 // POST /api/ip/enable-all-recording
 func EnableAllIPRecording(c *gin.Context) {
-	svc := service.NewIPMonitoringService()
-	data, err := svc.EnableAllIPRecording()
-	if err != nil {
-		respondInternalError(c, "UPDATE_ERROR", "Unable to update IP recording settings", "enable all IP recording", err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data, "message": data["message"]})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NEWAPI_ADAPTER_REQUIRED",
+		"Bulk IP-recording changes are disabled because NewAPI has no audited bulk admin API for this setting",
+		"",
+	))
 }
 
 // GET /api/ip/lookup/:ip

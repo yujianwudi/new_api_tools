@@ -272,53 +272,6 @@ func (s *AIAutoBanService) GetSuspiciousUsers(window string, limit int) ([]map[s
 	return rows, nil
 }
 
-// ManualAssess performs AI assessment on a single user (placeholder)
-func (s *AIAutoBanService) ManualAssess(userID int64, window string) map[string]interface{} {
-	return map[string]interface{}{
-		"user_id":     userID,
-		"window":      window,
-		"risk_score":  0,
-		"risk_level":  "unknown",
-		"suggestion":  "AI 评估功能需要配置 API",
-		"assessed":    false,
-		"assessed_at": time.Now().Unix(),
-	}
-}
-
-// RunScan performs a scan (placeholder)
-func (s *AIAutoBanService) RunScan(window string, limit int) map[string]interface{} {
-	return map[string]interface{}{
-		"scanned":  0,
-		"assessed": 0,
-		"banned":   0,
-		"dry_run":  true,
-		"window":   window,
-		"message":  "扫描功能需要配置 AI API",
-	}
-}
-
-// TestConnection tests the configured API connection (placeholder)
-func (s *AIAutoBanService) TestConnection(ctx context.Context) map[string]interface{} {
-	config := s.getStoredConfig()
-	baseURL, _ := config["base_url"].(string)
-	if baseURL == "" {
-		return map[string]interface{}{
-			"success": false,
-			"message": "未配置 API Base URL",
-		}
-	}
-	if err := security.ValidateHTTPSURL(ctx, baseURL); err != nil {
-		return map[string]interface{}{
-			"success": false,
-			"message": fmt.Sprintf("API Base URL 不安全: %s", err.Error()),
-		}
-	}
-	return map[string]interface{}{
-		"success": true,
-		"message": "连接测试需要在运行时执行",
-	}
-}
-
 // getEndpointURL builds the API URL, auto-appending /v1 if needed
 func getEndpointURL(baseURL, endpoint string) string {
 	base := strings.TrimRight(baseURL, "/")

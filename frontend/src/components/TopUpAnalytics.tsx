@@ -79,6 +79,7 @@ interface PayerCohorts {
 
 type Granularity = 'daily' | 'weekly' | 'monthly'
 type TrendChartType = 'bar' | 'line'
+type AnalyticsRequestKey = 'realtime' | 'trends' | 'financial' | 'top-users' | 'payment' | 'heatmap' | 'funnel' | 'payer-cohorts'
 
 const fmtMoney = (n: number) => `¥${(n || 0).toFixed(2)}`
 const fmtExactMoney = (n: number) => `¥${(n || 0).toLocaleString('zh-CN', {
@@ -136,96 +137,192 @@ export function TopUpAnalytics({ active }: Props) {
 
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const initialLoadedRef = useRef(false)
+  const [initialLoaded, setInitialLoaded] = useState(false)
+  const initialLoadStartedRef = useRef(false)
+  const mountedRef = useRef(true)
+  const requestControllersRef = useRef<Partial<Record<AnalyticsRequestKey, AbortController>>>({})
+  const trendParamsRef = useRef(`${trendGranularity}:${trendDays}`)
+  const financialParamsRef = useRef(String(financialMonths))
+  const topUsersParamsRef = useRef(`${topUsersLimit}:${topUsersDays}`)
+  const paymentParamsRef = useRef(String(paymentDays))
+  const heatmapParamsRef = useRef(String(heatmapDays))
+  const funnelParamsRef = useRef(String(funnelDays))
+  const payerParamsRef = useRef(String(payerDays))
 
-  // 通用 fetch helper —— 失败时不让单个模块挂掉整个面板
-  const safeFetch = useCallback(async <T,>(path: string): Promise<T | null> => {
+  const fetchModule = useCallback(async <T,>(
+    requestKey: AnalyticsRequestKey,
+    path: string,
+    commit: (data: T) => void,
+  ): Promise<boolean> => {
+    requestControllersRef.current[requestKey]?.abort()
+    const controller = new AbortController()
+    requestControllersRef.current[requestKey] = controller
     try {
-      const res = await fetch(`${apiUrl}${path}`, { headers })
-      const data = await res.json()
-      if (!data.success) {
-        console.warn(`fetch ${path} failed:`, data.error?.message)
-        return null
+      const res = await fetch(`${apiUrl}${path}`, { headers, signal: controller.signal })
+      const data = await res.json() as {
+        success?: boolean
+        data?: T
+        message?: string
+        error?: { message?: string }
       }
-      return data.data as T
-    } catch (e) {
-      console.error(`fetch ${path} error:`, e)
-      return null
+      if (controller.signal.aborted || requestControllersRef.current[requestKey] !== controller) return false
+      if (!res.ok || !data.success || data.data === undefined) {
+        console.warn(`fetch ${path} failed:`, data.error?.message || data.message || `HTTP ${res.status}`)
+        return false
+      }
+      commit(data.data)
+      return true
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return false
+      console.error(`fetch ${path} error:`, error)
+      return false
+    } finally {
+      if (requestControllersRef.current[requestKey] === controller) {
+        delete requestControllersRef.current[requestKey]
+      }
     }
   }, [apiUrl, headers])
 
-  const fetchRealtime = useCallback(async () => {
-    const d = await safeFetch<RealtimeStats>('/api/top-ups/analytics/realtime')
-    if (d) setRealtime(d)
-  }, [safeFetch])
+  const fetchRealtime = useCallback(() => fetchModule<RealtimeStats>(
+    'realtime', '/api/top-ups/analytics/realtime', setRealtime,
+  ), [fetchModule])
 
-  const fetchTrends = useCallback(async () => {
-    const d = await safeFetch<TrendPoint[]>(
-      `/api/top-ups/analytics/trends?granularity=${trendGranularity}&days=${trendDays}`)
-    if (d) setTrends(d)
-  }, [safeFetch, trendGranularity, trendDays])
+  const fetchTrends = useCallback(() => fetchModule<TrendPoint[]>(
+    'trends',
+    `/api/top-ups/analytics/trends?granularity=${trendGranularity}&days=${trendDays}`,
+    setTrends,
+  ), [fetchModule, trendGranularity, trendDays])
 
-  const fetchFinancial = useCallback(async () => {
-    const d = await safeFetch<FinancialSummary[]>(`/api/top-ups/analytics/financial-summary?months=${financialMonths}`)
-    if (d) setFinancial(d)
-  }, [safeFetch, financialMonths])
+  const fetchFinancial = useCallback(() => fetchModule<FinancialSummary[]>(
+    'financial',
+    `/api/top-ups/analytics/financial-summary?months=${financialMonths}`,
+    setFinancial,
+  ), [fetchModule, financialMonths])
 
-  const fetchTopUsers = useCallback(async () => {
-    const d = await safeFetch<TopUser[]>(`/api/top-ups/analytics/top-users?limit=${topUsersLimit}&days=${topUsersDays}`)
-    if (d) setTopUsers(d)
-  }, [safeFetch, topUsersLimit, topUsersDays])
+  const fetchTopUsers = useCallback(() => fetchModule<TopUser[]>(
+    'top-users',
+    `/api/top-ups/analytics/top-users?limit=${topUsersLimit}&days=${topUsersDays}`,
+    setTopUsers,
+  ), [fetchModule, topUsersLimit, topUsersDays])
 
-  const fetchPayment = useCallback(async () => {
-    const d = await safeFetch<PaymentDist[]>(`/api/top-ups/analytics/payment-distribution?days=${paymentDays}`)
-    if (d) setPayment(d)
-  }, [safeFetch, paymentDays])
+  const fetchPayment = useCallback(() => fetchModule<PaymentDist[]>(
+    'payment',
+    `/api/top-ups/analytics/payment-distribution?days=${paymentDays}`,
+    setPayment,
+  ), [fetchModule, paymentDays])
 
-  const fetchHeatmap = useCallback(async () => {
-    const d = await safeFetch<HeatmapPoint[]>(`/api/top-ups/analytics/heatmap?days=${heatmapDays}`)
-    if (d) setHeatmap(d)
-  }, [safeFetch, heatmapDays])
+  const fetchHeatmap = useCallback(() => fetchModule<HeatmapPoint[]>(
+    'heatmap',
+    `/api/top-ups/analytics/heatmap?days=${heatmapDays}`,
+    setHeatmap,
+  ), [fetchModule, heatmapDays])
 
-  const fetchFunnel = useCallback(async () => {
-    const d = await safeFetch<FunnelData>(`/api/top-ups/analytics/funnel?days=${funnelDays}`)
-    if (d) setFunnel(d)
-  }, [safeFetch, funnelDays])
+  const fetchFunnel = useCallback(() => fetchModule<FunnelData>(
+    'funnel',
+    `/api/top-ups/analytics/funnel?days=${funnelDays}`,
+    setFunnel,
+  ), [fetchModule, funnelDays])
 
-  const fetchPayerCohorts = useCallback(async () => {
-    const d = await safeFetch<PayerCohorts>(`/api/top-ups/analytics/payer-cohorts?days=${payerDays}`)
-    if (d) setPayerCohorts(d)
-  }, [safeFetch, payerDays])
+  const fetchPayerCohorts = useCallback(() => fetchModule<PayerCohorts>(
+    'payer-cohorts',
+    `/api/top-ups/analytics/payer-cohorts?days=${payerDays}`,
+    setPayerCohorts,
+  ), [fetchModule, payerDays])
 
-  // 首次激活才发起所有请求；后续受控字段（granularity/days）变化只触发对应模块
   useEffect(() => {
-    if (!active || initialLoadedRef.current) return
-    initialLoadedRef.current = true
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      Object.values(requestControllersRef.current).forEach((controller) => controller?.abort())
+      requestControllersRef.current = {}
+    }
+  }, [])
+
+  // 首次激活只发起一轮请求。同步参数快照可避免同一次 effect flush
+  // 中的参数监听器再次发起相同请求。
+  useEffect(() => {
+    if (!active || initialLoadStartedRef.current) return
+    initialLoadStartedRef.current = true
+    trendParamsRef.current = `${trendGranularity}:${trendDays}`
+    financialParamsRef.current = String(financialMonths)
+    topUsersParamsRef.current = `${topUsersLimit}:${topUsersDays}`
+    paymentParamsRef.current = String(paymentDays)
+    heatmapParamsRef.current = String(heatmapDays)
+    funnelParamsRef.current = String(funnelDays)
+    payerParamsRef.current = String(payerDays)
     setLoading(true)
-    Promise.all([
+    void Promise.all([
       fetchRealtime(), fetchTrends(), fetchFinancial(),
       fetchTopUsers(), fetchPayment(), fetchHeatmap(), fetchFunnel(), fetchPayerCohorts(),
-    ]).finally(() => setLoading(false))
-  }, [active, fetchRealtime, fetchTrends, fetchFinancial, fetchTopUsers, fetchPayment, fetchHeatmap, fetchFunnel, fetchPayerCohorts])
+    ]).finally(() => {
+      if (!mountedRef.current) return
+      setLoading(false)
+      setInitialLoaded(true)
+    })
+  }, [active, trendGranularity, trendDays, financialMonths, topUsersLimit, topUsersDays, paymentDays, heatmapDays, funnelDays, payerDays, fetchRealtime, fetchTrends, fetchFinancial, fetchTopUsers, fetchPayment, fetchHeatmap, fetchFunnel, fetchPayerCohorts])
 
-  // 受控参数变化时单独刷新
-  useEffect(() => { if (initialLoadedRef.current) fetchTrends() }, [fetchTrends])
-  useEffect(() => { if (initialLoadedRef.current) fetchFinancial() }, [fetchFinancial])
-  useEffect(() => { if (initialLoadedRef.current) fetchTopUsers() }, [fetchTopUsers])
-  useEffect(() => { if (initialLoadedRef.current) fetchPayment() }, [fetchPayment])
-  useEffect(() => { if (initialLoadedRef.current) fetchHeatmap() }, [fetchHeatmap])
-  useEffect(() => { if (initialLoadedRef.current) fetchFunnel() }, [fetchFunnel])
-  useEffect(() => { if (initialLoadedRef.current) fetchPayerCohorts() }, [fetchPayerCohorts])
+  // 参数变化只刷新对应模块；每个模块会取消自己的旧请求。
+  useEffect(() => {
+    const next = `${trendGranularity}:${trendDays}`
+    if (!active || !initialLoadStartedRef.current || trendParamsRef.current === next) return
+    trendParamsRef.current = next
+    void fetchTrends()
+  }, [active, trendGranularity, trendDays, fetchTrends])
+  useEffect(() => {
+    const next = String(financialMonths)
+    if (!active || !initialLoadStartedRef.current || financialParamsRef.current === next) return
+    financialParamsRef.current = next
+    void fetchFinancial()
+  }, [active, financialMonths, fetchFinancial])
+  useEffect(() => {
+    const next = `${topUsersLimit}:${topUsersDays}`
+    if (!active || !initialLoadStartedRef.current || topUsersParamsRef.current === next) return
+    topUsersParamsRef.current = next
+    void fetchTopUsers()
+  }, [active, topUsersLimit, topUsersDays, fetchTopUsers])
+  useEffect(() => {
+    const next = String(paymentDays)
+    if (!active || !initialLoadStartedRef.current || paymentParamsRef.current === next) return
+    paymentParamsRef.current = next
+    void fetchPayment()
+  }, [active, paymentDays, fetchPayment])
+  useEffect(() => {
+    const next = String(heatmapDays)
+    if (!active || !initialLoadStartedRef.current || heatmapParamsRef.current === next) return
+    heatmapParamsRef.current = next
+    void fetchHeatmap()
+  }, [active, heatmapDays, fetchHeatmap])
+  useEffect(() => {
+    const next = String(funnelDays)
+    if (!active || !initialLoadStartedRef.current || funnelParamsRef.current === next) return
+    funnelParamsRef.current = next
+    void fetchFunnel()
+  }, [active, funnelDays, fetchFunnel])
+  useEffect(() => {
+    const next = String(payerDays)
+    if (!active || !initialLoadStartedRef.current || payerParamsRef.current === next) return
+    payerParamsRef.current = next
+    void fetchPayerCohorts()
+  }, [active, payerDays, fetchPayerCohorts])
 
   const handleRefreshAll = async () => {
     setRefreshing(true)
-    await Promise.all([
-      fetchRealtime(), fetchTrends(), fetchFinancial(),
-      fetchTopUsers(), fetchPayment(), fetchHeatmap(), fetchFunnel(), fetchPayerCohorts(),
-    ])
-    setRefreshing(false)
-    showToast('success', '已刷新所有分析数据')
+    try {
+      const results = await Promise.all([
+        fetchRealtime(), fetchTrends(), fetchFinancial(),
+        fetchTopUsers(), fetchPayment(), fetchHeatmap(), fetchFunnel(), fetchPayerCohorts(),
+      ])
+      if (results.every(Boolean)) {
+        showToast('success', '已刷新所有分析数据')
+      } else {
+        showToast('error', '部分分析数据刷新失败，请重试')
+      }
+    } finally {
+      if (mountedRef.current) setRefreshing(false)
+    }
   }
 
-  if (loading && !initialLoadedRef.current) {
+  if (loading && !initialLoaded) {
     return (
       <div className="flex justify-center items-center py-20">
         <Loader2 className="h-10 w-10 animate-spin text-primary" />

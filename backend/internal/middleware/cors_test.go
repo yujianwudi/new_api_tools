@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -53,6 +54,35 @@ func TestCORSMiddlewareAllowsOnlyConfiguredOrigin(t *testing.T) {
 	router.ServeHTTP(untrusted, untrustedReq)
 	if got := untrusted.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("untrusted origin was allowed: %q", got)
+	}
+}
+
+func TestCORSMiddlewareAllowsAuditedMutationHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CORS_ALLOWED_ORIGINS", "https://admin.example.com")
+	t.Setenv("CORS_ALLOW_CREDENTIALS", "false")
+	t.Setenv("JWT_SECRET_KEY", "cors-mutation-test-secret")
+	config.Load()
+
+	router := gin.New()
+	router.Use(CORSMiddleware())
+	router.POST("/test", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	preflight := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	request.Header.Set("Origin", "https://admin.example.com")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	request.Header.Set("Access-Control-Request-Headers", "authorization, content-type, idempotency-key, x-api-key, x-request-id")
+	router.ServeHTTP(preflight, request)
+
+	if preflight.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want %d", preflight.Code, http.StatusNoContent)
+	}
+	allowed := strings.ToLower(preflight.Header().Get("Access-Control-Allow-Headers"))
+	for _, header := range []string{"authorization", "content-type", "idempotency-key", "x-api-key", "x-request-id"} {
+		if !strings.Contains(allowed, header) {
+			t.Fatalf("preflight omitted %q from Access-Control-Allow-Headers: %q", header, allowed)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,8 +12,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/auth"
+	"github.com/new-api-tools/backend/internal/controlplane"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
+	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
 // 每个调用方（按 user_sub / api_key / IP 退化）同一时刻只允许一个 CSV 导出在跑。
@@ -33,14 +37,16 @@ func exportLockKey(c *gin.Context) string {
 }
 
 // RegisterTopUpRoutes registers /api/top-ups endpoints
-func RegisterTopUpRoutes(r *gin.RouterGroup) {
+func RegisterTopUpRoutes(r *gin.RouterGroup, store *toolstore.Store) {
 	g := r.Group("/top-ups")
 	{
 		g.GET("", ListTopUps)
 		g.GET("/statistics", GetTopUpStatistics)
 		g.GET("/payment-methods", GetPaymentMethods)
 		g.GET("/payment-providers", GetPaymentProviders)
-		g.GET("/export", ExportTopUps)
+		g.GET("/export", auth.RequireRole(auth.RoleAdmin), func(c *gin.Context) {
+			exportTopUps(c, store)
+		})
 		g.GET("/:id", GetTopUpRecord)
 	}
 }
@@ -180,6 +186,24 @@ func GetTopUpRecord(c *gin.Context) {
 
 // GET /api/top-ups/export — streams matching records as CSV. Filters mirror /api/top-ups.
 func ExportTopUps(c *gin.Context) {
+	exportTopUps(c, nil)
+}
+
+func exportTopUps(c *gin.Context, store *toolstore.Store) {
+	params, err := parseTopUpFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid top-up filters", ""))
+		return
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, models.ErrorResp(
+			"AUDIT_STORE_UNAVAILABLE",
+			"Export was not started because the audit store is unavailable",
+			"",
+		))
+		return
+	}
+
 	// 并发互斥：同一个用户已有导出在跑就直接 429，不让长查询叠加。
 	lockKey := exportLockKey(c)
 	if _, busy := exportInFlight.LoadOrStore(lockKey, struct{}{}); busy {
@@ -192,17 +216,13 @@ func ExportTopUps(c *gin.Context) {
 	}
 	defer exportInFlight.Delete(lockKey)
 
-	params, err := parseTopUpFilters(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid top-up filters", ""))
-		return
-	}
-
-	total, err := service.CountTopUps(params)
+	plan, err := service.PrepareTopUpExport(c.Request.Context(), params)
 	if err != nil {
 		topUpQueryError(c, "export count query", err)
 		return
 	}
+	defer plan.Close()
+	total := plan.Snapshot.Total
 	if total > service.TopUpExportLimit {
 		c.JSON(http.StatusBadRequest, models.ErrorResp(
 			"EXPORT_TOO_LARGE",
@@ -212,11 +232,25 @@ func ExportTopUps(c *gin.Context) {
 		return
 	}
 
+	meta := operationMeta(c, "top-up CSV export")
+	filters := topUpExportAuditFilters(params)
+	if err := appendTopUpExportAudit(
+		c.Request.Context(), store, meta, "intent", toolstore.OperationSucceeded, "", filters,
+		gin.H{"expected_row_count": total, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv"},
+	); err != nil {
+		respondHandlerError(c, http.StatusServiceUnavailable, "AUDIT_STORE_UNAVAILABLE",
+			"Export was not started because the audit store is unavailable",
+			"top-up export intent audit", errors.New("tool store operation failed"))
+		return
+	}
+
 	filename := fmt.Sprintf("top_ups_%s.csv", time.Now().Format("20060102_150405"))
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("X-Export-Expected-Rows", strconv.FormatInt(total, 10))
+	c.Header("Trailer", "X-Export-Row-Count, X-Export-Truncated")
 
 	// 审计日志：合规要求"谁、何时、按什么过滤、导出多少行"，便于事后追踪。
 	subject, _ := c.Get("user_sub")
@@ -232,11 +266,81 @@ func ExportTopUps(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
 
-	if err := service.ExportTopUpsToCSV(ctx, c.Writer, params); err != nil {
-		// 响应头已发出，无法切回 JSON。CSV 末尾追加注释会污染 Excel 解析，
-		// 这里仅 server log，前端通过文件最后一行可观察到截断。
-		if !errors.Is(err, context.Canceled) {
-			log.Printf("top_ups export failed: %v", err)
+	exportResult, exportErr := plan.WriteCSV(ctx, c.Writer)
+	truncated := exportResult.Truncated || exportErr != nil || exportResult.RowsWritten != total
+	c.Header("X-Export-Row-Count", strconv.FormatInt(exportResult.RowsWritten, 10))
+	c.Header("X-Export-Truncated", strconv.FormatBool(truncated))
+	status := toolstore.OperationSucceeded
+	errorCode := ""
+	if truncated {
+		status = toolstore.OperationFailed
+		errorCode = "EXPORT_TRUNCATED"
+	}
+	if exportErr != nil {
+		errorCode = "EXPORT_STREAM_FAILED"
+		if errors.Is(exportErr, context.Canceled) || errors.Is(exportErr, context.DeadlineExceeded) {
+			status = toolstore.OperationCancelled
+			errorCode = "EXPORT_CANCELLED"
 		}
 	}
+	auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Second)
+	if err := appendTopUpExportAudit(
+		auditCtx, store, meta, "outcome", status, errorCode, filters,
+		gin.H{
+			"row_count": exportResult.RowsWritten, "expected_row_count": total,
+			"truncated": truncated, "snapshot_max_id": plan.Snapshot.MaxID, "format": "csv",
+		},
+	); err != nil {
+		log.Printf("top_ups export outcome audit failed request_id=%s", meta.RequestID)
+	}
+	auditCancel()
+	if exportErr != nil {
+		// 响应头已发出，无法切回 JSON。CSV 末尾追加注释会污染 Excel 解析，
+		// 这里仅 server log，前端通过文件最后一行可观察到截断。
+		if !errors.Is(exportErr, context.Canceled) {
+			log.Printf("top_ups export failed: %v", exportErr)
+		}
+	}
+}
+
+func topUpExportAuditFilters(params service.ListTopUpParams) gin.H {
+	return gin.H{
+		"status": params.Status, "payment_method": params.PaymentMethod,
+		"payment_provider": params.PaymentProvider, "trade_no": params.TradeNo,
+		"username": params.Username, "user_id": optionalTopUpFilterID(params.UserID),
+		"inviter_id": optionalTopUpFilterID(params.InviterID),
+		"start_date": params.StartDate, "end_date": params.EndDate,
+	}
+}
+
+func appendTopUpExportAudit(
+	ctx context.Context,
+	store *toolstore.Store,
+	meta controlplane.OperationMeta,
+	phase string,
+	status toolstore.OperationStatus,
+	errorCode string,
+	filters any,
+	result any,
+) error {
+	if store == nil {
+		return toolstore.ErrStoreClosed
+	}
+	beforeJSON, err := json.Marshal(filters)
+	if err != nil {
+		return fmt.Errorf("marshal top-up export filters: %w", err)
+	}
+	afterJSON, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal top-up export result: %w", err)
+	}
+	_, err = store.AppendOperationAudit(ctx, toolstore.OperationAuditInput{
+		RequestID: meta.RequestID, Actor: meta.Actor, SourceIP: meta.SourceIP,
+		AuthMethod: meta.AuthMethod, Action: "top_ups.export." + phase,
+		TargetType: "financial_export", TargetID: meta.RequestID,
+		Reason: meta.Reason, BeforeJSON: json.RawMessage(beforeJSON), AfterJSON: json.RawMessage(afterJSON),
+		Status: status, ErrorCode: errorCode,
+		IdempotencyKey: "export:" + meta.RequestID + ":" + phase,
+	})
+	return err
 }

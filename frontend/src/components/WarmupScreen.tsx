@@ -55,6 +55,11 @@ export function WarmupScreen({ onReady }: WarmupScreenProps) {
           return
         }
 
+        if (response.status === 501) {
+          if (mounted) onReady()
+          return
+        }
+
         const data = await response.json()
 
         if (!mounted) return

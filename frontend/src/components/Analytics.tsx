@@ -62,6 +62,31 @@ interface SyncStatus {
   needs_reset: boolean
 }
 
+const BATCH_MAX_TOTAL_TIMEOUT_MS = 10 * 60 * 1000
+const BATCH_REQUEST_TIMEOUT_MS = 30 * 1000
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
+function waitWithSignal(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Batch processing aborted', 'AbortError'))
+      return
+    }
+    const timeout = window.setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort)
+      resolve()
+    }, milliseconds)
+    const handleAbort = () => {
+      window.clearTimeout(timeout)
+      reject(new DOMException('Batch processing aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', handleAbort, { once: true })
+  })
+}
+
 function formatCountdown(seconds: number) {
   const mins = Math.floor(seconds / 60)
   const secs = seconds % 60
@@ -125,6 +150,17 @@ export function Analytics() {
   const batchAbortRef = useRef(false)
   const batchStartTimeRef = useRef(0)
   const batchTotalProcessedRef = useRef(0)
+  const batchControllerRef = useRef<AbortController | null>(null)
+  const batchRequestControllerRef = useRef<AbortController | null>(null)
+  const batchTimeoutRef = useRef<number | null>(null)
+  const batchStopReasonRef = useRef<'manual' | 'timeout' | null>(null)
+
+  useEffect(() => () => {
+    batchAbortRef.current = true
+    batchControllerRef.current?.abort()
+    batchRequestControllerRef.current?.abort()
+    if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
+  }, [])
 
   // 从 localStorage 恢复倒计时，或使用默认值
   const [countdown, setCountdown] = useState(() => {
@@ -265,19 +301,20 @@ export function Analytics() {
     return () => clearInterval(interval)
   }, [syncStatus?.progress_percent, batchProcessing])
 
-  const fetchSyncStatus = useCallback(async () => {
+  const fetchSyncStatus = useCallback(async (signal?: AbortSignal) => {
     try {
-      const response = await fetch(`${apiUrl}/api/analytics/sync-status`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/analytics/sync-status`, { headers: getAuthHeaders(), signal })
       const data = await response.json()
       if (data.success) setSyncStatus(data.data)
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return
       console.error('Failed to fetch sync status:', error)
     }
   }, [apiUrl, getAuthHeaders])
 
-  const fetchAnalytics = useCallback(async () => {
+  const fetchAnalytics = useCallback(async (signal?: AbortSignal) => {
     try {
-      const response = await fetch(`${apiUrl}/api/analytics/summary`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/analytics/summary`, { headers: getAuthHeaders(), signal })
       const data = await response.json()
       if (data.success) {
         setState(data.data.state)
@@ -286,6 +323,7 @@ export function Analytics() {
         setModelStats(data.data.model_statistics || [])
       }
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return
       console.error('Failed to fetch analytics:', error)
       showToast('error', '加载分析数据失败')
     } finally {
@@ -456,42 +494,87 @@ export function Analytics() {
   }
 
   const startBatchProcess = async () => {
+    batchControllerRef.current?.abort()
+    batchRequestControllerRef.current?.abort()
+    if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
+
+    const batchController = new AbortController()
+    batchControllerRef.current = batchController
     setBatchProcessing(true)
     batchAbortRef.current = false
+    batchStopReasonRef.current = null
     batchStartTimeRef.current = Date.now()
     batchTotalProcessedRef.current = 0
     let consecutiveFailures = 0
+    let completed = false
     const MAX_CONSECUTIVE_FAILURES = 3
-    const MAX_TOTAL_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes total timeout
 
-    const processLoop = async () => {
-      while (!batchAbortRef.current) {
-        // Total timeout protection
-        const elapsed = Date.now() - batchStartTimeRef.current
-        if (elapsed >= MAX_TOTAL_TIMEOUT_MS) {
-          showToast('info', `批处理已运行 ${Math.floor(elapsed / 60000)} 分钟，自动停止。可再次点击继续处理。`)
+    batchTimeoutRef.current = window.setTimeout(() => {
+      batchStopReasonRef.current = 'timeout'
+      batchAbortRef.current = true
+      batchController.abort()
+      batchRequestControllerRef.current?.abort()
+    }, BATCH_MAX_TOTAL_TIMEOUT_MS)
+
+    try {
+      while (!batchAbortRef.current && !batchController.signal.aborted) {
+        if (Date.now() - batchStartTimeRef.current >= BATCH_MAX_TOTAL_TIMEOUT_MS) {
+          batchStopReasonRef.current = 'timeout'
+          batchAbortRef.current = true
+          batchController.abort()
+          batchRequestControllerRef.current?.abort()
           break
         }
 
         try {
-          const response = await fetch(`${apiUrl}/api/analytics/batch?max_iterations=100`, {
-            method: 'POST',
-            headers: getAuthHeaders(),
-          })
-          const data = await response.json()
+          const requestController = new AbortController()
+          batchRequestControllerRef.current = requestController
+          let requestTimedOut = false
+          const abortRequest = () => requestController.abort()
+          batchController.signal.addEventListener('abort', abortRequest, { once: true })
+          const requestTimeout = window.setTimeout(() => {
+            requestTimedOut = true
+            requestController.abort()
+          }, BATCH_REQUEST_TIMEOUT_MS)
 
-          if (data.success) {
-            consecutiveFailures = 0 // Reset on success
+          let data: {
+            success?: boolean
+            completed?: boolean
+            total_processed?: number
+            message?: string
+          }
+          let responseOk = false
+          try {
+            const response = await fetch(`${apiUrl}/api/analytics/batch?max_iterations=100`, {
+              method: 'POST',
+              headers: getAuthHeaders(),
+              signal: requestController.signal,
+            })
+            responseOk = response.ok
+            data = await response.json()
+          } catch (error) {
+            if (batchController.signal.aborted) break
+            if (requestTimedOut) throw new Error('Batch request timed out')
+            throw error
+          } finally {
+            window.clearTimeout(requestTimeout)
+            batchController.signal.removeEventListener('abort', abortRequest)
+            if (batchRequestControllerRef.current === requestController) {
+              batchRequestControllerRef.current = null
+            }
+          }
+
+          if (responseOk && data.success) {
+            consecutiveFailures = 0
             batchTotalProcessedRef.current += (data.total_processed || 0)
-            await fetchSyncStatus()
+            await fetchSyncStatus(batchController.signal)
+            if (batchController.signal.aborted) break
 
             if (data.completed) {
-              showToast('success', `同步完成！共处理 ${batchTotalProcessedRef.current.toLocaleString()} 条日志`)
-              await fetchAnalytics()
+              completed = true
               break
             }
-            // Small delay to avoid overwhelming the server
-            await new Promise(resolve => setTimeout(resolve, 100))
+            await waitWithSignal(100, batchController.signal)
           } else {
             consecutiveFailures++
             console.error('Batch process failed:', data.message)
@@ -499,34 +582,51 @@ export function Analytics() {
               showToast('error', `连续 ${MAX_CONSECUTIVE_FAILURES} 次批处理失败，已停止。请检查后端日志。`)
               break
             }
-            // Wait longer before retry on failure
-            await new Promise(resolve => setTimeout(resolve, 2000))
+            await waitWithSignal(2000, batchController.signal)
           }
         } catch (error) {
+          if (batchController.signal.aborted || isAbortError(error)) break
           consecutiveFailures++
           console.error('Batch process error:', error)
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
             showToast('error', `连续 ${MAX_CONSECUTIVE_FAILURES} 次网络错误，已停止。请检查网络连接。`)
             break
           }
-          // Wait before retry on network error
-          await new Promise(resolve => setTimeout(resolve, 3000))
+          await waitWithSignal(3000, batchController.signal).catch(() => undefined)
         }
       }
 
-      if (batchAbortRef.current) {
+      const stopReason = batchStopReasonRef.current as 'manual' | 'timeout' | null
+      if (completed) {
+        if (batchTimeoutRef.current !== null) {
+          window.clearTimeout(batchTimeoutRef.current)
+          batchTimeoutRef.current = null
+        }
+        showToast('success', `同步完成！共处理 ${batchTotalProcessedRef.current.toLocaleString()} 条日志`)
+        await Promise.all([fetchSyncStatus(), fetchAnalytics()])
+      } else if (stopReason === 'manual') {
         showToast('info', '批处理已手动停止')
-        await fetchSyncStatus()
-        await fetchAnalytics()
+        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
+      } else if (stopReason === 'timeout') {
+        const elapsed = Date.now() - batchStartTimeRef.current
+        showToast('info', `批处理已运行 ${Math.max(1, Math.floor(elapsed / 60000))} 分钟，自动停止。可再次点击继续处理。`)
+        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       }
+    } finally {
+      if (batchTimeoutRef.current !== null) window.clearTimeout(batchTimeoutRef.current)
+      batchTimeoutRef.current = null
+      batchRequestControllerRef.current?.abort()
+      batchRequestControllerRef.current = null
+      if (batchControllerRef.current === batchController) batchControllerRef.current = null
       setBatchProcessing(false)
     }
-
-    processLoop()
   }
 
   const stopBatchProcess = () => {
+    batchStopReasonRef.current = 'manual'
     batchAbortRef.current = true
+    batchControllerRef.current?.abort()
+    batchRequestControllerRef.current?.abort()
   }
 
   const resetAnalytics = async () => {

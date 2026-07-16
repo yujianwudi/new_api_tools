@@ -33,79 +33,29 @@ func RegisterStorageRoutes(r *gin.RouterGroup) {
 
 // GET /api/storage/config
 func GetAllConfigs(c *gin.Context) {
-	cm := cache.Get()
-	configs, err := cm.GetAllHashFields("app:config")
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": true, "data": map[string]interface{}{}})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": configs})
+	storageConfigUnavailable(c)
 }
 
 // GET /api/storage/config/:key
 func GetConfig(c *gin.Context) {
-	key := c.Param("key")
-	cm := cache.Get()
-
-	value, err := cm.HashGet("app:config", key)
-	if err != nil || value == "" {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "Configuration key '" + key + "' not found",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    gin.H{"key": key, "value": value},
-	})
+	storageConfigUnavailable(c)
 }
 
 // POST /api/storage/config
 func SetConfig(c *gin.Context) {
-	var req struct {
-		Key         string      `json:"key" binding:"required"`
-		Value       interface{} `json:"value" binding:"required"`
-		Description string      `json:"description"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
-		return
-	}
-
-	cm := cache.Get()
-	if err := cm.HashSet("app:config", req.Key, req.Value); err != nil {
-		respondInternalError(c, "STORAGE_ERROR", "Failed to save config", "storage configuration save", err)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Configuration '" + req.Key + "' saved successfully",
-		"data":    gin.H{"key": req.Key, "value": req.Value},
-	})
+	storageConfigUnavailable(c)
 }
 
 // DELETE /api/storage/config/:key
 func DeleteConfig(c *gin.Context) {
-	key := c.Param("key")
-	cm := cache.Get()
+	storageConfigUnavailable(c)
+}
 
-	deleted, err := cm.HashDelete("app:config", key)
-	if err != nil || !deleted {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "Configuration '" + key + "' not found",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Configuration '" + key + "' deleted successfully",
-	})
+func storageConfigUnavailable(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, models.NewErrorResponse(
+		"NOT_IMPLEMENTED",
+		"Generic storage configuration access is disabled in v0.5.0",
+	))
 }
 
 // GET /api/storage/cache/info

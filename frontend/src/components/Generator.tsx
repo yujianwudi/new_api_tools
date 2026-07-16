@@ -1,11 +1,18 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
-import { GeneratorForm, GenerateFormData } from './GeneratorForm'
+import { GeneratorForm, type GenerateFormData } from './GeneratorForm'
 import { ResultModal, GenerateResult } from './ResultModal'
 import { addHistoryItem, HistoryItem } from './History'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from './ui/card'
 import { Sparkles } from 'lucide-react'
+import {
+  clearIdempotencyKey,
+  getOrCreateIdempotencyKey,
+  idempotencyHeader,
+  type IdempotencyOperation,
+} from '../lib/idempotency'
+import { extractAppliedRedemptionResult } from '../lib/redemptionRecovery'
 
 interface ApiResponse {
   success: boolean
@@ -17,6 +24,7 @@ interface ApiResponse {
   error?: {
     code: string
     message: string
+    details?: unknown
   }
 }
 
@@ -26,6 +34,7 @@ export function Generator() {
   const [isLoading, setIsLoading] = useState(false)
   const [result, setResult] = useState<GenerateResult | null>(null)
   const [showModal, setShowModal] = useState(false)
+  const operationRef = useRef<IdempotencyOperation | null>(null)
 
   const handleSubmit = async (formData: GenerateFormData) => {
     setIsLoading(true)
@@ -34,17 +43,12 @@ export function Generator() {
       const apiUrl = import.meta.env.VITE_API_URL || ''
       const requestBody: Record<string, unknown> = {
         name: formData.name,
+        reason: formData.reason,
         count: formData.count,
-        key_prefix: formData.key_prefix || '',
-        quota_mode: formData.quota_mode,
+        key_prefix: '',
+        quota_mode: 'fixed',
+        fixed_amount: formData.fixed_amount,
         expire_mode: formData.expire_mode,
-      }
-
-      if (formData.quota_mode === 'fixed') {
-        requestBody.fixed_amount = formData.fixed_amount
-      } else {
-        requestBody.min_amount = formData.min_amount
-        requestBody.max_amount = formData.max_amount
       }
 
       if (formData.expire_mode === 'days') {
@@ -53,11 +57,14 @@ export function Generator() {
         requestBody.expire_date = new Date(formData.expire_date).toISOString()
       }
 
-      const response = await fetch(`${apiUrl}/api/redemptions/generate`, {
+      const fingerprint = JSON.stringify(requestBody)
+      const idempotencyKey = getOrCreateIdempotencyKey(operationRef, fingerprint, 'generator.redemption.create')
+      const response = await fetch(`${apiUrl}/api/control-plane/redemptions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
+          ...idempotencyHeader(idempotencyKey),
         },
         body: JSON.stringify(requestBody),
       })
@@ -65,11 +72,26 @@ export function Generator() {
       const data: ApiResponse = await response.json()
 
       if (!response.ok) {
+        const recoveryResult = extractAppliedRedemptionResult(data)
+        if (recoveryResult) {
+          const generateResult: GenerateResult = {
+            keys: recoveryResult.keys,
+            count: recoveryResult.count,
+            name: formData.name,
+            deliveryStatus: 'applied_audit_uncertain',
+          }
+          setResult(generateResult)
+          setShowModal(true)
+          showToast('info', '上游已创建兑换码，但审计结果待对账；请立即保存，切勿重试')
+          await saveToHistory(formData, recoveryResult.count)
+          return
+        }
         showToast('error', data.error?.message || data.message || '生成失败')
         return
       }
 
       if (data.success && data.data) {
+        clearIdempotencyKey(operationRef)
         const generateResult: GenerateResult = {
           keys: data.data.keys,
           count: data.data.count,
@@ -83,7 +105,7 @@ export function Generator() {
       }
     } catch (error) {
       console.error('Generate error:', error)
-      showToast('error', '网络错误，请检查后端服务是否运行')
+      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
     } finally {
       setIsLoading(false)
     }

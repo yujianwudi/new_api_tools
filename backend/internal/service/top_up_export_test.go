@@ -6,8 +6,12 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/new-api-tools/backend/internal/database"
 )
 
 var errCSVFlush = errors.New("csv flush failed")
@@ -149,7 +153,7 @@ func TestExportTopUpsToCSV_NeutralizesSpreadsheetFormulas(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{}); err != nil {
+	if _, err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{}); err != nil {
 		t.Fatalf("export: %v", err)
 	}
 	rows := parseCSVRows(t, buf.Bytes())
@@ -175,8 +179,12 @@ func TestExportTopUpsToCSV_BOMAndHeader(t *testing.T) {
 	seedTopUps(t, 3)
 
 	var buf bytes.Buffer
-	if err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{}); err != nil {
+	result, err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{})
+	if err != nil {
 		t.Fatalf("export: %v", err)
+	}
+	if result.RowsWritten != 3 || result.Truncated {
+		t.Fatalf("export result = %+v, want 3 complete rows", result)
 	}
 	out := buf.Bytes()
 
@@ -197,9 +205,12 @@ func TestExportTopUpsToCSV_ReturnsFinalFlushError(t *testing.T) {
 	seedTopUps(t, 1)
 
 	writer := &failCSVFlushWriter{}
-	err := ExportTopUpsToCSV(context.Background(), writer, ListTopUpParams{})
+	result, err := ExportTopUpsToCSV(context.Background(), writer, ListTopUpParams{})
 	if !errors.Is(err, errCSVFlush) {
 		t.Fatalf("export error = %v, want %v", err, errCSVFlush)
+	}
+	if !result.Truncated {
+		t.Fatalf("flush failure result = %+v, want truncated", result)
 	}
 }
 
@@ -215,8 +226,12 @@ func TestExportTopUpsToCSV_HardLimitBreaks(t *testing.T) {
 	seedTopUps(t, 15)
 
 	var buf bytes.Buffer
-	if err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{}); err != nil {
+	result, err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{})
+	if err != nil {
 		t.Fatalf("export: %v", err)
+	}
+	if result.RowsWritten != TopUpExportLimit || !result.Truncated {
+		t.Fatalf("export result = %+v, want %d rows and truncated", result, TopUpExportLimit)
 	}
 	rows := countCSVRows(t, buf.Bytes())
 	// header(1) + 至多 limit(10) 数据行
@@ -240,7 +255,7 @@ func TestExportTopUpsToCSV_ContextCancel(t *testing.T) {
 	cancel() // 提前取消
 
 	var buf bytes.Buffer
-	err := ExportTopUpsToCSV(ctx, &buf, ListTopUpParams{})
+	result, err := ExportTopUpsToCSV(ctx, &buf, ListTopUpParams{})
 	// 取消可能在 query 阶段（返回 err）或 next 阶段（返回 ctx.Err()），两种都接受
 	if err == nil {
 		// 也允许 query 已经完成但 rows.Next 检查 ctx 时返回。检查写入量很小。
@@ -252,6 +267,9 @@ func TestExportTopUpsToCSV_ContextCancel(t *testing.T) {
 	}
 	if ctx.Err() == nil {
 		t.Errorf("expected ctx error, got: %v", err)
+	}
+	if !result.Truncated {
+		t.Errorf("cancelled export result = %+v, want truncated", result)
 	}
 }
 
@@ -297,7 +315,7 @@ func TestExportTopUpsToCSV_StatusFilter(t *testing.T) {
 
 	// pending 必须捞到 id=4 (pending) 和 id=5 (NULL)
 	var buf bytes.Buffer
-	if err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{Status: "pending"}); err != nil {
+	if _, err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{Status: "pending"}); err != nil {
 		t.Fatalf("export: %v", err)
 	}
 	out := string(buf.Bytes())
@@ -309,5 +327,92 @@ func TestExportTopUpsToCSV_StatusFilter(t *testing.T) {
 	}
 	if strings.Contains(out, ",1,success") || strings.Contains(out, ",3,failed") {
 		t.Errorf("pending export must NOT include success/failed rows, got:\n%s", out)
+	}
+}
+
+func TestPreparedTopUpExportKeepsCountAndStreamOnOneSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "top-ups.db")
+	db, err := sqlx.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 1000;`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	database.SetForTesting(&database.Manager{DB: db, IsPG: false})
+	t.Cleanup(func() {
+		database.SetForTesting(nil)
+		_ = db.Close()
+	})
+
+	db.MustExec(`
+		CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);
+		CREATE TABLE top_ups (
+			id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER, money REAL,
+			trade_no TEXT, payment_method TEXT, payment_provider TEXT,
+			create_time INTEGER, complete_time INTEGER, status TEXT
+		);
+		INSERT INTO users(id, username) VALUES (1, 'alice');
+		INSERT INTO top_ups(id, user_id, amount, money, trade_no, create_time, status)
+		VALUES (1, 1, 100, 1.0, 'before-snapshot', 100, 'success');
+	`)
+
+	plan, err := PrepareTopUpExport(context.Background(), ListTopUpParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	if plan.Snapshot.Total != 1 || plan.Snapshot.MaxID != 1 {
+		t.Fatalf("snapshot = %+v, want total=1 max_id=1", plan.Snapshot)
+	}
+	if _, err := db.Exec(`INSERT INTO top_ups(id, user_id, amount, money, trade_no, create_time, status)
+		VALUES (2, 1, 200, 2.0, 'after-snapshot', 200, 'success')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE top_ups
+		SET amount = 999, trade_no = 'updated-after-snapshot'
+		WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	result, err := plan.WriteCSV(context.Background(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsWritten != 1 || result.Truncated {
+		t.Fatalf("result = %+v, want one complete snapshot row", result)
+	}
+	if strings.Contains(buf.String(), ",after-snapshot,") {
+		t.Fatalf("row inserted after snapshot leaked into export: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "before-snapshot") || strings.Contains(buf.String(), "updated-after-snapshot") {
+		t.Fatalf("row updated after snapshot changed export contents: %s", buf.String())
+	}
+}
+
+func TestExportTopUpsToCSVReturnsStructScanError(t *testing.T) {
+	db := installSQLiteForTests(t)
+	db.MustExec(`
+		CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);
+		CREATE TABLE top_ups (
+			id INTEGER PRIMARY KEY, user_id INTEGER, amount TEXT, money REAL,
+			trade_no TEXT, payment_method TEXT, payment_provider TEXT,
+			create_time INTEGER, complete_time INTEGER, status TEXT
+		);
+		INSERT INTO top_ups(id, user_id, amount, money, create_time, status)
+		VALUES (1, 1, 'not-an-integer', 1.0, 100, 'success');
+	`)
+
+	var buf bytes.Buffer
+	result, err := ExportTopUpsToCSV(context.Background(), &buf, ListTopUpParams{})
+	if err == nil || !strings.Contains(err.Error(), "scan export row") {
+		t.Fatalf("error = %v, want immediate StructScan failure", err)
+	}
+	if result.RowsWritten != 0 || !result.Truncated {
+		t.Fatalf("result = %+v, want zero rows and truncated", result)
 	}
 }

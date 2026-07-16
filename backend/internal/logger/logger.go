@@ -280,7 +280,7 @@ func (l *AppLogger) TaskError(msg string) {
 
 // ========== API log methods ==========
 
-func (l *AppLogger) API(method, path string, status int, duration time.Duration, ip string) {
+func (l *AppLogger) API(method, path string, status int, duration time.Duration, ip string, requestID ...string) {
 	methodStr := fmt.Sprintf("%-6s", method)
 	if len(path) > 40 {
 		path = path[:37] + "..."
@@ -289,19 +289,31 @@ func (l *AppLogger) API(method, path string, status int, duration time.Duration,
 	timeStr := fmt.Sprintf("%7.3fs", duration.Seconds())
 
 	msg := fmt.Sprintf("%s | %s | %d | %s | %s", methodStr, pathStr, status, timeStr, ip)
-	l.zl.Info().Str("category", CatAPI).Msg(msg)
+	event := l.zl.Info().Str("category", CatAPI).Str("ip", ip)
+	if len(requestID) > 0 && requestID[0] != "" {
+		event = event.Str("request_id", requestID[0])
+	}
+	event.Msg(msg)
 }
 
-func (l *AppLogger) APIError(method, path string, status int, errMsg, ip string) {
+func (l *AppLogger) APIError(method, path string, status int, errMsg, ip string, requestID ...string) {
 	methodStr := fmt.Sprintf("%-6s", method)
 	msg := fmt.Sprintf("%s | %s | %d | %s", methodStr, path, status, errMsg)
-	l.zl.Error().Str("category", CatAPI).Str("ip", ip).Msg(msg)
+	event := l.zl.Error().Str("category", CatAPI).Str("ip", ip)
+	if len(requestID) > 0 && requestID[0] != "" {
+		event = event.Str("request_id", requestID[0])
+	}
+	event.Msg(msg)
 }
 
-func (l *AppLogger) APIWarn(method, path string, status int, errMsg, ip string) {
+func (l *AppLogger) APIWarn(method, path string, status int, errMsg, ip string, requestID ...string) {
 	methodStr := fmt.Sprintf("%-6s", method)
 	msg := fmt.Sprintf("%s | %s | %d | %s", methodStr, path, status, errMsg)
-	l.zl.Warn().Str("category", CatAPI).Str("ip", ip).Msg(msg)
+	event := l.zl.Warn().Str("category", CatAPI).Str("ip", ip)
+	if len(requestID) > 0 && requestID[0] != "" {
+		event = event.Str("request_id", requestID[0])
+	}
+	event.Msg(msg)
 }
 
 // ========== Formatted output methods ==========

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Users,
   Loader2,
@@ -93,6 +93,8 @@ const formatTime = (ts: number | null | undefined) =>
     hour: '2-digit', minute: '2-digit',
   }) : '-'
 
+const isAbortError = (error: unknown) => error instanceof DOMException && error.name === 'AbortError'
+
 export function AffiliateStats() {
   const { showToast } = useToast()
   const { token } = useAuth()
@@ -118,6 +120,9 @@ export function AffiliateStats() {
   const [expandedId, setExpandedId] = useState<number | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailRows, setDetailRows] = useState<TopUpDetailRow[]>([])
+  const listControllerRef = useRef<AbortController | null>(null)
+  const summaryControllerRef = useRef<AbortController | null>(null)
+  const detailControllerRef = useRef<AbortController | null>(null)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const authHeaders = useMemo(() => ({
@@ -133,7 +138,10 @@ export function AffiliateStats() {
     return p
   }, [search, startDate, endDate])
 
-  const fetchList = useCallback(async () => {
+  const fetchList = useCallback(async (): Promise<boolean> => {
+    listControllerRef.current?.abort()
+    const controller = new AbortController()
+    listControllerRef.current = controller
     setLoading(true)
     try {
       const params = buildParams()
@@ -141,47 +149,92 @@ export function AffiliateStats() {
       params.append('page_size', String(pageSize))
       params.append('sort_by', sortBy)
       params.append('sort_dir', sortDir)
-      const res = await fetch(`${apiUrl}/api/users/affiliate-stats?${params.toString()}`, { headers: authHeaders })
+      const res = await fetch(`${apiUrl}/api/users/affiliate-stats?${params.toString()}`, {
+        headers: authHeaders,
+        signal: controller.signal,
+      })
       const data = await res.json()
-      if (data.success) {
+      if (controller.signal.aborted || listControllerRef.current !== controller) return false
+      if (res.ok && data.success) {
         const result: PaginatedResponse = data.data
         setRows(Array.isArray(result?.items) ? result.items : [])
         setTotal(typeof result?.total === 'number' ? result.total : 0)
         setTotalPages(typeof result?.total_pages === 'number' ? result.total_pages : 1)
+        return true
       } else {
         showToast('error', data.error?.message || '获取邀请返利统计失败')
+        return false
       }
     } catch (e) {
+      if (controller.signal.aborted || isAbortError(e)) return false
       console.error('Failed to fetch affiliate stats:', e)
       showToast('error', '网络错误，请重试')
+      return false
     } finally {
-      setLoading(false)
+      if (listControllerRef.current === controller) {
+        listControllerRef.current = null
+        setLoading(false)
+      }
     }
   }, [apiUrl, authHeaders, buildParams, page, sortBy, sortDir, showToast])
 
-  const fetchSummary = useCallback(async () => {
+  const fetchSummary = useCallback(async (): Promise<boolean> => {
+    summaryControllerRef.current?.abort()
+    const controller = new AbortController()
+    summaryControllerRef.current = controller
     setSummaryLoading(true)
     try {
-      const res = await fetch(`${apiUrl}/api/users/affiliate-stats/summary?${buildParams().toString()}`, { headers: authHeaders })
+      const res = await fetch(`${apiUrl}/api/users/affiliate-stats/summary?${buildParams().toString()}`, {
+        headers: authHeaders,
+        signal: controller.signal,
+      })
       const data = await res.json()
-      if (data.success) setSummary(data.data)
+      if (controller.signal.aborted || summaryControllerRef.current !== controller) return false
+      if (res.ok && data.success) {
+        setSummary(data.data)
+        return true
+      }
+      console.error('Failed to fetch affiliate summary:', data.error?.message || data.message)
+      return false
     } catch (e) {
+      if (controller.signal.aborted || isAbortError(e)) return false
       console.error('Failed to fetch affiliate summary:', e)
+      return false
     } finally {
-      setSummaryLoading(false)
+      if (summaryControllerRef.current === controller) {
+        summaryControllerRef.current = null
+        setSummaryLoading(false)
+      }
     }
   }, [apiUrl, authHeaders, buildParams])
 
-  useEffect(() => { fetchList() }, [fetchList])
-  useEffect(() => { fetchSummary() }, [fetchSummary])
+  useEffect(() => { void fetchList() }, [fetchList])
+  useEffect(() => { void fetchSummary() }, [fetchSummary])
+  useEffect(() => () => {
+    listControllerRef.current?.abort()
+    summaryControllerRef.current?.abort()
+    detailControllerRef.current?.abort()
+  }, [])
   // 任何筛选条件变化都回到第一页
-  useEffect(() => { setPage(1); setExpandedId(null) }, [search, startDate, endDate, sortBy, sortDir])
+  useEffect(() => {
+    setPage(1)
+    setExpandedId(null)
+    setDetailRows([])
+    detailControllerRef.current?.abort()
+  }, [search, startDate, endDate, sortBy, sortDir])
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchList(), fetchSummary()])
-    setRefreshing(false)
-    showToast('success', '数据已刷新')
+    try {
+      const results = await Promise.all([fetchList(), fetchSummary()])
+      if (results.every(Boolean)) {
+        showToast('success', '数据已刷新')
+      } else {
+        showToast('error', '部分数据刷新失败，请重试')
+      }
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   const applySearch = () => setSearch(searchInput.trim())
@@ -198,10 +251,16 @@ export function AffiliateStats() {
   // 展开某一行：请求该邀请人名下被邀请人的最近成功充值
   const toggleExpand = async (inviterId: number) => {
     if (expandedId === inviterId) {
+      detailControllerRef.current?.abort()
+      detailControllerRef.current = null
       setExpandedId(null)
       setDetailRows([])
+      setDetailLoading(false)
       return
     }
+    detailControllerRef.current?.abort()
+    const controller = new AbortController()
+    detailControllerRef.current = controller
     setExpandedId(inviterId)
     setDetailRows([])
     setDetailLoading(true)
@@ -213,18 +272,26 @@ export function AffiliateStats() {
       p.append('page_size', '10')
       if (startDate) p.append('start_date', startDate)
       if (endDate) p.append('end_date', endDate)
-      const res = await fetch(`${apiUrl}/api/top-ups?${p.toString()}`, { headers: authHeaders })
+      const res = await fetch(`${apiUrl}/api/top-ups?${p.toString()}`, {
+        headers: authHeaders,
+        signal: controller.signal,
+      })
       const data = await res.json()
-      if (data.success && Array.isArray(data.data?.items)) {
+      if (controller.signal.aborted || detailControllerRef.current !== controller) return
+      if (res.ok && data.success && Array.isArray(data.data?.items)) {
         setDetailRows(data.data.items as TopUpDetailRow[])
       } else {
         setDetailRows([])
       }
     } catch (e) {
+      if (controller.signal.aborted || isAbortError(e)) return
       console.error('Failed to fetch top-up details:', e)
       showToast('error', '获取明细失败')
     } finally {
-      setDetailLoading(false)
+      if (detailControllerRef.current === controller) {
+        detailControllerRef.current = null
+        setDetailLoading(false)
+      }
     }
   }
 
@@ -397,8 +464,17 @@ export function AffiliateStats() {
                     const main = (
                       <TableRow
                         key={row.inviter_id}
-                        className="cursor-pointer hover:bg-muted/40"
-                        onClick={() => toggleExpand(row.inviter_id)}
+                        className="cursor-pointer hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                        onClick={() => void toggleExpand(row.inviter_id)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault()
+                            void toggleExpand(row.inviter_id)
+                          }
+                        }}
+                        tabIndex={0}
+                        aria-expanded={expandedId === row.inviter_id}
+                        aria-controls={`affiliate-detail-${row.inviter_id}`}
                       >
                         <TableCell>
                           {expandedId === row.inviter_id
@@ -426,7 +502,11 @@ export function AffiliateStats() {
                     )
                     if (expandedId !== row.inviter_id) return [main]
                     const detail = (
-                      <TableRow key={`${row.inviter_id}-detail`} className="bg-muted/20 hover:bg-muted/20">
+                      <TableRow
+                        key={`${row.inviter_id}-detail`}
+                        id={`affiliate-detail-${row.inviter_id}`}
+                        className="bg-muted/20 hover:bg-muted/20"
+                      >
                         <TableCell></TableCell>
                         <TableCell colSpan={7} className="py-3">
                           {detailLoading ? (

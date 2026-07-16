@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,11 +30,17 @@ type IPGeoInfo struct {
 	Success     bool   `json:"success"`
 }
 
-// GeoIP database download URLs (multiple mirrors for reliability)
+const (
+	geoipDatabaseCommit = "a83d44508ee6831c2770b2c4be91f9850ec429d7"
+	geoipDatabaseSHA256 = "168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf"
+)
+
+// GeoIP data is pinned to one immutable upstream commit. Mirrors may improve
+// availability, but every payload must match the release checksum before it is
+// opened or installed.
 var geoipDownloadURLs = []string{
-	"https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
-	"https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
-	"https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb",
+	"https://raw.githubusercontent.com/adysec/IP_database/" + geoipDatabaseCommit + "/geolite/GeoLite2-City.mmdb",
+	"https://cdn.jsdelivr.net/gh/adysec/IP_database@" + geoipDatabaseCommit + "/geolite/GeoLite2-City.mmdb",
 }
 
 // geoipUpdateInterval is the interval between automatic database updates (24 hours)
@@ -71,14 +79,16 @@ type IPGeoService struct {
 	updateMu      sync.Mutex
 
 	// Test seams are configured before the service starts and remain immutable.
-	downloadFn     func(context.Context, string) error
-	openReaderFn   func(string) (geoIPCityReader, error)
-	downloadURLs   []string
-	downloadClient *http.Client
-	retryInterval  time.Duration
-	updateInterval time.Duration
-	minFileSize    int64
-	maxFileSize    int64
+	downloadFn        func(context.Context, string) error
+	openReaderFn      func(string) (geoIPCityReader, error)
+	openReaderBytesFn func([]byte) (geoIPCityReader, error)
+	downloadURLs      []string
+	downloadClient    *http.Client
+	retryInterval     time.Duration
+	updateInterval    time.Duration
+	minFileSize       int64
+	maxFileSize       int64
+	expectedSHA256    string
 }
 
 var (
@@ -148,6 +158,22 @@ func (s *IPGeoService) databaseDownloadURLs() []string {
 	return geoipDownloadURLs
 }
 
+func (s *IPGeoService) databaseSHA256() string {
+	if s != nil && strings.TrimSpace(s.expectedSHA256) != "" {
+		return strings.ToLower(strings.TrimSpace(s.expectedSHA256))
+	}
+	return geoipDatabaseSHA256
+}
+
+func geoIPFeatureEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *IPGeoService) httpClient() *http.Client {
 	if s.downloadClient != nil {
 		return s.downloadClient
@@ -155,11 +181,55 @@ func (s *IPGeoService) httpClient() *http.Client {
 	return security.NewHTTPSClient(120 * time.Second)
 }
 
-func (s *IPGeoService) openDatabase(path string) (geoIPCityReader, error) {
+// openVerifiedDatabase applies the same bounded-size and pinned-checksum policy
+// to image-bundled, persistent, downloaded, and manually mounted databases.
+// The parser receives the exact byte slice that was hashed; it never reopens
+// the path after verification, which prevents a local path-swap TOCTOU.
+func (s *IPGeoService) openVerifiedDatabase(path string) (geoIPCityReader, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open database for verification: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat database for verification: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("database is not a regular file")
+	}
+	minFileSize := s.minimumFileSize()
+	maxFileSize := s.maximumFileSize()
+	if info.Size() < minFileSize {
+		return nil, fmt.Errorf("database is too small: %d bytes", info.Size())
+	}
+	if info.Size() > maxFileSize {
+		return nil, fmt.Errorf("database exceeds maximum size: %d bytes", info.Size())
+	}
+
+	payload, err := io.ReadAll(io.LimitReader(file, maxFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read database for verification: %w", err)
+	}
+	if int64(len(payload)) != info.Size() {
+		return nil, fmt.Errorf("database size changed during verification")
+	}
+	digest := sha256.Sum256(payload)
+	actual := fmt.Sprintf("%x", digest[:])
+	if actual != s.databaseSHA256() {
+		return nil, fmt.Errorf("database checksum mismatch")
+	}
+
+	if s.openReaderBytesFn != nil {
+		return s.openReaderBytesFn(payload)
+	}
 	if s.openReaderFn != nil {
+		// Path-based opening is retained only as a test seam. Production always
+		// parses the verified in-memory snapshot below.
 		return s.openReaderFn(path)
 	}
-	return geoip2.Open(path)
+	return geoip2.FromBytes(payload)
 }
 
 func (s *IPGeoService) downloadTo(ctx context.Context, path string) error {
@@ -225,7 +295,11 @@ func (s *IPGeoService) startBackgroundUpdater() {
 
 func (s *IPGeoService) init() {
 	s.ensureLifecycle()
-	defer s.startBackgroundUpdater()
+	allowDownload := geoIPFeatureEnabled("GEOIP_AUTO_DOWNLOAD")
+	allowUpdate := allowDownload && geoIPFeatureEnabled("GEOIP_AUTO_UPDATE")
+	if allowUpdate {
+		defer s.startBackgroundUpdater()
+	}
 
 	// Determine the preferred database directory
 	geoipDir := os.Getenv("GEOIP_DATA_DIR")
@@ -246,9 +320,9 @@ func (s *IPGeoService) init() {
 			continue
 		}
 		if _, err := os.Stat(path); err == nil {
-			reader, err := s.openDatabase(path)
+			reader, err := s.openVerifiedDatabase(path)
 			if err != nil {
-				fmt.Printf("[GeoIP] Failed to open %s: %v\n", path, err)
+				fmt.Printf("[GeoIP] Refusing database %s: %v\n", path, err)
 				continue
 			}
 			oldReader, installed := s.installReader(reader, path)
@@ -264,6 +338,11 @@ func (s *IPGeoService) init() {
 		}
 	}
 
+	if !allowDownload {
+		fmt.Println("[GeoIP] No local GeoLite2-City.mmdb found; automatic downloads are disabled")
+		return
+	}
+
 	// Database not found — try to download it
 	fmt.Println("[GeoIP] No GeoLite2-City.mmdb found, attempting auto-download...")
 	downloadPath := filepath.Join(geoipDir, "GeoLite2-City.mmdb")
@@ -275,7 +354,7 @@ func (s *IPGeoService) init() {
 	}
 
 	// Load the downloaded database
-	reader, err := s.openDatabase(downloadPath)
+	reader, err := s.openVerifiedDatabase(downloadPath)
 	if err != nil {
 		fmt.Printf("[GeoIP] Failed to open downloaded database: %v\n", err)
 		fmt.Println("[GeoIP] IP geolocation disabled. Will retry in background.")
@@ -345,7 +424,8 @@ func (s *IPGeoService) downloadDatabase(ctx context.Context, destPath string) er
 			return fmt.Errorf("create temp file: %w", err)
 		}
 
-		written, copyErr := io.Copy(out, io.LimitReader(resp.Body, maxFileSize+1))
+		hasher := sha256.New()
+		written, copyErr := io.Copy(io.MultiWriter(out, hasher), io.LimitReader(resp.Body, maxFileSize+1))
 		closeErr := out.Close()
 		_ = resp.Body.Close()
 
@@ -371,9 +451,14 @@ func (s *IPGeoService) downloadDatabase(ctx context.Context, destPath string) er
 			_ = os.Remove(tempPath)
 			continue
 		}
+		if actual := fmt.Sprintf("%x", hasher.Sum(nil)); actual != s.databaseSHA256() {
+			fmt.Printf("[GeoIP] Downloaded file checksum mismatch from %s, skipping\n", url)
+			_ = os.Remove(tempPath)
+			continue
+		}
 
-		// Validate it's a valid mmdb by trying to open it
-		testReader, err := s.openDatabase(tempPath)
+		// Validate the exact checksum-matched bytes before installing them.
+		testReader, err := s.openVerifiedDatabase(tempPath)
 		if err != nil {
 			fmt.Printf("[GeoIP] Downloaded file is not valid mmdb: %v\n", err)
 			_ = os.Remove(tempPath)
@@ -463,7 +548,7 @@ func (s *IPGeoService) tryUpdateDatabase() {
 	}
 
 	// Reload the database
-	newReader, err := s.openDatabase(dbPath)
+	newReader, err := s.openVerifiedDatabase(dbPath)
 	if err != nil {
 		fmt.Printf("[GeoIP] Failed to reload updated database: %v\n", err)
 		return

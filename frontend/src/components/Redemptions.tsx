@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useToast } from './Toast'
 import { useAuth } from '../contexts/AuthContext'
-import { Trash2, Copy, Ticket, Loader2, RefreshCw, Filter, Search, Calendar, Tag, AlertCircle, CheckCircle2, XCircle } from 'lucide-react'
+import { Trash2, Ticket, Loader2, RefreshCw, Filter, Search, Calendar, Tag, AlertCircle, CheckCircle2, XCircle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
@@ -12,10 +12,18 @@ import { Input } from './ui/input'
 import { StatCard } from './StatCard'
 import { UserAnalysisDialog } from './UserAnalysisDialog'
 import { cn } from '../lib/utils'
+import {
+  clearIdempotencyKey,
+  getOrCreateIdempotencyKey,
+  idempotencyHeader,
+  mutationResponseRequiresReconciliation,
+  type IdempotencyOperation,
+} from '../lib/idempotency'
 
 interface RedemptionCode {
   id: number
   key: string
+  key_fingerprint: string
   name: string
   quota: number
   created_time: number
@@ -78,11 +86,12 @@ export function Redemptions() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('')
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
-  const [deleteDialog, setDeleteDialog] = useState<{ open: boolean; type: 'single' | 'batch'; id?: number }>({ open: false, type: 'single' })
+  const [deleteDialog, setDeleteDialog] = useState<{ open: boolean; type: 'single' | 'batch'; id?: number; reason: string }>({ open: false, type: 'single', reason: '' })
   const [deleting, setDeleting] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
   const [selectedUser, setSelectedUser] = useState<{ id: number; username: string } | null>(null)
+  const deleteOperationRef = useRef<IdempotencyOperation | null>(null)
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const getAuthHeaders = useCallback(() => ({
@@ -152,31 +161,67 @@ export function Redemptions() {
     setSelectedIds(newSelected)
   }
 
+  const openDeleteDialog = (type: 'single' | 'batch', id?: number) => {
+    setDeleteDialog({ open: true, type, id, reason: '' })
+  }
+
+  const closeDeleteDialog = () => {
+    setDeleteDialog({ open: false, type: 'single', reason: '' })
+  }
+
   const confirmDelete = async () => {
     if (deleting) return // 防止重复点击
+    const reason = deleteDialog.reason.trim()
+    if (reason.length < 3) {
+      showToast('error', '请输入至少 3 个字符的删除原因')
+      return
+    }
     setDeleting(true)
     try {
       if (deleteDialog.type === 'single' && deleteDialog.id) {
-        const response = await fetch(`${apiUrl}/api/redemptions/${deleteDialog.id}`, { method: 'DELETE', headers: getAuthHeaders() })
-        const data = await response.json()
-        if (data.success) { showToast('success', '删除成功'); fetchCodes(); fetchStatistics(); }
-        else showToast('error', data.error?.message || '删除失败')
-      } else if (deleteDialog.type === 'batch') {
-        const response = await fetch(`${apiUrl}/api/redemptions/batch`, {
+        const requestBody = { reason }
+        const fingerprint = JSON.stringify({ action: 'redemption.delete', id: deleteDialog.id, ...requestBody })
+        const idempotencyKey = getOrCreateIdempotencyKey(deleteOperationRef, fingerprint, 'redemptions.delete')
+        const response = await fetch(`${apiUrl}/api/control-plane/redemptions/${deleteDialog.id}`, {
           method: 'DELETE',
-          headers: getAuthHeaders(),
-          body: JSON.stringify({ ids: Array.from(selectedIds) }),
+          headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
+          body: JSON.stringify(requestBody),
         })
         const data = await response.json()
-        if (data.success) { showToast('success', `成功删除 ${selectedIds.size} 个兑换码`); setSelectedIds(new Set()); fetchCodes(); fetchStatistics(); }
-        else showToast('error', data.error?.message || '删除失败')
+        if (data.success) {
+          clearIdempotencyKey(deleteOperationRef)
+          showToast('success', '删除成功')
+          closeDeleteDialog()
+          void Promise.all([fetchCodes(), fetchStatistics()])
+        } else showToast('error', mutationResponseRequiresReconciliation(data)
+          ? '操作结果不确定，请先对账，切勿修改内容后重新提交'
+          : data.error?.message || data.message || '删除失败')
+      } else if (deleteDialog.type === 'batch') {
+        const ids = Array.from(selectedIds).sort((left, right) => left - right)
+        const requestBody = { ids, reason }
+        const fingerprint = JSON.stringify({ action: 'redemption.batch-delete', ...requestBody })
+        const idempotencyKey = getOrCreateIdempotencyKey(deleteOperationRef, fingerprint, 'redemptions.delete')
+        const response = await fetch(`${apiUrl}/api/control-plane/redemptions/batch-delete`, {
+          method: 'POST',
+          headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
+          body: JSON.stringify(requestBody),
+        })
+        const data = await response.json()
+        if (data.success) {
+          clearIdempotencyKey(deleteOperationRef)
+          showToast('success', `成功删除 ${ids.length} 个兑换码`)
+          setSelectedIds(new Set())
+          closeDeleteDialog()
+          void Promise.all([fetchCodes(), fetchStatistics()])
+        } else showToast('error', mutationResponseRequiresReconciliation(data)
+          ? '批量删除结果不确定，请先对账，切勿修改内容后重新提交'
+          : data.error?.message || data.message || '删除失败')
       }
     } catch (error) {
-      showToast('error', '网络错误，请重试')
+      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账，勿新建操作')
       console.error('Delete error:', error)
     } finally {
       setDeleting(false)
-      setDeleteDialog({ open: false, type: 'single' })
     }
   }
 
@@ -185,25 +230,6 @@ export function Redemptions() {
     await Promise.all([fetchCodes(), fetchStatistics()])
     setRefreshing(false)
     showToast('success', '数据已刷新')
-  }
-
-  const copyToClipboard = async (text: string) => {
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text)
-        showToast('success', '兑换码已复制')
-        return
-      }
-      const textArea = document.createElement('textarea')
-      textArea.value = text
-      textArea.style.position = 'fixed'
-      textArea.style.left = '-9999px'
-      document.body.appendChild(textArea)
-      textArea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textArea)
-      showToast('success', '兑换码已复制')
-    } catch { showToast('error', '复制失败') }
   }
 
   return (
@@ -220,7 +246,7 @@ export function Redemptions() {
             刷新
           </Button>
           {selectedIds.size > 0 && (
-            <Button variant="destructive" size="sm" onClick={() => setDeleteDialog({ open: true, type: 'batch' })} className="h-9">
+            <Button variant="destructive" size="sm" onClick={() => openDeleteDialog('batch')} className="h-9">
               <Trash2 className="h-4 w-4 mr-2" />
               删除选中 ({selectedIds.size})
             </Button>
@@ -379,10 +405,9 @@ export function Redemptions() {
                           <RedemptionStatusBadge status={code.status} />
                         </div>
                         <div className="mt-1 flex items-center gap-2">
-                          <code className="text-[11px] font-mono bg-muted px-1.5 py-0.5 rounded truncate flex-1">{code.key}</code>
-                          <button onClick={() => copyToClipboard(code.key)} className="text-muted-foreground hover:text-primary shrink-0" title="复制">
-                            <Copy className="h-3.5 w-3.5" />
-                          </button>
+                          <code className="text-[11px] font-mono bg-muted px-1.5 py-0.5 rounded truncate flex-1" title={code.key_fingerprint}>
+                            {code.key}
+                          </code>
                         </div>
                         <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
                           <div><span className="text-muted-foreground">额度：</span><span className="text-green-600 font-medium">{formatQuota(code.quota)}</span></div>
@@ -416,7 +441,7 @@ export function Redemptions() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => setDeleteDialog({ open: true, type: 'single', id: code.id })}
+                        onClick={() => openDeleteDialog('single', code.id)}
                         className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                       >
                         <Trash2 className="h-4 w-4" />
@@ -440,7 +465,7 @@ export function Redemptions() {
                         className="rounded border-input w-4 h-4 align-middle" 
                       />
                     </TableHead>
-                    <TableHead>兑换码</TableHead>
+                    <TableHead>兑换码指纹</TableHead>
                     <TableHead>名称</TableHead>
                     <TableHead>额度 (USD)</TableHead>
                     <TableHead>状态</TableHead>
@@ -462,15 +487,10 @@ export function Redemptions() {
                         />
                       </TableCell>
                       <TableCell>
-                        <div className="flex items-center gap-2 group">
-                          <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">{code.key}</code>
-                          <button 
-                            onClick={() => copyToClipboard(code.key)} 
-                            className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary transition-opacity"
-                            title="复制"
-                          >
-                            <Copy className="h-3.5 w-3.5" />
-                          </button>
+                        <div className="flex items-center gap-2">
+                          <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded" title={code.key_fingerprint}>
+                            {code.key}
+                          </code>
                         </div>
                       </TableCell>
                       <TableCell className="font-medium text-sm">{code.name}</TableCell>
@@ -512,7 +532,7 @@ export function Redemptions() {
                         <Button 
                           variant="ghost" 
                           size="icon" 
-                          onClick={() => setDeleteDialog({ open: true, type: 'single', id: code.id })} 
+                          onClick={() => openDeleteDialog('single', code.id)}
                           className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                         >
                           <Trash2 className="h-4 w-4" />
@@ -545,7 +565,13 @@ export function Redemptions() {
       </Card>
 
       {/* Delete Dialog */}
-      <Dialog open={deleteDialog.open} onOpenChange={(open: boolean) => setDeleteDialog(prev => ({ ...prev, open }))}>
+      <Dialog
+        open={deleteDialog.open}
+        onOpenChange={(open: boolean) => {
+          if (open) setDeleteDialog((previous) => ({ ...previous, open: true }))
+          else closeDeleteDialog()
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>确认删除</DialogTitle>
@@ -553,9 +579,24 @@ export function Redemptions() {
               {deleteDialog.type === 'single' ? '确定要删除这个兑换码吗？此操作不可恢复。' : `确定要删除选中的 ${selectedIds.size} 个兑换码吗？此操作不可恢复。`}
             </DialogDescription>
           </DialogHeader>
+          <div className="space-y-2">
+            <label className="text-sm font-medium" htmlFor="redemption-delete-reason">
+              删除原因 <span className="text-destructive">*</span>
+            </label>
+            <textarea
+              id="redemption-delete-reason"
+              value={deleteDialog.reason}
+              onChange={(event) => setDeleteDialog((previous) => ({ ...previous, reason: event.target.value }))}
+              placeholder="例如：工单 #1234，兑换码创建错误"
+              maxLength={1000}
+              rows={3}
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <p className="text-xs text-muted-foreground">必填；原因和幂等键会写入操作审计。同一内容重试会沿用同一幂等键。</p>
+          </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteDialog({ open: false, type: 'single' })} disabled={deleting}>取消</Button>
-            <Button variant="destructive" onClick={confirmDelete} disabled={deleting}>
+            <Button variant="outline" onClick={closeDeleteDialog} disabled={deleting}>取消</Button>
+            <Button variant="destructive" onClick={confirmDelete} disabled={deleting || deleteDialog.reason.trim().length < 3}>
               {deleting ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />删除中...</> : '确认删除'}
             </Button>
           </DialogFooter>

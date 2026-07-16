@@ -4,9 +4,9 @@ set -euo pipefail
 #######################################
 # NewAPI Middleware Tool - 快速安装脚本
 #
-# 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh)
-#   NEWAPI_TOOLS_REF=main bash <(curl -sSL https://raw.githubusercontent.com/yujianwudi/new_api_tools/v0.2.0/install.sh) # 显式跟随开发分支
+# 安装入口:
+#   按 README.md / RELEASE_0.5.0.md 中的固定 commit URL + SHA-256 校验步骤下载后执行。
+#   不要从 tag/main URL 通过 curl process substitution 直接运行本脚本。
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -31,10 +31,14 @@ die() { log_error "$*"; exit 1; }
 REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
-INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.2.0}"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.5.0}"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
+REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
 INSTALL_COMMIT=""
+NEWAPI_TOOLS_IMAGE_DERIVED=false
+NEWAPI_TOOLS_EXPECTED_REVISION=""
 REINSTALL=false
+INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
 
 validate_newapi_tools_image() {
   local image="${1:-}"
@@ -43,6 +47,105 @@ validate_newapi_tools_image() {
   [[ ! "$image" =~ [[:space:][:cntrl:]] ]] ||
     die "NEWAPI_TOOLS_IMAGE 不能包含空白或控制字符"
   [[ "$image" != -* ]] || die "NEWAPI_TOOLS_IMAGE 格式无效"
+  if [[ "$image" == *@* ]]; then
+    [[ "$image" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]] ||
+      die "NEWAPI_TOOLS_IMAGE digest 必须使用 repo@sha256:<64 位小写十六进制>"
+  fi
+}
+
+is_immutable_newapi_tools_image() {
+  [[ "${1:-}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]
+}
+
+image_repository_without_tag() {
+  local image="${1%@*}" final_component
+  final_component="${image##*/}"
+  if [[ "$final_component" == *:* ]]; then
+    image="${image%:*}"
+  fi
+  printf '%s\n' "$image"
+}
+
+resolve_install_image_digest() {
+  local image="$1" expected_revision="${2:-}" repository actual_revision
+  local -a matching_digests=()
+  validate_newapi_tools_image "$image"
+  if is_immutable_newapi_tools_image "$image"; then
+    matching_digests=("$image")
+  else
+    repository="$(image_repository_without_tag "$image")"
+    mapfile -t matching_digests < <(
+      docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" 2>/dev/null |
+        awk -v prefix="${repository}@sha256:" \
+          'index($0, prefix) == 1 && $0 ~ /^.+@sha256:[0-9a-f]{64}$/ { print }'
+    )
+    (( ${#matching_digests[@]} == 1 )) ||
+      die "目标仓库 ${repository} 必须且只能匹配一个 RepoDigest，实际为 ${#matching_digests[@]} 个"
+  fi
+
+  if [[ -n "$expected_revision" ]]; then
+    actual_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null)" ||
+      die "无法读取镜像源码版本标签"
+    [[ "${actual_revision,,}" == "${expected_revision,,}" ]] ||
+      die "镜像源码版本与安装 Git commit 不匹配，已拒绝部署"
+  fi
+
+  printf '%s\n' "${matching_digests[0]}"
+}
+
+resolve_install_running_image_digest() {
+  local container="$1" configured_image="$2" image_id repository
+  local -a matching_digests=()
+  validate_newapi_tools_image "$configured_image"
+  repository="$(image_repository_without_tag "$configured_image")"
+  image_id="$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)" ||
+    die "无法读取现有 ${container} 容器实际运行的镜像 ID"
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    die "现有 ${container} 容器的镜像 ID 格式无效"
+  mapfile -t matching_digests < <(
+    docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image_id" 2>/dev/null |
+      awk -v prefix="${repository}@sha256:" \
+        'index($0, prefix) == 1 && $0 ~ /^.+@sha256:[0-9a-f]{64}$/ { print }'
+  )
+  (( ${#matching_digests[@]} == 1 )) ||
+    die "现有容器镜像在目标仓库 ${repository} 中必须且只能匹配一个 RepoDigest，实际为 ${#matching_digests[@]} 个"
+  if is_immutable_newapi_tools_image "$configured_image" &&
+    [[ "${matching_digests[0]}" != "$configured_image" ]]; then
+    die "旧配置的不可变镜像与现有容器实际运行镜像不一致；拒绝建立错误回滚锚点"
+  fi
+  printf '%s\n' "${matching_digests[0]}"
+}
+
+list_install_container_names() {
+  docker ps -a --format '{{.Names}}'
+}
+
+resolve_install_running_compose_project() {
+  local container="$1" env_file="$2" label_project configured_project
+  label_project="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' \
+    "$container" 2>/dev/null)" || die "无法读取现有容器的 Compose project label"
+  label_project="${label_project%$'\r'}"
+  [[ "$label_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+    die "现有容器缺少有效的 com.docker.compose.project 标识；拒绝猜测部署身份"
+  configured_project="$(env_file_value "$env_file" 'COMPOSE_PROJECT_NAME')"
+  if [[ -n "$configured_project" ]]; then
+    [[ "$configured_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+      die "配置中的 COMPOSE_PROJECT_NAME 格式无效"
+    [[ "$configured_project" == "$label_project" ]] ||
+      die "配置的 COMPOSE_PROJECT_NAME 与运行容器 project label 不一致"
+  fi
+  printf '%s\n' "$label_project"
+}
+
+pin_install_image_after_pull() {
+  local resolved
+  if ! resolved="$(resolve_install_image_digest "$NEWAPI_TOOLS_IMAGE" "$NEWAPI_TOOLS_EXPECTED_REVISION")"; then
+    log_error "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
+    return 1
+  fi
+  NEWAPI_TOOLS_IMAGE="$resolved"
+  export NEWAPI_TOOLS_IMAGE
+  log_success "候选部署镜像已验证并固定为 ${resolved}"
 }
 
 resolve_install_image() {
@@ -51,13 +154,17 @@ resolve_install_image() {
 
   local image=""
   if [[ -n "$requested_image" ]]; then
+    is_immutable_newapi_tools_image "$requested_image" ||
+      die "显式 NEWAPI_TOOLS_IMAGE 必须使用发行页核验过的 repo@sha256:<digest>"
+    [[ "$(image_repository_without_tag "$requested_image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 必须属于受信任仓库 ${NEWAPI_TOOLS_IMAGE_REPOSITORY}"
     image="$requested_image"
   elif [[ "$ref" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${BASH_REMATCH[1]}"
+    die "发行版本 ${ref} 必须同时提供发行页中的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
   elif [[ "$ref" == "main" ]]; then
     image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
   else
-    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置 NEWAPI_TOOLS_IMAGE（完整 tag 或 digest）"
+    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
   fi
 
   validate_newapi_tools_image "$image"
@@ -71,8 +178,24 @@ validate_install_ref() {
     die "NEWAPI_TOOLS_REF 格式无效"
 }
 
+verify_install_origin() {
+  local origin
+  origin="$(git remote get-url origin 2>/dev/null)" || die "现有安装目录缺少 origin 远端"
+  case "$origin" in
+    "https://github.com/yujianwudi/new_api_tools"|\
+    "https://github.com/yujianwudi/new_api_tools.git"|\
+    "git@github.com:yujianwudi/new_api_tools.git"|\
+    "ssh://git@github.com/yujianwudi/new_api_tools.git")
+      ;;
+    *)
+      die "现有安装目录 origin 不受信任：${origin}"
+      ;;
+  esac
+}
+
 checkout_install_ref() {
   validate_install_ref
+  verify_install_origin
   git fetch --force --prune --tags origin
 
   local target=""
@@ -80,8 +203,9 @@ checkout_install_ref() {
     git show-ref --verify --quiet "refs/remotes/origin/main" ||
       die "远端 main 分支不存在"
     target="refs/remotes/origin/main"
-  elif [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
-    git show-ref --verify --quiet "refs/tags/${INSTALL_REF}"; then
+  elif [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    git show-ref --verify --quiet "refs/tags/${INSTALL_REF}" ||
+      die "发行版本 ${INSTALL_REF} 缺少签出的 Git tag"
     target="refs/tags/${INSTALL_REF}"
   elif git show-ref --verify --quiet "refs/remotes/origin/${INSTALL_REF}"; then
     target="refs/remotes/origin/${INSTALL_REF}"
@@ -95,8 +219,33 @@ checkout_install_ref() {
   local commit
   commit="$(git rev-parse --verify "${target}^{commit}")" ||
     die "无法解析安装版本 ${INSTALL_REF}"
+
+  if [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+    die "发行版本 ${INSTALL_REF} 必须使用发行页提供的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
+  fi
+  if [[ -n "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+    is_immutable_newapi_tools_image "$REQUESTED_NEWAPI_TOOLS_IMAGE" ||
+      die "显式 NEWAPI_TOOLS_IMAGE 必须使用 repo@sha256:<64 位小写十六进制>"
+    [[ "$(image_repository_without_tag "$REQUESTED_NEWAPI_TOOLS_IMAGE")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 必须属于受信任仓库 ${NEWAPI_TOOLS_IMAGE_REPOSITORY}"
+    [[ "$REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION" =~ ^[0-9a-fA-F]{40}$ ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 必须同时提供 40 位 NEWAPI_TOOLS_EXPECTED_REVISION"
+    [[ "${commit,,}" == "${REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION,,}" ]] ||
+      die "安装版本 ${INSTALL_REF} 当前解析到的 commit 与预期发行 commit 不一致"
+  elif [[ -n "$REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION" ]]; then
+    die "NEWAPI_TOOLS_EXPECTED_REVISION 只能与显式不可变 NEWAPI_TOOLS_IMAGE 同时使用"
+  fi
+
   git reset --hard "$commit"
   INSTALL_COMMIT="$commit"
+  if [[ -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+    NEWAPI_TOOLS_IMAGE_DERIVED=true
+    NEWAPI_TOOLS_EXPECTED_REVISION="$commit"
+  else
+    NEWAPI_TOOLS_IMAGE_DERIVED=false
+    NEWAPI_TOOLS_EXPECTED_REVISION="${REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION,,}"
+  fi
+  export NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
   NEWAPI_TOOLS_IMAGE="$(resolve_install_image "$INSTALL_REF" "$commit" "$REQUESTED_NEWAPI_TOOLS_IMAGE")"
   export NEWAPI_TOOLS_IMAGE
   export NEWAPI_TOOLS_SOURCE_COMMIT="$commit"
@@ -126,19 +275,22 @@ version_at_least() {
 require_docker_compose_v224() {
   local reason="${1:-当前 Compose 配置}"
   if [[ "${DOCKER_COMPOSE:-}" != "docker compose" ]]; then
-    die "${reason} 依赖 !reset 语法，需要 Docker Compose v2.24+；检测到的是旧版 docker-compose，请安装/升级 Compose v2 插件"
+    die "${reason} 需要 Docker Compose v2.24+；检测到的是旧版 docker-compose，请安装/升级 Compose v2 插件"
   fi
 
   local version="${DOCKER_COMPOSE_V2_VERSION:-}"
   [[ -n "$version" ]] || version="$(get_docker_compose_v2_version)"
   [[ -n "$version" ]] || die "无法识别 Docker Compose v2 版本；${reason} 需要 v2.24+"
-  version_at_least "$version" "2.24.0" || die "Docker Compose v${version} 过旧；${reason} 依赖 !reset 语法，最低需要 v2.24.0"
+  version_at_least "$version" "2.24.0" || die "Docker Compose v${version} 过旧；${reason} 最低需要 v2.24.0"
 }
 
 env_file_value() {
   local env_file="$1" key="$2"
   local value
-  value="$(awk -v k="$key" 'index($0, k "=")==1 {print substr($0, length(k)+2); exit}' "$env_file" 2>/dev/null || true)"
+  value="$(awk -v k="$key" '
+    index($0, k "=") == 1 { value = substr($0, length(k)+2); found = 1 }
+    END { if (found) print value }
+  ' "$env_file" 2>/dev/null || true)"
   value="${value%$'\r'}"
   if [[ ${#value} -ge 2 && "$value" == \'*\' ]]; then
     value="${value:1:${#value}-2}"
@@ -156,6 +308,22 @@ dotenv_quote() {
   printf "'%s'" "$escaped"
 }
 
+# Replace an exact dotenv key atomically. An empty value removes the key so an
+# unavailable auto-detection is not persisted as if it were configured.
+replace_optional_env_value() {
+  local env_file="$1" key="$2" value="${3-}" tmp
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "无效的环境变量名称：${key}"
+  [[ -f "$env_file" ]] || die "无法更新配置：${env_file} 不存在"
+
+  tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
+  awk -v k="$key" 'index($0, k "=") == 1 { next } { print }' "$env_file" > "$tmp"
+  if [[ -n "$value" ]]; then
+    printf '%s=%s\n' "$key" "$(dotenv_quote "$value")" >> "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$env_file"
+}
+
 legacy_image_version_to_reference() {
   local version="${1:-}"
   [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
@@ -166,22 +334,57 @@ legacy_image_version_to_reference() {
 # 将最终镜像引用以单一活动键幂等写入 .env，并停用旧版 tag-only 配置。
 migrate_image_env_file() {
   local env_file="$1" selected_image="${2:-${NEWAPI_TOOLS_IMAGE:-}}"
+  local allow_image_replacement="${3:-false}"
   [[ -f "$env_file" ]] || return 0
 
-  local current_image legacy_version
+  local current_image legacy_version existing_image persisted_image rollback_anchor=""
+  local existing_container_names="" has_existing_container=false
   current_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
   legacy_version="$(env_file_value "$env_file" 'NEWAPI_TOOLS_VERSION')"
+  existing_image="$current_image"
+  if [[ -z "$existing_image" && -n "$legacy_version" ]]; then
+    existing_image="$(legacy_image_version_to_reference "$legacy_version")"
+  fi
 
   if [[ -z "$selected_image" ]]; then
-    if [[ -n "$current_image" ]]; then
-      selected_image="$current_image"
-    elif [[ -n "$legacy_version" ]]; then
-      selected_image="$(legacy_image_version_to_reference "$legacy_version")"
+    if [[ -n "$existing_image" ]]; then
+      selected_image="$existing_image"
     else
-      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.2.0"
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.5.0"
     fi
   fi
   validate_newapi_tools_image "$selected_image"
+  [[ -z "$existing_image" ]] || validate_newapi_tools_image "$existing_image"
+  persisted_image="$selected_image"
+
+  if [[ "$allow_image_replacement" != "true" ]]; then
+    if ! existing_container_names="$(list_install_container_names)"; then
+      die "无法可靠枚举现有 Docker 容器；拒绝在部署状态未知时迁移镜像配置"
+    fi
+    if printf '%s\n' "$existing_container_names" | grep -Fxq 'newapi-tools'; then
+      has_existing_container=true
+      [[ -n "$existing_image" ]] ||
+        die "检测到现有 newapi-tools 容器，但配置中没有可审计的旧镜像引用"
+    fi
+  fi
+  # Before pulling a candidate, every existing installation must have an
+  # immutable rollback anchor that the v0.5.0 image-policy can restart. A
+  # mutable current tag (including a legacy NEWAPI_TOOLS_VERSION or a same-tag
+  # update) is resolved only from the already-local image. Zero or multiple
+  # same-repository RepoDigests fail closed before any pull/down operation.
+  # NEWAPI_TOOLS_IMAGE still exports the candidate for the later pull.
+  if [[ -n "$existing_image" && "$allow_image_replacement" != "true" ]]; then
+    if [[ "$has_existing_container" == "true" ]]; then
+      if ! rollback_anchor="$(resolve_install_running_image_digest 'newapi-tools' "$existing_image")"; then
+        die "无法把现有容器实际运行镜像固定为唯一 OCI digest；已拒绝在无回滚锚点时升级"
+      fi
+    elif is_immutable_newapi_tools_image "$existing_image"; then
+      rollback_anchor="$existing_image"
+    elif ! rollback_anchor="$(resolve_install_image_digest "$existing_image" "")"; then
+      die "无法把现有镜像 ${existing_image} 固定为唯一 OCI digest；已拒绝在无回滚锚点时升级"
+    fi
+    persisted_image="$rollback_anchor"
+  fi
 
   local tmp
   tmp="$(umask 077; mktemp "${env_file}.tmp.XXXXXX")"
@@ -193,7 +396,7 @@ migrate_image_env_file() {
     }
     { print }
   ' "$env_file" > "$tmp"
-  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$selected_image")" >> "$tmp"
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$(dotenv_quote "$persisted_image")" >> "$tmp"
   chmod 600 "$tmp"
 
   if cmp -s "$env_file" "$tmp"; then
@@ -202,14 +405,192 @@ migrate_image_env_file() {
   else
     mv "$tmp" "$env_file"
     if [[ -n "$legacy_version" ]]; then
-      log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为完整 NEWAPI_TOOLS_IMAGE"
+      log_info "已将旧 NEWAPI_TOOLS_VERSION 迁移为不可变回滚镜像 ${persisted_image}"
+    elif [[ -n "$rollback_anchor" && "$rollback_anchor" != "$current_image" ]]; then
+      log_info "已将现有镜像固定为升级回滚锚点 ${rollback_anchor}"
     else
-      log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${selected_image}"
+      log_info "已写入部署镜像 NEWAPI_TOOLS_IMAGE=${persisted_image}"
     fi
   fi
 
   NEWAPI_TOOLS_IMAGE="$selected_image"
   export NEWAPI_TOOLS_IMAGE
+}
+
+install_compose_env_keys() {
+  local env_file="$1" project_dir="$2"
+  [[ -r "$env_file" ]] || return 1
+  {
+    grep -hoE '\$\{[A-Za-z_][A-Za-z0-9_]*' \
+      "${project_dir}/docker-compose.yml" \
+      "${project_dir}/docker-compose.host.yml" \
+      "${project_dir}/docker-compose.logdb.yml" 2>/dev/null |
+      sed 's/^${//' || true
+    printf '%s\n' \
+      NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_VERSION \
+      COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES \
+      COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE
+  } | sort -u
+}
+
+run_install_compose() {
+  local env_file="$1" project_dir="$2" image_override="${3:-}"
+  local compose_file_override="${COMPOSE_FILE:-}" project_name
+  local -a project_args=()
+  shift 3
+  [[ -r "$env_file" ]] || {
+    log_error "Compose 配置文件不可读：${env_file}"
+    return 1
+  }
+  project_name="${INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE:-}"
+  [[ -n "$project_name" ]] || project_name="$(env_file_value "$env_file" 'COMPOSE_PROJECT_NAME')"
+  if [[ -n "$project_name" ]]; then
+    [[ "$project_name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || {
+      log_error "配置中的 COMPOSE_PROJECT_NAME 格式无效，拒绝猜测 Compose 项目"
+      return 1
+    }
+    project_args=(-p "$project_name")
+  fi
+  (
+    local key
+    while IFS= read -r key; do
+      [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      unset "$key" 2>/dev/null || true
+    done < <(install_compose_env_keys "$env_file" "$project_dir")
+    if [[ -n "$compose_file_override" ]]; then
+      COMPOSE_FILE="$compose_file_override"
+      export COMPOSE_FILE
+    fi
+    if [[ -n "$image_override" ]]; then
+      NEWAPI_TOOLS_IMAGE="$image_override"
+      export NEWAPI_TOOLS_IMAGE
+    fi
+    $DOCKER_COMPOSE "${project_args[@]}" "$@"
+  )
+}
+
+is_install_v05_ready_response() {
+  local body="${1:-}"
+  printf '%s' "$body" | grep -Eq '^[[:space:]]*\{' &&
+    printf '%s' "$body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' &&
+    printf '%s' "$body" | grep -Eq '"main_database"[[:space:]]*:[[:space:]]*"ok"' &&
+    printf '%s' "$body" | grep -Eq '"tool_store"[[:space:]]*:[[:space:]]*"ok"'
+}
+
+is_install_legacy_db_ready_response() {
+  local body="${1:-}"
+  printf '%s' "$body" | grep -Eq '^[[:space:]]*\{' &&
+    printf '%s' "$body" | grep -Eq '"success"[[:space:]]*:[[:space:]]*true' &&
+    printf '%s' "$body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"connected"'
+}
+
+verify_install_application_health() {
+  local mode="$1" ready_body="" legacy_body=""
+  ready_body="$(docker exec newapi-tools curl --silent --show-error \
+    http://localhost:8080/readyz 2>/dev/null || true)"
+  if is_install_v05_ready_response "$ready_body"; then
+    return 0
+  fi
+  [[ "$mode" == "rollback" ]] || return 1
+  if printf '%s' "$ready_body" | grep -Eq '^[[:space:]]*\{'; then
+    return 1
+  fi
+  legacy_body="$(docker exec newapi-tools curl --fail --silent --show-error \
+    http://localhost:8080/api/health/db 2>/dev/null || true)"
+  is_install_legacy_db_ready_response "$legacy_body"
+}
+
+start_install_services_and_wait() {
+  local env_file="$1" project_dir="$2" health_mode="$3" image_override="$4"
+  shift 4
+  run_install_compose "$env_file" "$project_dir" "$image_override" "$@" up -d || return 1
+  restore_runtime_network_connections "$project_dir" || return 1
+  run_install_compose "$env_file" "$project_dir" "$image_override" "$@" \
+    up -d --wait --wait-timeout 180 || return 1
+  verify_install_application_health "$health_mode"
+}
+
+# Restart an existing installation as a transaction. The .env file keeps the
+# previous immutable image until the candidate is healthy; only then is the
+# candidate digest committed. Any failed candidate start (or failed commit)
+# restores and health-checks the previous image before returning a failure.
+restart_install_services_transactionally() {
+  local env_file="$1" project_dir="$2"
+  shift 2
+
+  local candidate_image="$NEWAPI_TOOLS_IMAGE" rollback_image container_names project_name=""
+  rollback_image="$(env_file_value "$env_file" 'NEWAPI_TOOLS_IMAGE')"
+  is_immutable_newapi_tools_image "$candidate_image" ||
+    die "候选镜像尚未固定为不可变 OCI digest；拒绝切换服务"
+  is_immutable_newapi_tools_image "$rollback_image" ||
+    die "现有服务缺少不可变回滚镜像；拒绝切换服务"
+
+  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
+  if ! container_names="$(list_install_container_names)"; then
+    die "无法可靠枚举现有 Docker 容器；拒绝在部署身份未知时切换服务"
+  fi
+  if printf '%s\n' "$container_names" | grep -Fxq 'newapi-tools'; then
+    project_name="$(resolve_install_running_compose_project 'newapi-tools' "$env_file")" ||
+      die "无法建立可信的旧 Compose project 身份；拒绝切换服务"
+    INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$project_name"
+    replace_optional_env_value "$env_file" 'COMPOSE_PROJECT_NAME' "$project_name"
+  fi
+
+  log_info "重启服务并等待候选版本健康..."
+  if ! run_install_compose "$env_file" "$project_dir" "$candidate_image" "$@" down; then
+    log_error "停止现有服务返回失败；按可能已部分删除处理并立即重建旧服务"
+    setup_compose_files "$project_dir"
+    if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" "$@"; then
+      die "候选版本尚未启动；初次停止失败后已恢复旧镜像 ${rollback_image}"
+    fi
+    die "初次停止失败，且旧镜像 ${rollback_image} 无法恢复健康；请立即检查 docker compose ps/logs"
+  fi
+
+  local candidate_healthy=false
+  if start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" "$@"; then
+    candidate_healthy=true
+  else
+    log_error "候选服务无法启动、恢复运行时网络或通过内容健康检查，将执行回滚"
+  fi
+
+  if [[ "$candidate_healthy" == "true" ]]; then
+    # Run the atomic file update in a subshell so a persistence failure can be
+    # caught and treated like any other failed candidate activation.
+    if (migrate_image_env_file "$env_file" "$candidate_image" true); then
+      NEWAPI_TOOLS_IMAGE="$candidate_image"
+      export NEWAPI_TOOLS_IMAGE
+      log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+      return 0
+    fi
+    log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
+  fi
+
+  NEWAPI_TOOLS_IMAGE="$rollback_image"
+  export NEWAPI_TOOLS_IMAGE
+
+  local rollback_config_restored=true
+  if ! (migrate_image_env_file "$env_file" "$rollback_image" true); then
+    rollback_config_restored=false
+    log_error "无法持久化恢复回滚镜像配置"
+  fi
+
+  # Re-read overlays after restoring the old dotenv file. COMPOSE_FILE and
+  # runtime network attachments may differ from the candidate deployment.
+  setup_compose_files "$project_dir"
+
+  if ! run_install_compose "$env_file" "$project_dir" "$rollback_image" "$@" down; then
+    log_error "清理失败的候选服务时发生错误；仍将尝试重建旧服务"
+  fi
+
+  local rollback_healthy=false
+  if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" "$@"; then
+    rollback_healthy=true
+  fi
+
+  if [[ "$rollback_config_restored" == "true" && "$rollback_healthy" == "true" ]]; then
+    die "候选服务启动失败；已恢复旧镜像 ${rollback_image}，更新未提交"
+  fi
+  die "候选服务启动失败，且旧镜像 ${rollback_image} 的配置或健康回滚也失败；请立即检查 docker compose ps/logs"
 }
 
 #######################################
@@ -240,7 +621,7 @@ setup_compose_files() {
     if [[ -z "$nw" ]]; then
       [[ -f "$host_overlay" ]] ||
         die "host 模式需要 ${host_overlay}，缺少该叠加层时无法安全移除基础 external network 配置"
-      require_docker_compose_v224 "host 网络叠加层 ${host_overlay}"
+      require_docker_compose_v224 "host 网络叠加层 ${host_overlay} 的 !reset 语法"
       compose_files+=("$host_overlay")
     fi
   fi
@@ -363,22 +744,21 @@ check_requirements() {
 
   command -v git >/dev/null 2>&1 || missing+=("git")
   command -v docker >/dev/null 2>&1 || missing+=("docker")
+  command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
 
-  # 优先 docker compose v2；仅在没有 v2 时兼容旧 docker-compose。
+  # v0.5.0 基础 Compose 使用不可变镜像策略门禁，并与 host overlay 统一要求 v2.24+。
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
     DOCKER_COMPOSE_V2_VERSION="$(get_docker_compose_v2_version)"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    DOCKER_COMPOSE="docker-compose"
-    DOCKER_COMPOSE_V2_VERSION=""
-    log_warn "未检测到 Docker Compose v2，暂用旧版 docker-compose；host 网络部署需要 v2.24+"
   else
-    missing+=("Docker Compose v2（推荐）或旧版 docker-compose")
+    missing+=("Docker Compose v2.24+")
   fi
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     die "缺少必要命令: ${missing[*]}"
   fi
+
+  require_docker_compose_v224 "v0.5.0 不可变镜像策略门禁"
 
   log_success "环境检查通过 (使用 $DOCKER_COMPOSE)"
 }
@@ -467,10 +847,6 @@ sync_newapi_mutation_safety_config() {
     log_info "已加入安全默认值 ALLOW_UNSAFE_BATCH_DELETE=false"
   fi
 
-  if ! grep -q '^ENFORCE_IP_RECORDING=' "$env_file" 2>/dev/null; then
-    echo "ENFORCE_IP_RECORDING=false" >> "$env_file"
-    log_info "已加入隐私安全默认值 ENFORCE_IP_RECORDING=false"
-  fi
 }
 
 #######################################
@@ -1092,14 +1468,16 @@ do_update_interactive() {
 
   # 拉取最新镜像并重启
   log_info "拉取最新镜像..."
-  if ! $DOCKER_COMPOSE pull newapi-tools; then
-    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  if ! run_install_compose "${project_dir}/.env" "$project_dir" "$NEWAPI_TOOLS_IMAGE" \
+    pull --include-deps newapi-tools; then
+    die "拉取 newapi-tools 及其策略门禁/Redis 依赖镜像失败；当前运行中的服务保持不变"
   fi
+  # Resolve the just-pulled tag to an immutable RepoDigest and validate the
+  # derived image revision before stopping the currently running service.
+  pin_install_image_after_pull "${project_dir}/.env" ||
+    die "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
 
-  log_info "重启服务..."
-  $DOCKER_COMPOSE down
-  $DOCKER_COMPOSE up -d
-  restore_runtime_network_connections "$project_dir"
+  restart_install_services_transactionally "${project_dir}/.env" "$project_dir"
 
   log_success "更新完成!"
   echo ""
@@ -1219,6 +1597,9 @@ do_reconfigure_interactive() {
   rm -f .env
 
   # 运行部署脚本
+  if [[ "$NEWAPI_TOOLS_IMAGE_DERIVED" == "true" ]]; then
+    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
+  fi
   exec ./deploy.sh
 }
 
@@ -1416,33 +1797,26 @@ clone_or_update_project() {
 download_geoip_database() {
   local geoip_dir="${PROJECT_DIR}/data/geoip"
   local city_db="${geoip_dir}/GeoLite2-City.mmdb"
-  local asn_db="${geoip_dir}/GeoLite2-ASN.mmdb"
+  local expected_sha256="168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf"
+  local actual_sha256=""
+  mkdir -p "$geoip_dir"
 
-  # 如果数据库已存在，跳过下载
-  if [[ -f "$city_db" && -f "$asn_db" ]]; then
-    log_success "GeoIP 数据库已存在"
+  if [[ ! -f "$city_db" ]]; then
+    log_info "主机侧 GeoIP 自动下载已禁用；将使用镜像内的固定校验快照"
     return 0
   fi
 
-  log_info "下载 GeoIP 数据库..."
-  mkdir -p "$geoip_dir"
-
-  local base_url="https://raw.githubusercontent.com/adysec/IP_database/main/geolite"
-  local fallback_url="https://raw.gitmirror.com/adysec/IP_database/main/geolite"
-
-  if [[ ! -f "$city_db" ]]; then
-    curl -sL --connect-timeout 15 -o "$city_db" "${base_url}/GeoLite2-City.mmdb" 2>/dev/null || \
-    curl -sL --connect-timeout 30 -o "$city_db" "${fallback_url}/GeoLite2-City.mmdb" 2>/dev/null || \
-    log_warn "GeoLite2-City.mmdb 下载失败"
+  actual_sha256="$(sha256sum "$city_db" 2>/dev/null | awk '{print $1}' || true)"
+  if [[ "$actual_sha256" == "$expected_sha256" ]]; then
+    log_success "手工挂载的 GeoIP 数据库 checksum 已验证"
+    return 0
   fi
 
-  if [[ ! -f "$asn_db" ]]; then
-    curl -sL --connect-timeout 15 -o "$asn_db" "${base_url}/GeoLite2-ASN.mmdb" 2>/dev/null || \
-    curl -sL --connect-timeout 30 -o "$asn_db" "${fallback_url}/GeoLite2-ASN.mmdb" 2>/dev/null || \
-    log_warn "GeoLite2-ASN.mmdb 下载失败"
+  if rm -f -- "$city_db"; then
+    log_warn "手工挂载的 GeoIP 数据库 checksum 无效；已移除并回退镜像内固定快照"
+  else
+    log_warn "无法移除无效 GeoIP 文件；运行时仍会拒绝其 checksum 并使用镜像内快照"
   fi
-
-  [[ -f "$city_db" && -f "$asn_db" ]] && log_success "GeoIP 数据库就绪"
 }
 
 #######################################
@@ -1468,7 +1842,7 @@ check_and_update_configs() {
   fi
 
   if [[ "$updated" == "true" ]]; then
-    log_success "配置已更新，将下载 GeoIP 数据库"
+    log_success "配置已更新；GeoIP 默认使用镜像内固定校验快照"
   fi
 }
 
@@ -1532,6 +1906,67 @@ migrate_env_file() {
   # 直接对端才允许后端解析 X-Forwarded-For。
   if ! grep -q '^TRUSTED_PROXY_CIDRS=' "$env_file" 2>/dev/null; then
     echo "TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128" >> "$env_file"
+    migrated=true
+  fi
+
+  if ! grep -q '^API_KEY_ROLE=' "$env_file" 2>/dev/null; then
+    echo "API_KEY_ROLE=viewer" >> "$env_file"
+    migrated=true
+  fi
+
+  if ! grep -q '^NEWAPI_ADMIN_ACCESS_TOKEN=' "$env_file" 2>/dev/null; then
+    echo "NEWAPI_ADMIN_ACCESS_TOKEN=" >> "$env_file"
+    migrated=true
+  fi
+  if ! grep -q '^NEWAPI_ADMIN_USER_ID=' "$env_file" 2>/dev/null; then
+    echo "NEWAPI_ADMIN_USER_ID=0" >> "$env_file"
+    migrated=true
+  fi
+
+  local current_newapi_baseurl
+  current_newapi_baseurl="$(env_file_value "$env_file" 'NEWAPI_BASEURL')"
+  current_newapi_baseurl="${current_newapi_baseurl#"${current_newapi_baseurl%%[![:space:]]*}"}"
+  current_newapi_baseurl="${current_newapi_baseurl%"${current_newapi_baseurl##*[![:space:]]}"}"
+  if [[ -z "$current_newapi_baseurl" ]]; then
+    local newapi_container newapi_mode newapi_port newapi_host newapi_env detected_newapi_baseurl=""
+    newapi_container="$(env_file_value "$env_file" 'NEWAPI_CONTAINER')"
+    newapi_mode="$(env_file_value "$env_file" 'NEWAPI_NETWORK_MODE')"
+    newapi_port=""
+    if [[ -n "$newapi_container" ]] &&
+      newapi_env="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$newapi_container" 2>/dev/null)"; then
+      newapi_port="$(printf '%s\n' "$newapi_env" | sed -n 's/^PORT=//p' | tail -n1)"
+      newapi_port="${newapi_port:-3000}"
+    fi
+    newapi_host="$newapi_container"
+    [[ "$newapi_mode" == "host" ]] && newapi_host="host.docker.internal"
+    if [[ -n "$newapi_host" && "$newapi_port" =~ ^[0-9]{1,5}$ ]] &&
+      (( 10#$newapi_port >= 1 && 10#$newapi_port <= 65535 )); then
+      detected_newapi_baseurl="http://${newapi_host}:${newapi_port}"
+    fi
+
+    if [[ -n "$detected_newapi_baseurl" ]]; then
+      replace_optional_env_value "$env_file" 'NEWAPI_BASEURL' "$detected_newapi_baseurl"
+      migrated=true
+      log_info "已自动检测并补充 NEWAPI_BASEURL"
+    elif grep -q '^NEWAPI_BASEURL=' "$env_file" 2>/dev/null; then
+      replace_optional_env_value "$env_file" 'NEWAPI_BASEURL'
+      migrated=true
+      log_warn "NEWAPI_BASEURL 仍未检测到；已移除空配置，写操作保持禁用"
+    fi
+  fi
+
+  if ! grep -q '^OBSERVABILITY_TOKEN=' "$env_file" 2>/dev/null; then
+    local observability_token
+    observability_token="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)"
+    echo "OBSERVABILITY_TOKEN=$(dotenv_quote "$observability_token")" >> "$env_file"
+    migrated=true
+  fi
+  if ! grep -q '^LOG_FRESHNESS_MAX_SECONDS=' "$env_file" 2>/dev/null; then
+    echo "LOG_FRESHNESS_MAX_SECONDS=900" >> "$env_file"
+    migrated=true
+  fi
+  if ! grep -q '^TOOL_STORE_PATH=' "$env_file" 2>/dev/null; then
+    echo "TOOL_STORE_PATH=/app/data/control-plane.db" >> "$env_file"
     migrated=true
   fi
 
@@ -1625,15 +2060,17 @@ quick_update() {
 
   # 拉取最新镜像
   log_info "拉取最新镜像..."
-  if ! $DOCKER_COMPOSE "${compose_args[@]}" pull newapi-tools; then
-    die "拉取 newapi-tools 镜像失败；当前运行中的服务保持不变"
+  if ! run_install_compose "$env_file" "$PROJECT_DIR" "$NEWAPI_TOOLS_IMAGE" \
+    "${compose_args[@]}" pull --include-deps newapi-tools; then
+    die "拉取 newapi-tools 及其策略门禁/Redis 依赖镜像失败；当前运行中的服务保持不变"
   fi
+  # Resolve mutable release/SHA tags to the exact pulled RepoDigest before
+  # stopping the old service. Auto-derived images also have their OCI source
+  # revision checked against the checked-out commit.
+  pin_install_image_after_pull "$env_file" ||
+    die "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
 
-  log_info "重启服务..."
-  $DOCKER_COMPOSE "${compose_args[@]}" down
-  $DOCKER_COMPOSE "${compose_args[@]}" up -d
-
-  restore_runtime_network_connections "$PROJECT_DIR"
+  restart_install_services_transactionally "$env_file" "$PROJECT_DIR" "${compose_args[@]}"
 
   # 获取前端端口
   local frontend_port
@@ -1677,6 +2114,9 @@ run_deploy() {
   chmod +x "${PROJECT_DIR}/deploy.sh"
 
   # 运行部署脚本
+  if [[ "$NEWAPI_TOOLS_IMAGE_DERIVED" == "true" ]]; then
+    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
+  fi
   exec "${PROJECT_DIR}/deploy.sh"
 }
 
@@ -1742,8 +2182,9 @@ NewAPI Middleware Tool - 安装管理脚本
 环境变量:
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
-  NEWAPI_TOOLS_REF   Git 安装版本（默认: v0.2.0；main 会锁定本次 commit 的短 SHA 镜像）
-  NEWAPI_TOOLS_IMAGE 完整镜像 tag/digest；自定义 ref 必须显式设置
+  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.5.0；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；发行/自定义 ref 必填
+  NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 
 更多信息: https://github.com/yujianwudi/new_api_tools
 EOF
