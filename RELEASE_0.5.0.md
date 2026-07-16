@@ -263,4 +263,4 @@ ghcr.io/yujianwudi/new_api_tools:0.5
 ghcr.io/yujianwudi/new_api_tools:<发行提交前7位SHA>
 ```
 
-`latest` 跟随可变的 `main`。生产环境应使用 `0.5.0` 或 OCI digest。
+`latest` 仅适用于跟随可变 `main` 的非生产环境；`0.5.0`、`0.5` 和提交短 SHA 也都是可变 OCI tag。生产部署必须使用发行页核验过并与发行 commit 绑定的 OCI manifest digest。
