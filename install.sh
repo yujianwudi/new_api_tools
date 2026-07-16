@@ -1266,8 +1266,6 @@ setup_compose_files() {
     else
       log_warn "LOG_NETWORK=${log_network}，但未找到 ${log_overlay}；更新后将仅尝试运行时接入该网络"
     fi
-  elif [[ -n "$log_network" ]]; then
-    log_info "日志库与主库同在网络 '${log_network}'，无需额外日志库叠加层"
   fi
 
   if (( ${#compose_files[@]} > 1 )); then
