@@ -38,7 +38,7 @@
 
 ### 原子安装、升级和卸载
 
-- `deploy.sh` 与 `install.sh` 使用同一个项目级排他 `flock`，覆盖安装、升级、重配、卸载、purge 和重装入口。
+- `deploy.sh`、`install.sh` 与 `setup-log-db.sh` 使用同一个项目级排他 `flock`，覆盖安装、升级、重配、日志库切换、卸载、purge 和重装入口。
 - 锁文件位于项目目录同级，要求当前 uid 所有、权限 `0600`，拒绝 symlink、目录、foreign-owner 和身份替换。
 - install → deploy 通过继承的锁 fd 交接，不释放重抢；进程退出或 `SIGKILL` 后由内核自动释放。
 - `.env` 和回滚快照使用 `0600 + file sync + atomic rename + parent sync`，拒绝不安全的既有文件和竞态替换。
@@ -72,11 +72,11 @@
 
 ## 安装
 
-从本发行页复制真实的 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`。下列安装器固定到代码提交 A，不依赖可变分支：
+从本发行页复制真实的 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`。下列安装器固定到最终审计修复提交，不依赖可变分支：
 
 ```bash
-INSTALLER_COMMIT_SHA=8e8b60d2b540bb4a233a421cf5f70e18817b7b20
-INSTALL_SCRIPT_SHA256=3f3e84709f170d283faa48c5878892c43bd8cba03e9652be93d23a99aa0c8031
+INSTALLER_COMMIT_SHA=d059378a2366ceba19515329b3e10cb8c3a190b3
+INSTALL_SCRIPT_SHA256=8880b0adab1e088aedf3eb58ccf9121d24c8655883f81460d217d45d460359a0
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
