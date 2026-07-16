@@ -277,6 +277,22 @@ assert.equal(
   pendingUsersByOperation.get(pendingIdempotency.userMutationOperationIdentifier(43))?.key,
   pendingUserB.key,
 )
+assert.equal(pendingIdempotency.parseUserMutationTargetId('42'), 42)
+assert.equal(
+  pendingIdempotency.parseUserMutationOperationTargetId('control-plane.user:42', '42'),
+  42,
+)
+assert.throws(
+  () => pendingIdempotency.parseUserMutationOperationTargetId('control-plane.user:43', '42'),
+  /does not match its target/,
+)
+for (const invalidTargetId of ['', '0', '-1', '1.5', '1e2', '+42', ' 42 ', '0042', '9007199254740992']) {
+  assert.throws(
+    () => pendingIdempotency.parseUserMutationTargetId(invalidTargetId),
+    /positive safe integer/,
+    `user mutation target ${JSON.stringify(invalidTargetId)} must be rejected`,
+  )
+}
 
 const failedBeginStorage = new FaultInjectingStorage()
 failedBeginStorage.ignoredSetKeys.add(PENDING_MUTATION_STORAGE_KEY)
@@ -419,7 +435,11 @@ assert.deepEqual(Array.from(boundedBatchResults), [
   'batch-0', 'batch-1', 'batch-2', 'batch-3', 'batch-4', 'batch-5', 'batch-6',
 ])
 
-const { cleanupAnalyticsBatchRun, replaceAnalyticsBatchRun } = loadTypeScriptModule('frontend/src/lib/analyticsBatch.ts')
+const {
+  cleanupAnalyticsBatchRun,
+  refreshAnalyticsBatchState,
+  replaceAnalyticsBatchRun,
+} = loadTypeScriptModule('frontend/src/lib/analyticsBatch.ts')
 const abortable = () => ({ aborted: false, abort() { this.aborted = true } })
 const oldBatch = { controller: abortable(), requestController: abortable(), timeout: 11 }
 const replacementBatch = { controller: abortable(), requestController: abortable(), timeout: 22 }
@@ -441,6 +461,102 @@ assert.equal(cleanupAnalyticsBatchRun(batchRunRef, replacementBatch, timeout => 
 assert.equal(batchRunRef.current, null)
 assert.equal(replacementBatch.requestController, null)
 assert.deepEqual(clearedBatchTimeouts, [11, 22])
+
+const refreshingBatch = { controller: abortable(), requestController: null, timeout: 33 }
+const refreshingBatchRef = { current: refreshingBatch }
+const refreshOrder = []
+let resolveSyncRefresh
+let resolveAnalyticsRefresh
+const finalRefreshLifecycle = (async () => {
+  try {
+    await refreshAnalyticsBatchState(
+      () => new Promise(resolve => {
+        refreshOrder.push('sync-started')
+        resolveSyncRefresh = () => {
+          refreshOrder.push('sync-finished')
+          resolve()
+        }
+      }),
+      () => new Promise(resolve => {
+        refreshOrder.push('analytics-started')
+        resolveAnalyticsRefresh = () => {
+          refreshOrder.push('analytics-finished')
+          resolve()
+        }
+      }),
+    )
+  } finally {
+    cleanupAnalyticsBatchRun(refreshingBatchRef, refreshingBatch, timeout => refreshOrder.push(`cleared-${timeout}`))
+  }
+})()
+await Promise.resolve()
+assert.deepEqual(refreshOrder, ['sync-started', 'analytics-started'])
+assert.equal(refreshingBatchRef.current, refreshingBatch, 'batch ownership must remain while final refreshes are pending')
+resolveSyncRefresh()
+await Promise.resolve()
+assert.equal(refreshingBatchRef.current, refreshingBatch, 'one completed refresh must not release batch ownership')
+resolveAnalyticsRefresh()
+await finalRefreshLifecycle
+assert.equal(refreshingBatchRef.current, null)
+assert.deepEqual(refreshOrder, [
+  'sync-started',
+  'analytics-started',
+  'sync-finished',
+  'analytics-finished',
+  'cleared-33',
+])
+
+const partiallyFailedBatch = { controller: abortable(), requestController: null, timeout: 44 }
+const partiallyFailedBatchRef = { current: partiallyFailedBatch }
+const partialFailureOrder = []
+const refreshFailure = new Error('sync refresh failed')
+let resolvePendingAnalyticsRefresh
+let observedRefreshFailure
+const partialFailureLifecycle = (async () => {
+  try {
+    await refreshAnalyticsBatchState(
+      async () => {
+        partialFailureOrder.push('sync-rejected')
+        throw refreshFailure
+      },
+      () => new Promise(resolve => {
+        partialFailureOrder.push('analytics-started')
+        resolvePendingAnalyticsRefresh = () => {
+          partialFailureOrder.push('analytics-finished')
+          resolve()
+        }
+      }),
+    )
+  } catch (error) {
+    observedRefreshFailure = error
+    partialFailureOrder.push('failure-observed')
+  } finally {
+    cleanupAnalyticsBatchRun(
+      partiallyFailedBatchRef,
+      partiallyFailedBatch,
+      timeout => partialFailureOrder.push(`cleared-${timeout}`),
+    )
+  }
+})()
+await Promise.resolve()
+await Promise.resolve()
+assert.equal(
+  partiallyFailedBatchRef.current,
+  partiallyFailedBatch,
+  'a rejected refresh must not release ownership while the other refresh is pending',
+)
+assert.deepEqual(partialFailureOrder, ['sync-rejected', 'analytics-started'])
+resolvePendingAnalyticsRefresh()
+await partialFailureLifecycle
+assert.equal(observedRefreshFailure, refreshFailure)
+assert.equal(partiallyFailedBatchRef.current, null)
+assert.deepEqual(partialFailureOrder, [
+  'sync-rejected',
+  'analytics-started',
+  'analytics-finished',
+  'failure-observed',
+  'cleared-44',
+])
 
 const monitor = read('frontend/src/components/ModelStatusMonitor.tsx')
 assert.match(monitor, /savedModels === null/)
@@ -493,7 +609,8 @@ const analytics = read('frontend/src/components/Analytics.tsx')
 assert.match(analytics, /replaceAnalyticsBatchRun\(batchRunRef, batchRun/)
 assert.match(analytics, /cleanupAnalyticsBatchRun\(batchRunRef, batchRun/)
 assert.match(analytics, /if \(batchRunRef\.current !== batchRun\) return/)
-assert.match(analytics, /else \{\s*void Promise\.all\(\[fetchSyncStatus\(\), fetchAnalytics\(\)\]\)\s*\}/)
+assert.match(analytics, /await refreshAnalyticsBatchState\(fetchSyncStatus, fetchAnalytics\)\s*\} finally/)
+assert.doesNotMatch(analytics, /void Promise\.all\(\[fetchSyncStatus\(\), fetchAnalytics\(\)\]\)/)
 
 const authContext = read('frontend/src/contexts/AuthContext.tsx')
 assert.match(authContext, /clearReusableIdempotencyKeys\(\)/)
@@ -537,6 +654,14 @@ assert.match(userAnalysis, /setBanReleaseCandidate\(current => operationReleaseC
 assert.match(userAnalysis, /operationReleaseCandidateMatches\(current, nextPending\)/)
 assert.doesNotMatch(userAnalysis, /getOrCreateIdempotencyKey|mutationResponseRequiresReconciliation|使用原内容重试/)
 const userManagement = read('frontend/src/components/UserManagement.tsx')
+const openPendingMutationDialogSource = userManagement.slice(
+  userManagement.indexOf('const openPendingMutationDialog'),
+  userManagement.indexOf('const deleteUser'),
+)
+const pendingTargetValidationIndex = openPendingMutationDialogSource.indexOf(
+  'parseUserMutationOperationTargetId(pending.operationIdentifier, pending.targetId)',
+)
+assert.ok(pendingTargetValidationIndex >= 0, 'pending user target validation must be present')
 const closeDeleteDialogSource = userManagement.slice(
   userManagement.indexOf('const closeDeleteDialog'),
   userManagement.indexOf('const reconcileDeleteUser'),
@@ -555,6 +680,16 @@ assert.match(userManagement, /bindOperationReleaseCandidate\(pending, reconcilia
 assert.match(userManagement, /setDeleteReleaseCandidate\(current => operationReleaseCandidateMatches\(current, pending\)/)
 assert.match(userManagement, /indexPendingMutationsByOperation<DeleteUserPendingMutation>\(listPendingMutations\(\), 'user'\)/)
 assert.match(userManagement, /pendingDeleteMutations\.get\(userMutationOperationIdentifier\(deleteUserTarget\.userId\)\) \?\? null/)
+assert.ok(
+  pendingTargetValidationIndex < openPendingMutationDialogSource.indexOf('rememberPendingDeleteMutation(pending)'),
+  'pending user target validation must run before the pending mutation enters component state',
+)
+assert.ok(
+  pendingTargetValidationIndex < openPendingMutationDialogSource.indexOf('setDeleteUserTarget'),
+  'pending user target validation must run before the dialog target is set',
+)
+assert.match(openPendingMutationDialogSource, /catch \(error\) \{[\s\S]*?showToast\(\s*'error',[\s\S]*?return\s*\}/)
+assert.doesNotMatch(openPendingMutationDialogSource, /clearPendingMutation/)
 assert.doesNotMatch(userManagement, /listPendingMutations\(\)\.find\(item => item\.targetType === 'user'\) \?\? null/)
 assert.doesNotMatch(userManagement, /使用原内容重试|Tool Store 未发现该操作意图，已安全释放/)
 

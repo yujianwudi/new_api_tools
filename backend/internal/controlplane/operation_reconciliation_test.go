@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
@@ -112,7 +113,7 @@ func TestLookupOperationReconciliationOutcomeStatuses(t *testing.T) {
 }
 
 func TestLookupOperationReconciliationRejectsIncompleteOrInconsistentChains(t *testing.T) {
-	t.Run("orphaned outcome remains locked", func(t *testing.T) {
+	t.Run("orphaned outcome is externally indistinguishable from missing", func(t *testing.T) {
 		store, err := toolstore.Init(filepath.Join(t.TempDir(), "operation-orphan.db"))
 		if err != nil {
 			t.Fatal(err)
@@ -128,9 +129,12 @@ func TestLookupOperationReconciliationRejectsIncompleteOrInconsistentChains(t *t
 		if err != nil {
 			t.Fatal(err)
 		}
+		previousLogger := logger.L
+		logger.L = nil
+		t.Cleanup(func() { logger.L = previousLogger })
 		_, err = LookupOperationReconciliation(context.Background(), store, key, "admin", "jwt")
-		if err == nil || errors.Is(err, toolstore.ErrNotFound) {
-			t.Fatalf("orphaned outcome error = %v, want non-not-found audit-chain error", err)
+		if !errors.Is(err, toolstore.ErrNotFound) {
+			t.Fatalf("orphaned outcome error = %v, want ErrNotFound", err)
 		}
 	})
 
@@ -151,7 +155,7 @@ func TestLookupOperationReconciliationRejectsIncompleteOrInconsistentChains(t *t
 			},
 		},
 	} {
-		t.Run("orphaned outcome "+test.name+" remains locked", func(t *testing.T) {
+		t.Run("orphaned outcome "+test.name+" is externally indistinguishable from missing", func(t *testing.T) {
 			store, err := toolstore.Init(filepath.Join(t.TempDir(), "operation-orphan-identity.db"))
 			if err != nil {
 				t.Fatal(err)
@@ -169,8 +173,8 @@ func TestLookupOperationReconciliationRejectsIncompleteOrInconsistentChains(t *t
 				t.Fatal(err)
 			}
 			_, err = LookupOperationReconciliation(context.Background(), store, key, "admin", "jwt")
-			if err == nil || errors.Is(err, toolstore.ErrNotFound) {
-				t.Fatalf("orphaned tampered outcome error = %v, want non-not-found audit-chain error", err)
+			if !errors.Is(err, toolstore.ErrNotFound) {
+				t.Fatalf("orphaned tampered outcome error = %v, want ErrNotFound", err)
 			}
 		})
 	}
@@ -222,6 +226,12 @@ func TestLookupOperationReconciliationRejectsIncompleteOrInconsistentChains(t *t
 			name: "outcome actor mismatch",
 			mutate: func(outcome *toolstore.OperationAuditInput) {
 				outcome.Actor = "different-actor"
+			},
+		},
+		{
+			name: "outcome source ip mismatch",
+			mutate: func(outcome *toolstore.OperationAuditInput) {
+				outcome.SourceIP = "198.51.100.23"
 			},
 		},
 		{

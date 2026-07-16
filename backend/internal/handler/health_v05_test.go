@@ -316,6 +316,47 @@ func TestDependencyProbeCoordinatorDoesNotLetShortWaiterDeadlinePoisonSharedProb
 	waitForDependencyProbeIdle(t, coordinator, probe.name)
 }
 
+func TestDependencyProbeCoordinatorCachesElapsedDeadlineBeforeTimerCallback(t *testing.T) {
+	coordinator := &dependencyProbeCoordinator{probeTimeout: time.Second}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	probe := dependencyProbe{name: "deadline-callback-race", check: func(context.Context) DependencyCheck {
+		close(started)
+		<-release
+		return DependencyCheck{Status: "healthy", OK: true}
+	}}
+
+	run, cached := coordinator.acquire(context.Background(), probe)
+	if cached != nil || run == nil {
+		t.Fatalf("probe acquire = run:%p cached:%#v", run, cached)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("dependency probe did not start")
+	}
+
+	// Model the narrow state where the coordinator deadline has elapsed but
+	// the timer callback has not acquired the mutex yet. The next lock holder
+	// must make the timeout durable instead of joining the stale live probe.
+	coordinator.mu.Lock()
+	run.deadline = time.Now().Add(-time.Millisecond)
+	coordinator.mu.Unlock()
+	late, cached := coordinator.acquire(context.Background(), probe)
+	if late != nil || cached == nil || cached.Status != "timeout" || cached.Details["probe_state"] != "still_running" {
+		t.Fatalf("elapsed coordinator deadline = run:%p cached:%#v, want cached timeout", late, cached)
+	}
+	coordinator.mu.Lock()
+	timedOut := run.timedOut
+	coordinator.mu.Unlock()
+	if !timedOut {
+		t.Fatal("elapsed coordinator deadline was returned but not cached on the shared run")
+	}
+
+	close(release)
+	waitForDependencyProbeIdle(t, coordinator, probe.name)
+}
+
 func waitForDependencyProbeIdle(t *testing.T, coordinator *dependencyProbeCoordinator, name string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

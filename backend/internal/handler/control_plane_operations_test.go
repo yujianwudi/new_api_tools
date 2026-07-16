@@ -119,7 +119,43 @@ func TestOperationReconciliationEndpointKeepsOwnedBrokenChainLocked(t *testing.T
 	}
 }
 
-func TestOperationReconciliationEndpointKeepsMalformedChainLockedWithoutLeakingDetails(t *testing.T) {
+func TestOperationReconciliationEndpointKeepsOwnedSourceIPMismatchLocked(t *testing.T) {
+	store, _ := newControlPlaneTestStore(t)
+	const key = "handler-source-ip-mismatch-chain"
+	beforeJSON := []byte(`{"request":{"action":"user.disable"}}`)
+	base := toolstore.OperationAuditInput{
+		RequestID: "handler-source-ip-mismatch-request", Actor: testControlPlaneActor,
+		SourceIP: testControlPlaneIP, AuthMethod: "jwt", TargetType: "user", TargetID: "78",
+		Reason: "risk review", BeforeJSON: beforeJSON, Status: toolstore.OperationSucceeded,
+		OccurredAt: time.Now(),
+	}
+	intent := base
+	intent.Action = "user.disable.intent"
+	intent.IdempotencyKey = "cp:" + key + ":intent"
+	if _, err := store.AppendOperationAudit(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	outcome := base
+	outcome.SourceIP = "198.51.100.23"
+	outcome.Action = "user.disable.outcome"
+	outcome.AfterJSON = []byte(`{}`)
+	outcome.IdempotencyKey = "cp:" + key + ":outcome"
+	if _, err := store.AppendOperationAudit(context.Background(), outcome); err != nil {
+		t.Fatal(err)
+	}
+
+	router := newControlPlaneTestRouter(store, true)
+	response := performControlPlaneRequest(t, router, http.MethodGet,
+		"/api/control-plane/operations/"+key, nil, "operation-reconcile-source-ip-mismatch")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("source-IP-mismatched chain reconciliation status = %d: %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), outcome.SourceIP) {
+		t.Fatalf("source-IP-mismatched chain leaked audit details: %s", response.Body.String())
+	}
+}
+
+func TestOperationReconciliationEndpointHidesOrphanedOutcomeAsMissing(t *testing.T) {
 	store, path := newControlPlaneTestStore(t)
 	const key = "handler-orphaned-operation"
 	_, err := store.AppendOperationAudit(context.Background(), toolstore.OperationAuditInput{
@@ -136,7 +172,7 @@ func TestOperationReconciliationEndpointKeepsMalformedChainLockedWithoutLeakingD
 	router := newControlPlaneTestRouter(store, true)
 	response := performControlPlaneRequest(t, router, http.MethodGet,
 		"/api/control-plane/operations/"+key, nil, "operation-reconcile-orphan")
-	if response.Code != http.StatusServiceUnavailable {
+	if response.Code != http.StatusNotFound {
 		t.Fatalf("orphaned reconciliation status = %d: %s", response.Code, response.Body.String())
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
@@ -153,7 +189,7 @@ func TestOperationReconciliationEndpointKeepsMalformedChainLockedWithoutLeakingD
 	}
 }
 
-func TestOperationReconciliationEndpointTreatsOrphanIdentityTamperingAsBrokenChain(t *testing.T) {
+func TestOperationReconciliationEndpointHidesOrphanIdentityTamperingAsMissing(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*toolstore.OperationAuditInput)
@@ -189,7 +225,7 @@ func TestOperationReconciliationEndpointTreatsOrphanIdentityTamperingAsBrokenCha
 			router := newControlPlaneTestRouter(store, true)
 			response := performControlPlaneRequest(t, router, http.MethodGet,
 				"/api/control-plane/operations/"+key, nil, "operation-reconcile-orphan-tampered")
-			if response.Code != http.StatusServiceUnavailable {
+			if response.Code != http.StatusNotFound {
 				t.Fatalf("orphan identity tamper status = %d: %s", response.Code, response.Body.String())
 			}
 			body := strings.ToLower(response.Body.String())

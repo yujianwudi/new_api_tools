@@ -2,7 +2,11 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
-import { cleanupAnalyticsBatchRun, replaceAnalyticsBatchRun } from '../lib/analyticsBatch'
+import {
+  cleanupAnalyticsBatchRun,
+  refreshAnalyticsBatchState,
+  replaceAnalyticsBatchRun,
+} from '../lib/analyticsBatch'
 import { RefreshCw, Trash2, AlertTriangle, Loader2, Timer, ChevronDown } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
@@ -611,17 +615,13 @@ export function Analytics() {
         window.clearTimeout(batchTimeout)
         batchRun.timeout = null
         showToast('success', `同步完成！共处理 ${batchRun.totalProcessed.toLocaleString()} 条日志`)
-        await Promise.all([fetchSyncStatus(), fetchAnalytics()])
       } else if (stopReason === 'manual') {
         showToast('info', '批处理已手动停止')
-        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       } else if (stopReason === 'timeout') {
         const elapsed = Date.now() - batchRun.startTime
         showToast('info', `批处理已运行 ${Math.max(1, Math.floor(elapsed / 60000))} 分钟，自动停止。可再次点击继续处理。`)
-        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
-      } else {
-        void Promise.all([fetchSyncStatus(), fetchAnalytics()])
       }
+      await refreshAnalyticsBatchState(fetchSyncStatus, fetchAnalytics)
     } finally {
       if (cleanupAnalyticsBatchRun(batchRunRef, batchRun, timeout => window.clearTimeout(timeout))) {
         setBatchProcessing(false)

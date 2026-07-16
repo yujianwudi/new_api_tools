@@ -56,6 +56,8 @@ type dependencyProbeRun struct {
 	probe         dependencyProbe
 	done          chan struct{}
 	expired       chan struct{}
+	startedAt     time.Time
+	deadline      time.Time
 	result        DependencyCheck
 	completed     bool
 	timedOut      bool
@@ -288,6 +290,7 @@ func (c *dependencyProbeCoordinator) acquire(ctx context.Context, probe dependen
 		c.active = make(map[string]*dependencyProbeRun)
 	}
 	if run := c.active[probe.name]; run != nil {
+		c.expireIfDeadlinePassedLocked(run, time.Now())
 		if run.timedOut {
 			check := run.timeoutResult
 			c.mu.Unlock()
@@ -312,6 +315,10 @@ func (c *dependencyProbeCoordinator) execute(run *dependencyProbeRun) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeoutDuration())
 	defer cancel()
 	deadline, _ := ctx.Deadline()
+	c.mu.Lock()
+	run.startedAt = started
+	run.deadline = deadline
+	c.mu.Unlock()
 	timer := time.AfterFunc(time.Until(deadline), func() {
 		c.expire(run, time.Since(started))
 	})
@@ -324,6 +331,7 @@ func (c *dependencyProbeCoordinator) execute(run *dependencyProbeRun) {
 	check.LatencyMS = time.Since(started).Milliseconds()
 
 	c.mu.Lock()
+	c.expireIfDeadlinePassedLocked(run, time.Now())
 	run.result = check
 	run.completed = true
 	if c.active[run.probe.name] == run {
@@ -343,6 +351,17 @@ func (c *dependencyProbeCoordinator) timeoutDuration() time.Duration {
 func (c *dependencyProbeCoordinator) expire(run *dependencyProbeRun, elapsed time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.expireLocked(run, elapsed)
+}
+
+func (c *dependencyProbeCoordinator) expireIfDeadlinePassedLocked(run *dependencyProbeRun, now time.Time) {
+	if run.deadline.IsZero() || now.Before(run.deadline) {
+		return
+	}
+	c.expireLocked(run, now.Sub(run.startedAt))
+}
+
+func (c *dependencyProbeCoordinator) expireLocked(run *dependencyProbeRun, elapsed time.Duration) {
 	if run.completed || run.timedOut {
 		return
 	}
@@ -374,6 +393,7 @@ func (c *dependencyProbeCoordinator) completedResult(run *dependencyProbeRun) De
 func (c *dependencyProbeCoordinator) timeout(run *dependencyProbeRun, collectionStarted time.Time, err error) DependencyCheck {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.expireIfDeadlinePassedLocked(run, time.Now())
 	if run.timedOut {
 		return run.timeoutResult
 	}
@@ -381,8 +401,8 @@ func (c *dependencyProbeCoordinator) timeout(run *dependencyProbeRun, collection
 		return run.result
 	}
 	// Request cancellation and shorter upstream deadlines belong only to this
-	// waiter. The coordinator's own expiry timer is the sole authority allowed
-	// to poison/cache a shared run.
+	// waiter. Only the coordinator's own deadline, observed either by its timer
+	// or by a lock holder after that timer is due, may poison/cache a shared run.
 	return dependencyProbeTimeout(run.probe, time.Since(collectionStarted), err)
 }
 

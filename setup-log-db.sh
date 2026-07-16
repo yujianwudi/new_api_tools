@@ -772,13 +772,10 @@ atomic_write_setup_file() {
 
 LOG_ENV_ATTEMPT_CONTENT=""
 LOG_ENV_ATTEMPT_READY=false
-persist_log_db_env() {
-  local dsn="$1" log_network="${2:-}" required_identity="${3:-}"
+BUILT_LOG_ENV_CONTENT=""
+build_log_db_env_content() {
+  local dsn="$1" log_network="${2:-}" source_content="$3"
   local content quoted_dsn quoted_network
-  load_setup_file_image "$ENV_FILE" || return 1
-  if [[ -n "$required_identity" && "$SETUP_FILE_IDENTITY" != "$required_identity" ]]; then
-    return 1
-  fi
   [[ "$log_network" != *$'\n'* && "$log_network" != *$'\r'* ]] || return 1
   quoted_dsn="$(dotenv_quote "$dsn")" || return 1
   quoted_network="$(dotenv_quote "$log_network")" || return 1
@@ -788,14 +785,25 @@ persist_log_db_env() {
       index($0, "LOG_SQL_DSN=") == 1 { next }
       index($0, "LOG_NETWORK=") == 1 { next }
       { print }
-    ' <<< "$SETUP_FILE_CONTENT"
+    ' <<< "$source_content"
     printf 'LOG_SQL_DSN=%s\n' "$quoted_dsn"
     printf 'LOG_NETWORK=%s\n' "$quoted_network"
   )" || return 1
 
-  LOG_ENV_ATTEMPT_CONTENT="$content"
+  BUILT_LOG_ENV_CONTENT="$content"
+}
+
+persist_log_db_env() {
+  local dsn="$1" log_network="${2:-}" required_identity="${3:-}"
+  load_setup_file_image "$ENV_FILE" || return 1
+  if [[ -n "$required_identity" && "$SETUP_FILE_IDENTITY" != "$required_identity" ]]; then
+    return 1
+  fi
+  build_log_db_env_content "$dsn" "$log_network" "$SETUP_FILE_CONTENT" || return 1
+
+  LOG_ENV_ATTEMPT_CONTENT="$BUILT_LOG_ENV_CONTENT"
   LOG_ENV_ATTEMPT_READY=true
-  atomic_write_setup_file "$ENV_FILE" "$content" "$SETUP_FILE_IDENTITY"
+  atomic_write_setup_file "$ENV_FILE" "$BUILT_LOG_ENV_CONTENT" "$SETUP_FILE_IDENTITY"
 }
 
 # 写 docker-compose.override.yml，把日志库网络固化进工具服务。
@@ -813,6 +821,295 @@ LOG_OVERRIDE_ATTEMPT_READY=false
 LOG_OVERRIDE_ATTEMPT_REMOVED=false
 LOG_ENV_SNAPSHOT_CONTENT=""
 LOG_ENV_SNAPSHOT_IDENTITY=""
+LOG_ENV_CANDIDATE_CONTENT=""
+LOG_OVERRIDE_CANDIDATE_EXISTS=false
+LOG_OVERRIDE_CANDIDATE_CONTENT=""
+BUILT_LOG_OVERRIDE_CONTENT=""
+SETUP_TRANSACTION_FILE_CONTENT=""
+
+log_db_transaction_marker_path() {
+  printf '%s/.setup-log-db.transaction\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_env_snapshot_path() {
+  printf '%s/.setup-log-db.transaction.env.snapshot\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_override_snapshot_path() {
+  printf '%s/.setup-log-db.transaction.override.snapshot\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_env_candidate_path() {
+  printf '%s/.setup-log-db.transaction.env.candidate\n' "$PROJECT_DIR"
+}
+
+log_db_transaction_override_candidate_path() {
+  printf '%s/.setup-log-db.transaction.override.candidate\n' "$PROJECT_DIR"
+}
+
+load_mode600_setup_transaction_file() {
+  local target="$1" identity metadata mode owner
+  load_setup_file_image "$target" || return 1
+  identity="$SETUP_FILE_IDENTITY"
+  metadata="$(stat -Lc '%a %u' -- "$target" 2>/dev/null)" || return 1
+  read -r mode owner <<< "$metadata"
+  [[ "$mode" == "600" && "$owner" == "$(setup_state_lock_current_uid)" ]] || return 1
+  setup_target_matches_identity "$target" "$identity" || return 1
+  SETUP_TRANSACTION_FILE_CONTENT="$SETUP_FILE_CONTENT"
+}
+
+durable_remove_setup_transaction_file() {
+  local target="$1" parent identity metadata mode owner
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    return 0
+  fi
+  identity="$(setup_target_identity "$target")" || return 1
+  metadata="$(stat -Lc '%a %u' -- "$target" 2>/dev/null)" || return 1
+  read -r mode owner <<< "$metadata"
+  [[ "$mode" == "600" && "$owner" == "$(setup_state_lock_current_uid)" ]] || return 1
+  setup_target_matches_identity "$target" "$identity" || return 1
+  parent="$(dirname -- "$target")"
+  rm -f -- "$target" || return 1
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  sync -f "$parent"
+}
+
+discard_stale_log_db_transaction_snapshots() {
+  local env_snapshot override_snapshot env_candidate override_candidate status=0
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+  durable_remove_setup_transaction_file "$env_snapshot" || status=1
+  durable_remove_setup_transaction_file "$override_snapshot" || status=1
+  durable_remove_setup_transaction_file "$env_candidate" || status=1
+  durable_remove_setup_transaction_file "$override_candidate" || status=1
+  return "$status"
+}
+
+# The marker is the authoritative transaction record. It is published only
+# after both old file images are durable, and removed before stale snapshots so
+# a crash during cleanup commits the already-healthy candidate instead of
+# resurrecting the old configuration on the next invocation.
+complete_log_db_configuration_transaction() {
+  local marker
+  marker="$(log_db_transaction_marker_path)"
+  durable_remove_setup_transaction_file "$marker" || return 1
+  discard_stale_log_db_transaction_snapshots
+}
+
+normalize_persisted_log_network() {
+  local persisted_log_network="${1:-}" main_network
+  main_network="$(read_env_value NEWAPI_NETWORK)"
+  if [[ -n "$persisted_log_network" && "$persisted_log_network" == "$main_network" ]]; then
+    persisted_log_network=""
+  fi
+  printf '%s\n' "$persisted_log_network"
+}
+
+plan_log_network_override_candidate() {
+  local persisted_log_network="${1:-}"
+  LOG_OVERRIDE_CANDIDATE_EXISTS=false
+  LOG_OVERRIDE_CANDIDATE_CONTENT=""
+  if [[ -n "$persisted_log_network" ]]; then
+    if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]] &&
+      ! grep -Fxq "$LOG_OVERRIDE_MARKER" <<< "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+      return 1
+    fi
+    build_log_network_override_content "$persisted_log_network" || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$BUILT_LOG_OVERRIDE_CONTENT"
+  elif [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]] &&
+    ! grep -Fxq "$LOG_OVERRIDE_MARKER" <<< "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+    # A user-managed override is intentionally retained when no extra generated
+    # log-network attachment is needed.
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$LOG_OVERRIDE_SNAPSHOT_CONTENT"
+  fi
+}
+
+begin_log_db_configuration_transaction() {
+  local dsn="$1" persisted_log_network="${2:-}"
+  local marker env_snapshot override_snapshot env_candidate override_candidate
+  local old_override_state candidate_override_state marker_content
+  marker="$(log_db_transaction_marker_path)"
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+
+  [[ ! -e "$marker" && ! -L "$marker" ]] || {
+    log_error "检测到尚未恢复的日志库配置事务：${marker}"
+    return 1
+  }
+  discard_stale_log_db_transaction_snapshots || {
+    log_error "无法安全清理旧日志库配置事务快照"
+    return 1
+  }
+  capture_log_db_env_snapshot || return 1
+  capture_log_network_override_snapshot || return 1
+  persisted_log_network="$(normalize_persisted_log_network "$persisted_log_network")" || return 1
+  build_log_db_env_content "$dsn" "$persisted_log_network" "$LOG_ENV_SNAPSHOT_CONTENT" || return 1
+  LOG_ENV_CANDIDATE_CONTENT="$BUILT_LOG_ENV_CONTENT"
+  plan_log_network_override_candidate "$persisted_log_network" || return 1
+
+  if ! atomic_write_setup_file "$env_snapshot" "$LOG_ENV_SNAPSHOT_CONTENT" ||
+    ! atomic_write_setup_file "$env_candidate" "$LOG_ENV_CANDIDATE_CONTENT"; then
+    discard_stale_log_db_transaction_snapshots || true
+    return 1
+  fi
+  if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]]; then
+    old_override_state="present"
+    if ! atomic_write_setup_file "$override_snapshot" "$LOG_OVERRIDE_SNAPSHOT_CONTENT"; then
+      discard_stale_log_db_transaction_snapshots || true
+      return 1
+    fi
+  else
+    old_override_state="absent"
+  fi
+  if [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "true" ]]; then
+    candidate_override_state="present"
+    if ! atomic_write_setup_file "$override_candidate" "$LOG_OVERRIDE_CANDIDATE_CONTENT"; then
+      discard_stale_log_db_transaction_snapshots || true
+      return 1
+    fi
+  else
+    candidate_override_state="absent"
+  fi
+  marker_content="$(printf 'version=2\nold_override=%s\ncandidate_override=%s' \
+    "$old_override_state" "$candidate_override_state")"
+  if ! atomic_write_setup_file "$marker" "$marker_content"; then
+    # atomic_write_setup_file can fail after the marker rename when only the
+    # parent-directory fsync fails. In that state the marker may already be the
+    # authoritative transaction record, so deleting its backing images would
+    # strand an unrecoverable marker. Preserve every artifact whenever the
+    # marker path exists; a later locked startup can either recover it or fail
+    # closed without losing the rollback evidence.
+    if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+      discard_stale_log_db_transaction_snapshots || true
+    fi
+    return 1
+  fi
+}
+
+load_persistent_log_db_transaction() {
+  local marker env_snapshot override_snapshot env_candidate override_candidate
+  local marker_content old_override_state candidate_override_state
+  marker="$(log_db_transaction_marker_path)"
+  env_snapshot="$(log_db_transaction_env_snapshot_path)"
+  override_snapshot="$(log_db_transaction_override_snapshot_path)"
+  env_candidate="$(log_db_transaction_env_candidate_path)"
+  override_candidate="$(log_db_transaction_override_candidate_path)"
+
+  load_mode600_setup_transaction_file "$marker" || return 1
+  marker_content="$SETUP_TRANSACTION_FILE_CONTENT"
+  case "$marker_content" in
+    $'version=2\nold_override=present\ncandidate_override=present')
+      old_override_state="present"; candidate_override_state="present" ;;
+    $'version=2\nold_override=present\ncandidate_override=absent')
+      old_override_state="present"; candidate_override_state="absent" ;;
+    $'version=2\nold_override=absent\ncandidate_override=present')
+      old_override_state="absent"; candidate_override_state="present" ;;
+    $'version=2\nold_override=absent\ncandidate_override=absent')
+      old_override_state="absent"; candidate_override_state="absent" ;;
+    *) return 1 ;;
+  esac
+
+  load_mode600_setup_transaction_file "$env_snapshot" || return 1
+  LOG_ENV_SNAPSHOT_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  load_mode600_setup_transaction_file "$env_candidate" || return 1
+  LOG_ENV_CANDIDATE_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  if [[ "$old_override_state" == "present" ]]; then
+    load_mode600_setup_transaction_file "$override_snapshot" || return 1
+    LOG_OVERRIDE_SNAPSHOT_EXISTS=true
+    LOG_OVERRIDE_SNAPSHOT_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  else
+    [[ ! -e "$override_snapshot" && ! -L "$override_snapshot" ]] || return 1
+    LOG_OVERRIDE_SNAPSHOT_EXISTS=false
+    LOG_OVERRIDE_SNAPSHOT_CONTENT=""
+  fi
+  if [[ "$candidate_override_state" == "present" ]]; then
+    load_mode600_setup_transaction_file "$override_candidate" || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=true
+    LOG_OVERRIDE_CANDIDATE_CONTENT="$SETUP_TRANSACTION_FILE_CONTENT"
+  else
+    [[ ! -e "$override_candidate" && ! -L "$override_candidate" ]] || return 1
+    LOG_OVERRIDE_CANDIDATE_EXISTS=false
+    LOG_OVERRIDE_CANDIDATE_CONTENT=""
+  fi
+}
+
+# Called by main only after the shared project flock is held. An incomplete
+# transaction is always rolled back to its durable old file images and the old
+# service is force-recreated before the marker is cleared.
+recover_incomplete_log_db_transaction() {
+  local marker override env_current_content env_current_identity
+  local override_current_exists=false override_current_content="" override_current_identity="absent"
+  local override_matches_old=false override_matches_candidate=false
+  marker="$(log_db_transaction_marker_path)"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    discard_stale_log_db_transaction_snapshots
+    return
+  fi
+
+  load_persistent_log_db_transaction || {
+    log_error "日志库配置事务记录不安全、损坏或权限不是 0600"
+    return 1
+  }
+  load_setup_file_image "$ENV_FILE" || return 1
+  env_current_content="$SETUP_FILE_CONTENT"
+  env_current_identity="$SETUP_FILE_IDENTITY"
+  if [[ "$env_current_content" != "$LOG_ENV_SNAPSHOT_CONTENT" &&
+    "$env_current_content" != "$LOG_ENV_CANDIDATE_CONTENT" ]]; then
+    log_error "中断事务后的 .env 既不等于旧文件像也不等于候选文件像；拒绝覆盖人工修改"
+    return 1
+  fi
+
+  override="${PROJECT_DIR}/docker-compose.override.yml"
+  if [[ -e "$override" || -L "$override" ]]; then
+    load_setup_file_image "$override" || return 1
+    override_current_exists=true
+    override_current_content="$SETUP_FILE_CONTENT"
+    override_current_identity="$SETUP_FILE_IDENTITY"
+  fi
+  if [[ "$LOG_OVERRIDE_SNAPSHOT_EXISTS" == "true" ]]; then
+    [[ "$override_current_exists" == "true" &&
+      "$override_current_content" == "$LOG_OVERRIDE_SNAPSHOT_CONTENT" ]] &&
+      override_matches_old=true
+  else
+    [[ "$override_current_exists" == "false" ]] && override_matches_old=true
+  fi
+  if [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "true" ]]; then
+    [[ "$override_current_exists" == "true" &&
+      "$override_current_content" == "$LOG_OVERRIDE_CANDIDATE_CONTENT" ]] &&
+      override_matches_candidate=true
+  else
+    [[ "$override_current_exists" == "false" ]] && override_matches_candidate=true
+  fi
+  if [[ "$override_matches_old" != "true" && "$override_matches_candidate" != "true" ]]; then
+    log_error "中断事务后的 Compose override 既不等于旧文件像也不等于候选文件像；拒绝覆盖人工修改"
+    return 1
+  fi
+
+  # Only populate the rollback attempt after both current files have passed the
+  # complete old-or-candidate image check. This avoids a partial rollback when
+  # either file was edited outside the advisory lock after the crash.
+  LOG_ENV_SNAPSHOT_IDENTITY="$env_current_identity"
+  LOG_ENV_ATTEMPT_CONTENT="$LOG_ENV_CANDIDATE_CONTENT"
+  LOG_ENV_ATTEMPT_READY=true
+  LOG_OVERRIDE_SNAPSHOT_IDENTITY="$override_current_identity"
+  LOG_OVERRIDE_ATTEMPT_CONTENT="$LOG_OVERRIDE_CANDIDATE_CONTENT"
+  LOG_OVERRIDE_ATTEMPT_READY="$LOG_OVERRIDE_CANDIDATE_EXISTS"
+  LOG_OVERRIDE_ATTEMPT_REMOVED=false
+  [[ "$LOG_OVERRIDE_CANDIDATE_EXISTS" == "false" ]] && LOG_OVERRIDE_ATTEMPT_REMOVED=true
+
+  log_warn "检测到中断的日志库配置事务，正在恢复旧配置与旧服务"
+  restore_log_db_env_snapshot || return 1
+  restore_log_network_override_snapshot || return 1
+  run_setup_compose_recreate || return 1
+  complete_log_db_configuration_transaction || return 1
+  log_success "已恢复中断事务中的旧日志库配置与服务"
+}
 
 capture_log_db_env_snapshot() {
   load_setup_file_image "$ENV_FILE" || return 1
@@ -884,15 +1181,32 @@ restore_log_network_override_snapshot() {
   sync -f "$PROJECT_DIR"
 }
 
-write_log_network_override() {
+build_log_network_override_content() {
   local net="$1"
-  local override="${PROJECT_DIR}/docker-compose.override.yml" content
-  local main_net; main_net="$(read_env_value NEWAPI_NETWORK)"
-
   [[ "$net" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || {
     log_error "日志库 Docker 网络名格式无效"
     return 1
   }
+
+  BUILT_LOG_OVERRIDE_CONTENT="$(cat <<EOF
+# 由 setup-log-db.sh 自动生成：把 newapi-tools 接入日志库所在的 docker 网络，
+# 使「docker compose up」重建后日志库连接依然可用。请勿手改；重跑 setup-log-db.sh 会覆盖。
+services:
+  ${TOOLS_CONTAINER}:
+    networks:
+      - ${LOG_OVERRIDE_NET_NAME}
+networks:
+  ${LOG_OVERRIDE_NET_NAME}:
+    external: true
+    name: '${net}'
+EOF
+  )"
+}
+
+write_log_network_override() {
+  local net="$1"
+  local override="${PROJECT_DIR}/docker-compose.override.yml"
+  local main_net; main_net="$(read_env_value NEWAPI_NETWORK)"
 
   # 日志库网络与主库网络相同 → 工具已经在上面，无需 override（避免重复挂同一网络报错）
   if [[ -n "$main_net" && "$net" == "$main_net" ]]; then
@@ -912,22 +1226,10 @@ write_log_network_override() {
     }
   fi
 
-  content="$(cat <<EOF
-# 由 setup-log-db.sh 自动生成：把 newapi-tools 接入日志库所在的 docker 网络，
-# 使「docker compose up」重建后日志库连接依然可用。请勿手改；重跑 setup-log-db.sh 会覆盖。
-services:
-  ${TOOLS_CONTAINER}:
-    networks:
-      - ${LOG_OVERRIDE_NET_NAME}
-networks:
-  ${LOG_OVERRIDE_NET_NAME}:
-    external: true
-    name: '${net}'
-EOF
-  )"
-  LOG_OVERRIDE_ATTEMPT_CONTENT="$content"
+  build_log_network_override_content "$net" || return 1
+  LOG_OVERRIDE_ATTEMPT_CONTENT="$BUILT_LOG_OVERRIDE_CONTENT"
   LOG_OVERRIDE_ATTEMPT_READY=true
-  atomic_write_setup_file "$override" "$content" || {
+  atomic_write_setup_file "$override" "$BUILT_LOG_OVERRIDE_CONTENT" || {
     log_error "无法原子持久化日志库 Compose override"
     return 1
   }
@@ -964,14 +1266,9 @@ remove_generated_log_network_override() {
 
 commit_log_db_configuration() {
   local dsn="$1" persisted_log_network="${2:-}"
-  local main_network
-  main_network="$(read_env_value NEWAPI_NETWORK)"
-  if [[ -n "$persisted_log_network" && "$persisted_log_network" == "$main_network" ]]; then
-    # The base Compose manifest already attaches newapi-tools to the main
-    # NewAPI network. Persisting the same network as LOG_NETWORK would make a
-    # later installer attach that external network under a second logical name.
-    persisted_log_network=""
-  fi
+  # The base Compose manifest already attaches newapi-tools to the main NewAPI
+  # network. Persisting it again would attach one external network twice.
+  persisted_log_network="$(normalize_persisted_log_network "$persisted_log_network")" || return 1
   LOG_ENV_ATTEMPT_CONTENT=""
   LOG_ENV_ATTEMPT_READY=false
   LOG_OVERRIDE_ATTEMPT_CONTENT=""
@@ -1071,6 +1368,8 @@ main() {
   if [[ "$MODE" != "--print" ]]; then
     need_cmd flock
     acquire_setup_state_lock "$PROJECT_DIR"
+    recover_incomplete_log_db_transaction ||
+      die "无法安全恢复中断的日志库配置事务；已保留 0600 快照与 marker，请检查文件和 docker compose 状态"
   fi
 
   echo ""
@@ -1162,11 +1461,16 @@ main() {
   # 4) 一次性提交完整 .env。LOG_NETWORK 同时持久化，确保后续
   # install.sh/deploy.sh 仍会选择 docker-compose.logdb.yml，不会在升级后丢网。
   local persisted_log_network="$need_network"
-  # 5) 先提交不含凭据的 override，再提交 .env。跨文件无法做到单次 rename，
-  # 因此保存旧 override 快照：override 失败时 .env 尚未变化，.env 失败时
-  # 原子恢复 override。进程在两次提交间崩溃也只会多接一条网络，重跑可收敛。
-  commit_log_db_configuration "$final_dsn" "$persisted_log_network" ||
-    die "日志库配置事务失败；旧 .env/override 已尝试恢复，可安全重跑"
+  # 5) 先持久化 mode-600 旧文件快照与 marker，再提交不含凭据的 override
+  # 和 .env。marker 会跨越候选服务 recreate；任意进程崩溃都由下一次持锁
+  # 启动恢复旧配置和旧服务，只有候选健康（或 --no-restart 明确提交）后才清理。
+  begin_log_db_configuration_transaction "$final_dsn" "$persisted_log_network" ||
+    die "无法持久化日志库配置事务快照；配置尚未修改"
+  if ! commit_log_db_configuration "$final_dsn" "$persisted_log_network"; then
+    recover_incomplete_log_db_transaction ||
+      die "高危：日志库配置提交失败，且无法从持久事务快照恢复旧配置/服务"
+    die "日志库配置事务失败；旧 .env/override 与旧服务已恢复，可安全重跑"
+  fi
   log_success "已写入 $ENV_FILE"
 
   if [[ "$MODE" == "--no-restart" ]]; then
@@ -1185,6 +1489,8 @@ main() {
       ! -L "${PROJECT_DIR}/docker-compose.override.yml" ]]; then
       manual_compose_files+=" -f docker-compose.override.yml"
     fi
+    complete_log_db_configuration_transaction ||
+      die "配置已写入但无法持久清理事务记录；请检查 ${PROJECT_DIR}/.setup-log-db.transaction*"
     log_info "--no-restart：已写入 .env，未重建容器。稍后请手动："
     echo "    cd $PROJECT_DIR && docker compose --env-file .env ${manual_compose_files} up -d --force-recreate --wait $TOOLS_CONTAINER"
     exit 0
@@ -1199,8 +1505,15 @@ main() {
     restart_status=$?
   fi
   case "$restart_status" in
-    0) ;;
-    10) die "日志库配置重建失败，已恢复旧配置与旧服务；可修正后安全重跑" ;;
+    0)
+      complete_log_db_configuration_transaction ||
+        die "候选服务已健康，但无法持久清理日志库配置事务记录；请检查 mode-600 marker"
+      ;;
+    10)
+      complete_log_db_configuration_transaction ||
+        die "旧配置与旧服务已恢复，但无法持久清理日志库配置事务记录"
+      die "日志库配置重建失败，已恢复旧配置与旧服务；可修正后安全重跑"
+      ;;
     *) die "高危：日志库配置重建与旧服务恢复均失败，请立即检查 docker compose ps/logs" ;;
   esac
 

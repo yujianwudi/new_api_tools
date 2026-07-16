@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -33,13 +34,24 @@ func (s *Store) AppendOperationAuditWithReconciliationRun(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	audit, err := s.appendOperationAudit(ctx, tx, auditInput)
+	audit, auditClaimed, err := s.appendOperationAuditClaim(ctx, tx, auditInput)
 	if err != nil {
 		return OperationAudit{}, ReconciliationRun{}, err
+	}
+	_, runLookupErr := getReconciliationRun(ctx, tx, "run_key", strings.TrimSpace(runInput.RunKey))
+	if runLookupErr != nil && !errors.Is(runLookupErr, ErrNotFound) {
+		return OperationAudit{}, ReconciliationRun{}, runLookupErr
 	}
 	run, err := s.createReconciliationRun(ctx, tx, runInput)
 	if err != nil {
 		return OperationAudit{}, ReconciliationRun{}, err
+	}
+	runClaimed := errors.Is(runLookupErr, ErrNotFound)
+	if auditClaimed != runClaimed {
+		return OperationAudit{}, ReconciliationRun{}, fmt.Errorf(
+			"%w: operation audit and reconciliation run must be created or replayed together",
+			ErrConflict,
+		)
 	}
 	if err := tx.Commit(); err != nil {
 		return OperationAudit{}, ReconciliationRun{}, fmt.Errorf("commit operation audit and reconciliation: %w", err)

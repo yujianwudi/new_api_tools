@@ -181,6 +181,10 @@ fi
 if grep -Fq '稳定部署应使用 `0.2.0` 或 digest。' RELEASE_0.2.0.md; then
   fail 'historical release notes must not recommend a mutable OCI tag for stable deployment'
 fi
+grep -Fq \
+  '`latest`、`0.2`、`0.2.0` 与短提交 SHA 都是可变 OCI tag，均可被重新指向其他镜像。' \
+  RELEASE_0.2.0.md ||
+  fail 'historical release notes must identify every published v0.2 image alias as mutable'
 
 if grep -Eqs 'bash[[:space:]]*<\([[:space:]]*curl|curl[^#|]*\|[[:space:]]*(ba)?sh' \
   install.sh "${release_docs[@]}"; then
@@ -198,7 +202,8 @@ pending_release_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]
   fail 'could not determine the pending source release version'
 
 release_target_for_version() {
-  local version="$1" tag="refs/tags/v${version}"
+  local version="$1" tag
+  tag="refs/tags/v${version}"
   if git show-ref --verify --quiet "$tag"; then
     printf '%s^{commit}\n' "$tag"
   elif [[ "$version" == "$pending_release_version" ]]; then
@@ -249,6 +254,12 @@ validate_release_installer_pin() {
     fail "$release_doc release install template must download from the pinned installer commit"
   grep -Fq 'sha256sum -c -' "$release_doc" ||
     fail "$release_doc release install template must verify the downloaded installer"
+  if release_version_at_least "$version" '0.5.1'; then
+    grep -Fq \
+      'printf '\''%s  %s\n'\'' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1' \
+      "$release_doc" ||
+      fail "$release_doc release install template must stop before execution when checksum verification fails"
+  fi
 }
 
 for release_doc in "${versioned_release_docs[@]}"; do

@@ -82,7 +82,7 @@ trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   "https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh" \
   --output "$install_script"
-printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c -
+printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1
 NEWAPI_TOOLS_REF=v0.5.1 \
 NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
 NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \

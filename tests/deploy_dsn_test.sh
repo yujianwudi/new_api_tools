@@ -3269,6 +3269,34 @@ assert_eq \
   '1|unchanged|640|0' \
   install_migration_rename_failure_preserves_old_dotenv
 
+install_observability_token_sha256_fallback() (
+  local fixture env_file token
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT
+  env_file="${fixture}/.env"
+  printf '%s\n' \
+    'SQL_DSN=' \
+    'NEWAPI_BASEURL=http://new-api:3000' > "$env_file"
+  chmod 600 "$env_file"
+  migrate_image_env_file() { :; }
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  openssl() { return 1; }
+  # The fallback must not depend on the optional vim-common/xxd package.
+  xxd() { return 97; }
+  migrate_env_file "$fixture" >/dev/null
+  token="$(env_file_value "$env_file" OBSERVABILITY_TOKEN)"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "${#token}|sha256sum"
+)
+
+assert_eq \
+  'installer observability token fallback uses required sha256sum without xxd' \
+  '64|sha256sum' \
+  install_observability_token_sha256_fallback
+
 install_safety_rewrite_rename_failure_preserves_old_dotenv() (
   local fixture env_file before after status tmp_count
   fixture="$(mktemp -d)"

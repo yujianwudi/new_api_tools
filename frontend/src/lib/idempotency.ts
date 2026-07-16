@@ -317,6 +317,25 @@ export function clearReusableIdempotencyKeys(): void {
   }
 }
 
+export function parseUserMutationTargetId(targetId: string): number {
+  if (typeof targetId !== 'string' || !/^[1-9]\d*$/.test(targetId)) {
+    throw new Error('User mutation target must be a positive safe integer')
+  }
+  const userId = Number(targetId)
+  if (!Number.isSafeInteger(userId) || userId <= 0) {
+    throw new Error('User mutation target must be a positive safe integer')
+  }
+  return userId
+}
+
+export function parseUserMutationOperationTargetId(operationIdentifier: string, targetId: string): number {
+  const userId = parseUserMutationTargetId(targetId)
+  if (operationIdentifier !== userMutationOperationIdentifier(userId)) {
+    throw new Error('User mutation operation identifier does not match its target')
+  }
+  return userId
+}
+
 export function userMutationOperationIdentifier(userId: number): string {
   if (!Number.isSafeInteger(userId) || userId <= 0) {
     throw new Error('User mutation target must be a positive safe integer')

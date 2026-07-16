@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
@@ -58,17 +59,24 @@ func LookupOperationReconciliation(
 	intent, err := store.GetOperationAuditByIdempotencyKey(ctx, "cp:"+key+":intent")
 	if err != nil {
 		if errors.Is(err, toolstore.ErrNotFound) {
-			_, outcomeErr := store.GetOperationAuditByIdempotencyKey(ctx, "cp:"+key+":outcome")
+			outcome, outcomeErr := store.GetOperationAuditByIdempotencyKey(ctx, "cp:"+key+":outcome")
 			if errors.Is(outcomeErr, toolstore.ErrNotFound) {
 				return OperationReconciliation{}, toolstore.ErrNotFound
 			}
 			if outcomeErr != nil {
 				return OperationReconciliation{}, fmt.Errorf("read orphaned operation outcome: %w", outcomeErr)
 			}
-			// An outcome without its intent is an integrity failure regardless of
-			// the identity fields stored on the orphan. Mapping those fields first
-			// would let corruption collapse into a misleading not-found response.
-			return OperationReconciliation{}, errors.New("operation outcome is missing its intent audit")
+			// Never let the presence or identity fields of an orphaned outcome turn
+			// this lookup into an idempotency-key oracle. Record the integrity
+			// anomaly internally using only its immutable row ID, then preserve the
+			// same external not-found contract as a genuinely missing operation.
+			if logger.L != nil {
+				logger.L.Security(fmt.Sprintf(
+					"operation audit integrity anomaly: outcome audit_id=%d is missing its intent",
+					outcome.ID,
+				))
+			}
+			return OperationReconciliation{}, toolstore.ErrNotFound
 		}
 		return OperationReconciliation{}, fmt.Errorf("read operation intent: %w", err)
 	}
@@ -158,6 +166,7 @@ func validateOperationAuditChain(intent, outcome toolstore.OperationAudit) error
 	if outcome.ID <= intent.ID || requestID == "" || requestID != strings.TrimSpace(outcome.RequestID) ||
 		intentAction == "" || intentAction != outcomeAction ||
 		strings.TrimSpace(intent.Actor) != strings.TrimSpace(outcome.Actor) ||
+		strings.TrimSpace(intent.SourceIP) != strings.TrimSpace(outcome.SourceIP) ||
 		strings.TrimSpace(intent.AuthMethod) != strings.TrimSpace(outcome.AuthMethod) ||
 		strings.TrimSpace(intent.TargetType) != strings.TrimSpace(outcome.TargetType) ||
 		strings.TrimSpace(intent.TargetID) != strings.TrimSpace(outcome.TargetID) ||

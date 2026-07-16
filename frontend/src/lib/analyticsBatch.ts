@@ -8,6 +8,18 @@ export interface AnalyticsBatchRunRef<Run extends OwnedAnalyticsBatchRun> {
   current: Run | null
 }
 
+export async function refreshAnalyticsBatchState(
+  fetchSyncStatus: () => Promise<unknown>,
+  fetchAnalytics: () => Promise<unknown>,
+): Promise<void> {
+  const results = await Promise.allSettled([
+    Promise.resolve().then(fetchSyncStatus),
+    Promise.resolve().then(fetchAnalytics),
+  ])
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (rejected) throw rejected.reason
+}
+
 export function replaceAnalyticsBatchRun<Run extends OwnedAnalyticsBatchRun>(
   runRef: AnalyticsBatchRunRef<Run>,
   nextRun: Run,

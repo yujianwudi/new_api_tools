@@ -59,6 +59,7 @@ import {
   operationReconciliationAction,
   operationReconciliationDecision,
   operationReleaseCandidateMatches,
+  parseUserMutationOperationTargetId,
   userMutationOperationIdentifier,
   type OperationReleaseCandidate,
   type PendingMutationRecord,
@@ -406,11 +407,22 @@ export function UserManagement() {
   const [deleteMode, setDeleteMode] = useState<'soft' | 'hard'>('soft')
 
   const openPendingMutationDialog = (pending: DeleteUserPendingMutation, username?: string) => {
-    const userId = Number(pending.targetId)
+    let userId: number
+    try {
+      userId = parseUserMutationOperationTargetId(pending.operationIdentifier, pending.targetId)
+    } catch (error) {
+      showToast(
+        'error',
+        error instanceof Error
+          ? `待对账操作的用户 ID 无效，持久锁已保留：${error.message}`
+          : '待对账操作的用户 ID 无效，持久锁已保留',
+      )
+      return
+    }
     rememberPendingDeleteMutation(pending)
     setDeleteReleaseCandidate(current => operationReleaseCandidateMatches(current, pending) ? current : null)
     setDeleteUserTarget({
-      userId: Number.isSafeInteger(userId) && userId > 0 ? userId : 0,
+      userId,
       username: username || `用户 #${pending.targetId}`,
       activityLevel: '',
     })

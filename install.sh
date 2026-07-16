@@ -2649,7 +2649,7 @@ migrate_env_file() {
 
   if ! printf '%s\n' "$content" | grep -q '^OBSERVABILITY_TOKEN='; then
     local observability_token
-    observability_token="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | xxd -p | tr -d '\n' | head -c 64)"
+    observability_token="$(openssl rand -hex 32 2>/dev/null || head -c 64 /dev/urandom | sha256sum | awk '{print $1}')"
     content="$(append_install_env_content_line "$content" \
       "OBSERVABILITY_TOKEN=$(dotenv_quote "$observability_token")")"
     migrated=true

@@ -33,6 +33,22 @@ assert_no_temp_files() {
 # directly without requiring a Docker daemon.
 source "$repo_root/setup-log-db.sh"
 
+clear_log_db_transaction_memory() {
+  LOG_ENV_SNAPSHOT_CONTENT=""
+  LOG_ENV_SNAPSHOT_IDENTITY=""
+  LOG_ENV_ATTEMPT_CONTENT=""
+  LOG_ENV_ATTEMPT_READY=false
+  LOG_ENV_CANDIDATE_CONTENT=""
+  LOG_OVERRIDE_SNAPSHOT_EXISTS=false
+  LOG_OVERRIDE_SNAPSHOT_CONTENT=""
+  LOG_OVERRIDE_SNAPSHOT_IDENTITY=""
+  LOG_OVERRIDE_ATTEMPT_CONTENT=""
+  LOG_OVERRIDE_ATTEMPT_READY=false
+  LOG_OVERRIDE_ATTEMPT_REMOVED=false
+  LOG_OVERRIDE_CANDIDATE_EXISTS=false
+  LOG_OVERRIDE_CANDIDATE_CONTENT=""
+}
+
 lock_project="$fixture/lock-project"
 mkdir "$lock_project"
 lock_path="$(setup_project_state_lock_path "$lock_project")"
@@ -379,6 +395,220 @@ assert_eq "$old_override_content" "$(<"$override")" \
 assert_no_temp_files "$ENV_FILE"
 assert_no_temp_files "$override"
 
+crash_project="$fixture/post-commit-crash-project"
+mkdir -p "$crash_project"
+PROJECT_DIR="$crash_project"
+ENV_FILE="$crash_project/.env"
+COMPOSE_FILE="$crash_project/docker-compose.yml"
+printf '%s\n' \
+  "NEWAPI_NETWORK='new-api_default'" \
+  "LOG_SQL_DSN='old-crash-secret'" \
+  "LOG_NETWORK='old-crash-log-net'" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+printf 'services: {}\n' > "$COMPOSE_FILE"
+printf 'services: {}\n' > "$crash_project/docker-compose.logdb.yml"
+commit_log_db_configuration "$special_dsn" 'old-crash-log-net' ||
+  fail 'could not prepare the post-commit crash baseline'
+crash_old_env="$(<"$ENV_FILE")"
+crash_override="$crash_project/docker-compose.override.yml"
+crash_old_override="$(<"$crash_override")"
+
+# The marker rename can succeed even when its following parent-directory fsync
+# fails. That ambiguous publish result must retain all four backing images so a
+# later locked startup can still recover the transaction.
+marker_sync_counter="$fixture/marker-parent-sync-counter"
+printf '0\n' > "$marker_sync_counter"
+if (
+  sync() {
+    local count
+    count="$(<"$marker_sync_counter")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$marker_sync_counter"
+    if (( count == 10 )); then
+      return 1
+    fi
+    command sync "$@"
+  }
+  begin_log_db_configuration_transaction "$special_dsn" 'candidate-marker-sync-log-net'
+); then
+  fail 'marker parent sync failure was reported as a durable transaction begin'
+fi
+crash_marker="$(log_db_transaction_marker_path)"
+crash_env_snapshot="$(log_db_transaction_env_snapshot_path)"
+crash_override_snapshot="$(log_db_transaction_override_snapshot_path)"
+crash_env_candidate="$(log_db_transaction_env_candidate_path)"
+crash_override_candidate="$(log_db_transaction_override_candidate_path)"
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  assert_mode_600 "$transaction_artifact"
+done
+clear_log_db_transaction_memory
+docker() { return 0; }
+recover_incomplete_log_db_transaction ||
+  fail 'startup could not recover a marker published before parent sync failure'
+unset -f docker
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  [[ ! -e "$transaction_artifact" && ! -L "$transaction_artifact" ]] ||
+    fail "marker parent sync recovery retained $transaction_artifact"
+done
+
+begin_log_db_configuration_transaction "$special_dsn" 'candidate-crash-log-net' ||
+  fail 'could not persist the post-commit crash transaction snapshot'
+assert_mode_600 "$crash_marker"
+assert_mode_600 "$crash_env_snapshot"
+assert_mode_600 "$crash_override_snapshot"
+assert_mode_600 "$crash_env_candidate"
+assert_mode_600 "$crash_override_candidate"
+commit_log_db_configuration "$special_dsn" 'candidate-crash-log-net' ||
+  fail 'could not commit the post-commit crash candidate'
+[[ "$(<"$ENV_FILE")" != "$crash_old_env" ]] ||
+  fail 'post-commit crash candidate did not change .env'
+
+# Simulate losing every in-memory snapshot after commit and before recreate.
+clear_log_db_transaction_memory
+crash_recreate_counter="$fixture/post-commit-crash-recreate-counter"
+printf '0\n' > "$crash_recreate_counter"
+docker() {
+  printf '%s\n' "$(( $(<"$crash_recreate_counter") + 1 ))" > "$crash_recreate_counter"
+  return 0
+}
+recover_incomplete_log_db_transaction ||
+  fail 'startup could not recover the durable post-commit crash transaction'
+unset -f docker
+assert_eq "$crash_old_env" "$(<"$ENV_FILE")" \
+  'post-commit crash recovery did not restore the old dotenv'
+assert_eq "$crash_old_override" "$(<"$crash_override")" \
+  'post-commit crash recovery did not restore the old Compose override'
+assert_eq '1' "$(<"$crash_recreate_counter")" \
+  'post-commit crash recovery did not recreate the old service exactly once'
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  [[ ! -e "$transaction_artifact" && ! -L "$transaction_artifact" ]] ||
+    fail "successful post-commit crash recovery retained $transaction_artifact"
+done
+
+# Simulate a crash after the override rename but before the .env rename. The
+# recovery validator must accept this old/candidate combination and roll it back.
+begin_log_db_configuration_transaction "$special_dsn" 'candidate-mid-commit-log-net' ||
+  fail 'could not persist the mid-commit crash transaction snapshot'
+load_mode600_setup_transaction_file "$crash_override_candidate" ||
+  fail 'could not read the persisted candidate override image'
+atomic_write_setup_file "$crash_override" "$SETUP_TRANSACTION_FILE_CONTENT" ||
+  fail 'could not simulate the candidate override rename'
+assert_eq "$crash_old_env" "$(<"$ENV_FILE")" \
+  'mid-commit crash simulation changed .env before its rename'
+clear_log_db_transaction_memory
+printf '0\n' > "$crash_recreate_counter"
+docker() {
+  printf '%s\n' "$(( $(<"$crash_recreate_counter") + 1 ))" > "$crash_recreate_counter"
+  return 0
+}
+recover_incomplete_log_db_transaction ||
+  fail 'startup rejected the valid old-env/candidate-override crash window'
+unset -f docker
+assert_eq "$crash_old_env" "$(<"$ENV_FILE")" \
+  'mid-commit crash recovery changed the old dotenv'
+assert_eq "$crash_old_override" "$(<"$crash_override")" \
+  'mid-commit crash recovery did not restore the old override'
+assert_eq '1' "$(<"$crash_recreate_counter")" \
+  'mid-commit crash recovery did not recreate the old service exactly once'
+
+# A same-user manual edit can bypass the advisory flock after a process crash.
+# Recovery must refuse to overwrite either file unless its complete image is
+# exactly the persisted old or candidate image, and must retain the marker.
+begin_log_db_configuration_transaction "$special_dsn" 'candidate-tamper-log-net' ||
+  fail 'could not persist the tamper recovery transaction snapshot'
+commit_log_db_configuration "$special_dsn" 'candidate-tamper-log-net' ||
+  fail 'could not commit the tamper recovery candidate'
+tamper_candidate_env="$(<"$ENV_FILE")"
+tamper_candidate_override="$(<"$crash_override")"
+printf "MANUAL_ENV_EDIT='preserve-me'\n" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+clear_log_db_transaction_memory
+printf '0\n' > "$crash_recreate_counter"
+docker() {
+  printf '%s\n' "$(( $(<"$crash_recreate_counter") + 1 ))" > "$crash_recreate_counter"
+  return 0
+}
+if recover_incomplete_log_db_transaction >/dev/null 2>&1; then
+  fail 'recovery overwrote a post-crash manual .env edit'
+fi
+unset -f docker
+assert_eq "MANUAL_ENV_EDIT='preserve-me'" "$(<"$ENV_FILE")" \
+  'failed recovery changed the post-crash manual .env image'
+assert_eq "$tamper_candidate_override" "$(<"$crash_override")" \
+  'failed .env validation changed the candidate override'
+assert_eq '0' "$(<"$crash_recreate_counter")" \
+  'recovery recreated services before validating the current .env image'
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  [[ -f "$transaction_artifact" && ! -L "$transaction_artifact" ]] ||
+    fail "tamper rejection discarded $transaction_artifact"
+  assert_mode_600 "$transaction_artifact"
+done
+load_mode600_setup_transaction_file "$crash_env_candidate" ||
+  fail 'could not reload the candidate .env image after tamper rejection'
+atomic_write_setup_file "$ENV_FILE" "$SETUP_TRANSACTION_FILE_CONTENT" ||
+  fail 'could not restore the candidate .env image for override tamper coverage'
+
+printf 'services:\n  manual-post-crash-edit: {}\n' > "$crash_override"
+chmod 600 "$crash_override"
+clear_log_db_transaction_memory
+printf '0\n' > "$crash_recreate_counter"
+docker() {
+  printf '%s\n' "$(( $(<"$crash_recreate_counter") + 1 ))" > "$crash_recreate_counter"
+  return 0
+}
+if recover_incomplete_log_db_transaction >/dev/null 2>&1; then
+  fail 'recovery overwrote a post-crash manual Compose override edit'
+fi
+unset -f docker
+assert_eq "$tamper_candidate_env" "$(<"$ENV_FILE")" \
+  'failed override validation changed the candidate .env'
+grep -Fq 'manual-post-crash-edit: {}' "$crash_override" ||
+  fail 'failed recovery changed the post-crash manual override image'
+assert_eq '0' "$(<"$crash_recreate_counter")" \
+  'recovery recreated services before validating the current override image'
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  [[ -f "$transaction_artifact" && ! -L "$transaction_artifact" ]] ||
+    fail "override tamper rejection discarded $transaction_artifact"
+  assert_mode_600 "$transaction_artifact"
+done
+
+# Restore the exact candidate override only to finish and clean the test
+# transaction; the preceding rejection assertions prove manual data survived.
+load_mode600_setup_transaction_file "$crash_override_candidate" ||
+  fail 'could not reload the candidate override image after tamper rejection'
+atomic_write_setup_file "$crash_override" "$SETUP_TRANSACTION_FILE_CONTENT" ||
+  fail 'could not restore the candidate override image for final recovery'
+clear_log_db_transaction_memory
+docker() { return 0; }
+recover_incomplete_log_db_transaction ||
+  fail 'valid candidate images could not recover after the tamper checks'
+unset -f docker
+for transaction_artifact in \
+  "$crash_marker" "$crash_env_snapshot" "$crash_override_snapshot" \
+  "$crash_env_candidate" "$crash_override_candidate"
+do
+  [[ ! -e "$transaction_artifact" && ! -L "$transaction_artifact" ]] ||
+    fail "final tamper recovery retained $transaction_artifact"
+done
+
+PROJECT_DIR="$project"
+ENV_FILE="$project/.env"
+override="$project/docker-compose.override.yml"
 COMPOSE_FILE="$project/docker-compose.yml"
 printf 'services:\n  newapi-tools:\n    image: example.invalid/test\n' > "$COMPOSE_FILE"
 printf 'services: {}\n' > "$project/docker-compose.logdb.yml"

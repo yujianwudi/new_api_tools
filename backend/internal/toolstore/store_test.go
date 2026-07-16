@@ -661,6 +661,11 @@ func TestOperationAuditAndReconciliationTransactionRetryAndConflictSemantics(t *
 		t.Fatalf("atomic retry IDs = audit:%d run:%d, want audit:%d run:%d",
 			retryAudit.ID, retryRun.ID, firstAudit.ID, firstRun.ID)
 	}
+	differentReplayRun := runInput
+	differentReplayRun.RunKey = "top-up-export-audit:different-replay"
+	if _, _, err := store.AppendOperationAuditWithReconciliationRun(ctx, auditInput, differentReplayRun); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same audit with different reconciliation run error = %v, want ErrConflict", err)
+	}
 
 	conflictingRun := runInput
 	conflictingRun.Kind = "different_reconciliation_kind"
@@ -675,7 +680,7 @@ func TestOperationAuditAndReconciliationTransactionRetryAndConflictSemantics(t *
 		t.Fatalf("conflicting audit retry error = %v, want ErrConflict", err)
 	}
 
-	var auditCount, runCount, forbiddenRunCount int
+	var auditCount, runCount, differentReplayRunCount, forbiddenRunCount int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operation_audit
 		WHERE idempotency_key = ?`, auditInput.IdempotencyKey).Scan(&auditCount); err != nil {
 		t.Fatal(err)
@@ -685,12 +690,16 @@ func TestOperationAuditAndReconciliationTransactionRetryAndConflictSemantics(t *
 		t.Fatal(err)
 	}
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reconciliation_runs
+		WHERE run_key = ?`, differentReplayRun.RunKey).Scan(&differentReplayRunCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reconciliation_runs
 		WHERE run_key = ?`, newRun.RunKey).Scan(&forbiddenRunCount); err != nil {
 		t.Fatal(err)
 	}
-	if auditCount != 1 || runCount != 1 || forbiddenRunCount != 0 {
-		t.Fatalf("atomic retry/conflict rows = audit:%d run:%d forbidden_run:%d, want 1/1/0",
-			auditCount, runCount, forbiddenRunCount)
+	if auditCount != 1 || runCount != 1 || differentReplayRunCount != 0 || forbiddenRunCount != 0 {
+		t.Fatalf("atomic retry/conflict rows = audit:%d run:%d different_replay_run:%d forbidden_run:%d, want 1/1/0/0",
+			auditCount, runCount, differentReplayRunCount, forbiddenRunCount)
 	}
 }
 
