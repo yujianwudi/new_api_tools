@@ -340,9 +340,8 @@ grep -Fq 'publish_minor=false' .github/workflows/release-recovery.yml ||
   fail 'release recovery must guard the mutable major.minor alias'
 grep -Fq 'refusing to overwrite existing release image tag' .github/workflows/build.yml ||
   fail 'normal release publication must keep exact version image tags immutable'
-grep -Fq 'refusing to overwrite existing release image tag' \
-  .github/workflows/release-recovery.yml ||
-  fail 'release recovery must keep exact version image tags immutable'
+grep -Fq 'release_image_exists=true' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must reuse an existing exact version image tag'
 grep -Fq 'candidate_source_version=' .github/workflows/build.yml ||
   fail 'normal release publication must ignore invalid higher-version tags'
 grep -Fq 'candidate_source_version=' .github/workflows/release-recovery.yml ||
@@ -358,6 +357,45 @@ grep -Fq 'npm audit --omit=dev --audit-level=high' .github/workflows/release-rec
   fail 'release recovery must repeat the production dependency audit'
 grep -Fq 'in-toto.io/predicate-type' .github/workflows/release-recovery.yml ||
   fail 'release recovery must verify SBOM and provenance attestations'
+grep -Fq 'registry_manifest()' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must read attestation manifests through the registry API'
+grep -Fq 'registry_reference_digest()' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must inspect exact and minor tags through the registry API'
+if grep -Eiq 'manifest unknown|could not determine whether the (release image tag|minor alias) exists' \
+  .github/workflows/release-recovery.yml; then
+  fail 'release recovery must not infer registry status from Buildx error text'
+fi
+grep -Fq 'invalid attestation manifest digest' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must validate attestation digest syntax before registry access'
+grep -Fiq 'docker-content-digest:' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must verify the registry content digest header'
+grep -Fq 'sha256sum "$destination"' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must verify the raw attestation manifest body digest'
+grep -Fq 'attestation manifest was not found' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must distinguish missing attestations from other registry errors'
+grep -Fq '"${image}@${version_digest}"' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must pin exact release verification to one manifest digest'
+[[ "$(grep -Fc 'refresh_release_versions' .github/workflows/release-recovery.yml)" -ge 3 ]] ||
+  fail 'release recovery must refresh release ordering immediately before minor publication'
+grep -Fq '.schemaVersion == 2' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must validate OCI schema version 2 manifests'
+grep -Fq 'umask 077' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must protect temporary credential and manifest files'
+if grep -Fq \
+  'docker buildx imagetools inspect --raw "${image}@${attestation_digest}"' \
+  .github/workflows/release-recovery.yml; then
+  fail 'release recovery must not use Buildx to decode attestation manifests'
+fi
+
+release_exact_publish_line="$(grep -nF -- \
+  '-t "${image}:${RELEASE_VERSION}"' \
+  .github/workflows/release-recovery.yml | head -n 1 | cut -d: -f1)"
+release_minor_publish_line="$(grep -nF -- \
+  '-t "${image}:${RELEASE_MAJOR_MINOR}"' \
+  .github/workflows/release-recovery.yml | head -n 1 | cut -d: -f1)"
+[[ -n "$release_exact_publish_line" && -n "$release_minor_publish_line" &&
+   "$release_exact_publish_line" -lt "$release_minor_publish_line" ]] ||
+  fail 'release recovery must verify the exact release before updating the minor alias'
 
 release_alias_line="$(grep -nF 'id: release_alias' .github/workflows/build.yml |
   tail -n 1 | cut -d: -f1)"
