@@ -147,8 +147,8 @@ docker compose exec -T newapi-tools test -f "$tool_store_path" || {
 推荐重新运行固定到发行 tag 的安装器：
 
 ```bash
-INSTALLER_COMMIT_SHA=dc66439fcd2f1830bb955127101ebcb38fc40e72
-INSTALL_SCRIPT_SHA256=26780fb76c281b09c4327588435848ffd35f184ce3cd790caedd6303914a9d21
+INSTALLER_COMMIT_SHA=0efcf5f21017a14a799a75d1682eaa78e29f958c
+INSTALL_SCRIPT_SHA256=b946e740e46292746ddb17b96181d57fd5d8006f65dfa3dbf0797dc34cd3ccd2
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
