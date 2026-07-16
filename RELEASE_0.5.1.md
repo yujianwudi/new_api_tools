@@ -75,8 +75,8 @@
 从本发行页复制真实的 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`。下列安装器固定到最终审计修复提交，不依赖可变分支：
 
 ```bash
-INSTALLER_COMMIT_SHA=80199a9182c9c2e4c8771b4c90fac2952ee0f331
-INSTALL_SCRIPT_SHA256=300eebfd65fda0d13914f4222ad212a3277660d2f5bdf01ef0f57761e2bd4185
+INSTALLER_COMMIT_SHA=2d8a8f87c57f51b4dc49ce380f09d678e4a48b6b
+INSTALL_SCRIPT_SHA256=773d4ce81a0cbb7e5b230bae5f6002745498876963cd3267a3cc54d214fdc419
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
