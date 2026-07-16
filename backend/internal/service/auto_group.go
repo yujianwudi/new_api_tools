@@ -324,8 +324,13 @@ if not commit_sequence_raw then
 end
 
 for _, item in ipairs(pending) do
-  item.entry['revertible'] = false
-  item.entry['recovery_state'] = 'manually_finalized_ambiguous'
+  if operation_state == 'sql_committed' then
+    item.entry['revertible'] = true
+    item.entry['recovery_state'] = 'manually_finalized_sql_committed'
+  else
+    item.entry['revertible'] = false
+    item.entry['recovery_state'] = 'manually_finalized_ambiguous'
+  end
   item.entry['resolved_by'] = actor
   item.entry['resolved_at'] = resolved_at
   local commit_sequence = redis.call('INCR', KEYS[4])
@@ -1083,9 +1088,9 @@ func (s *AutoGroupService) GetPendingAudits() (map[string]interface{}, error) {
 	}, nil
 }
 
-// ResolvePendingAudit is intentionally manual. Finalizing preserves the audit
-// record but marks it non-revertible because an ambiguous commit can never be
-// made safe for automatic rollback by inspecting the user's current group.
+// ResolvePendingAudit is intentionally manual. Finalizing a known SQL commit
+// preserves normal revert behavior; only an ambiguous commit is permanently
+// marked non-revertible.
 func (s *AutoGroupService) ResolvePendingAudit(operationID, resolution, confirmation, actor string) (map[string]interface{}, error) {
 	operationID = strings.TrimSpace(operationID)
 	resolution = strings.ToLower(strings.TrimSpace(resolution))
@@ -1157,7 +1162,7 @@ func (s *AutoGroupService) ResolvePendingAudit(operationID, resolution, confirma
 		"operation_id": operationID,
 		"resolution":   resolution,
 		"record_count": len(ids),
-		"revertible":   false,
+		"revertible":   resolution == autoGroupPendingResolutionFinalize && target.State == autoGroupPendingStateSQLCommitted,
 	}, nil
 }
 
@@ -2172,10 +2177,14 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 
 	elapsed := time.Since(startTime).Seconds()
 
-	// Update last scan time
-	s.SaveConfig(map[string]interface{}{
-		"last_scan_time": time.Now().Unix(),
-	})
+	// A preview must be strictly read-only. Persist scan metadata only for an
+	// execution path; production v0.5 does not expose that path until NewAPI has
+	// a versioned, auditable group-management adapter.
+	if !dryRun {
+		s.SaveConfig(map[string]interface{}{
+			"last_scan_time": time.Now().Unix(),
+		})
+	}
 
 	logger.L.Business(fmt.Sprintf("自动分组扫描完成 dry_run=%v total=%d assigned=%d skipped=%d errors=%d elapsed=%.2fs",
 		dryRun, len(users), assignedCount, skippedCount, errorCount, elapsed))

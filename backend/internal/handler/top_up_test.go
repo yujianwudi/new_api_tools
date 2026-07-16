@@ -1,14 +1,20 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/middleware"
+	"github.com/new-api-tools/backend/internal/toolstore"
 	_ "modernc.org/sqlite"
 )
 
@@ -118,15 +124,17 @@ func TestTopUpQueryHandlersHideDatabaseErrors(t *testing.T) {
 	})
 
 	tests := []struct {
-		name    string
-		target  string
-		handler gin.HandlerFunc
+		name        string
+		target      string
+		handler     gin.HandlerFunc
+		wantStatus  int
+		wantMessage string
 	}{
-		{name: "list", target: "/api/top-ups", handler: ListTopUps},
-		{name: "statistics", target: "/api/top-ups/statistics", handler: GetTopUpStatistics},
-		{name: "payment methods", target: "/api/top-ups/payment-methods", handler: GetPaymentMethods},
-		{name: "payment providers", target: "/api/top-ups/payment-providers", handler: GetPaymentProviders},
-		{name: "export", target: "/api/top-ups/export", handler: ExportTopUps},
+		{name: "list", target: "/api/top-ups", handler: ListTopUps, wantStatus: http.StatusInternalServerError, wantMessage: "Top-up data is temporarily unavailable"},
+		{name: "statistics", target: "/api/top-ups/statistics", handler: GetTopUpStatistics, wantStatus: http.StatusInternalServerError, wantMessage: "Top-up data is temporarily unavailable"},
+		{name: "payment methods", target: "/api/top-ups/payment-methods", handler: GetPaymentMethods, wantStatus: http.StatusInternalServerError, wantMessage: "Top-up data is temporarily unavailable"},
+		{name: "payment providers", target: "/api/top-ups/payment-providers", handler: GetPaymentProviders, wantStatus: http.StatusInternalServerError, wantMessage: "Top-up data is temporarily unavailable"},
+		{name: "export", target: "/api/top-ups/export", handler: ExportTopUps, wantStatus: http.StatusServiceUnavailable, wantMessage: "Export was not started because the audit store is unavailable"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,11 +144,11 @@ func TestTopUpQueryHandlersHideDatabaseErrors(t *testing.T) {
 			ctx.Request.RemoteAddr = "192.0.2.30:12345"
 
 			tt.handler(ctx)
-			if recorder.Code != http.StatusInternalServerError {
-				t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, tt.wantStatus, recorder.Body.String())
 			}
 			body := recorder.Body.String()
-			if !strings.Contains(body, "Top-up data is temporarily unavailable") {
+			if !strings.Contains(body, tt.wantMessage) {
 				t.Fatalf("generic top-up error missing: %s", body)
 			}
 			for _, sensitive := range []string{"no such table", "SQL logic error", "top_ups", "topups"} {
@@ -150,4 +158,114 @@ func TestTopUpQueryHandlersHideDatabaseErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := installTopUpExportFixture(t)
+
+	viewer := topUpExportRouter(store, auth.RoleViewer)
+	viewerRecorder := httptest.NewRecorder()
+	viewerRequest := httptest.NewRequest(http.MethodGet, "/api/top-ups/export", nil)
+	viewer.ServeHTTP(viewerRecorder, viewerRequest)
+	if viewerRecorder.Code != http.StatusForbidden {
+		t.Fatalf("viewer status = %d, want 403; body=%s", viewerRecorder.Code, viewerRecorder.Body.String())
+	}
+
+	admin := topUpExportRouter(store, auth.RoleAdmin)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/top-ups/export?status=success", nil)
+	request.RemoteAddr = "192.0.2.45:12345"
+	admin.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("admin status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if disposition := recorder.Header().Get("Content-Disposition"); !strings.Contains(disposition, "attachment") {
+		t.Fatalf("missing CSV attachment header: %q", disposition)
+	}
+
+	page, err := store.ListOperationAudits(context.Background(), toolstore.OperationAuditFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list export audits: %v", err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("audit count = %d, want 2: %+v", len(page.Items), page.Items)
+	}
+	if page.Items[0].Action != "top_ups.export.outcome" || page.Items[0].Status != toolstore.OperationSucceeded {
+		t.Fatalf("unexpected outcome audit: %+v", page.Items[0])
+	}
+	if page.Items[1].Action != "top_ups.export.intent" || page.Items[1].TargetType != "financial_export" {
+		t.Fatalf("unexpected intent audit: %+v", page.Items[1])
+	}
+	if page.Items[0].RequestID == "" || page.Items[0].RequestID != page.Items[1].RequestID {
+		t.Fatalf("audit request IDs are not correlated: %+v", page.Items)
+	}
+	var outcome struct {
+		RowCount         int64 `json:"row_count"`
+		ExpectedRowCount int64 `json:"expected_row_count"`
+		Truncated        bool  `json:"truncated"`
+	}
+	if err := json.Unmarshal(page.Items[0].AfterJSON, &outcome); err != nil {
+		t.Fatalf("decode outcome audit: %v", err)
+	}
+	if outcome.RowCount != 1 || outcome.ExpectedRowCount != 1 || outcome.Truncated {
+		t.Fatalf("outcome audit = %+v, want one complete written row", outcome)
+	}
+	response := recorder.Result()
+	if response.Trailer.Get("X-Export-Row-Count") != "1" || response.Trailer.Get("X-Export-Truncated") != "false" {
+		t.Fatalf("export trailers = %#v", response.Trailer)
+	}
+}
+
+func installTopUpExportFixture(t *testing.T) *toolstore.Store {
+	t.Helper()
+	db, err := sqlx.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open top-up export database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.MustExec(`
+		ATTACH DATABASE ':memory:' AS information_schema;
+		CREATE TABLE information_schema.columns (table_name TEXT, column_name TEXT);
+		INSERT INTO information_schema.columns (table_name, column_name)
+		VALUES ('top_ups', 'payment_provider');
+		CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, inviter_id INTEGER);
+		CREATE TABLE top_ups (
+			id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER, money REAL,
+			trade_no TEXT, payment_method TEXT, payment_provider TEXT,
+			create_time INTEGER, complete_time INTEGER, status TEXT
+		);
+		INSERT INTO users(id, username, inviter_id) VALUES (1, 'alice', 2);
+		INSERT INTO top_ups(id, user_id, amount, money, trade_no, payment_method,
+			payment_provider, create_time, complete_time, status)
+		VALUES (10, 1, 1000, 10.0, 'trade-10', 'card', 'provider', 1700000000, 1700000030, 'success');
+	`)
+	database.SetForTesting(&database.Manager{DB: db, IsPG: true})
+
+	store, err := toolstore.Init(filepath.Join(t.TempDir(), "control-plane.db"))
+	if err != nil {
+		database.SetForTesting(nil)
+		_ = db.Close()
+		t.Fatalf("initialize tool store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+		database.SetForTesting(nil)
+		_ = db.Close()
+	})
+	return store
+}
+
+func topUpExportRouter(store *toolstore.Store, role auth.Role) *gin.Engine {
+	router := gin.New()
+	router.Use(middleware.RequestIDMiddleware())
+	api := router.Group("/api")
+	api.Use(func(c *gin.Context) {
+		c.Set("auth_method", "jwt")
+		c.Set("user_sub", "admin")
+		auth.SetRole(c, role)
+		c.Next()
+	})
+	RegisterTopUpRoutes(api, store)
+	return router
 }

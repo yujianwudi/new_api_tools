@@ -13,11 +13,14 @@ import (
 	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/config"
+	"github.com/new-api-tools/backend/internal/controlplane"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/handler"
 	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/middleware"
-	"github.com/new-api-tools/backend/internal/service"
+	"github.com/new-api-tools/backend/internal/newapi"
+	"github.com/new-api-tools/backend/internal/observability"
+	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
 func main() {
@@ -38,7 +41,29 @@ func main() {
 	}
 	defer database.Close()
 
-	// ========== 4. Initialize Redis cache ==========
+	// ========== 4. Initialize the independent control-plane store ==========
+	toolStore, err := toolstore.Init(cfg.ToolStorePath)
+	if err != nil {
+		logger.L.Fatal("Tool Store initialization failed: " + err.Error())
+	}
+	defer toolStore.Close()
+
+	// NewAPI is an adapter dependency, not this process's persistence layer. A
+	// bad endpoint disables upstream operations but keeps the recovery console
+	// available for database and audit diagnostics.
+	var newAPIClient *newapi.Client
+	newAPIClient, err = newapi.NewClient(
+		cfg.NewAPIBaseURL,
+		cfg.NewAPIAdminAccessToken,
+		cfg.NewAPIAdminUserID,
+		nil,
+	)
+	if err != nil {
+		newAPIClient = nil
+		logger.L.Warn("NewAPI adapter disabled: NEWAPI_BASEURL is invalid")
+	}
+
+	// ========== 5. Initialize Redis cache ==========
 	if cfg.RedisConnString != "" {
 		_, err := cache.Init(cfg.RedisConnString)
 		if err != nil {
@@ -49,7 +74,7 @@ func main() {
 	}
 	defer cache.Close()
 
-	// ========== 5. Setup Gin router ==========
+	// ========== 6. Setup Gin router ==========
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	trustedProxyCIDRs, trustedProxyConfigValid := handler.TrustedProxyCIDRsForGin(os.Getenv("TRUSTED_PROXY_CIDRS"))
@@ -63,32 +88,56 @@ func main() {
 	}
 
 	// Global middleware
-	r.Use(middleware.ErrorHandlerMiddleware())  // Panic recovery
-	r.Use(middleware.CORSMiddleware())          // CORS
-	r.Use(middleware.RequestLoggerMiddleware()) // Request logging
+	r.Use(middleware.RequestIDMiddleware())       // Correlation and upstream propagation
+	r.Use(observability.Default.HTTPMiddleware()) // Prometheus-compatible SLI metrics
+	r.Use(middleware.RequestLoggerMiddleware())   // Request logging
+	r.Use(middleware.ErrorHandlerMiddleware())    // Panic recovery
+	r.Use(middleware.CORSMiddleware())            // CORS
 
-	// ========== 6. Register routes ==========
+	// ========== 7. Register routes ==========
 
 	// Health check (no auth required)
-	handler.RegisterHealthRoutes(r)
+	healthHandler := handler.NewHealthHandler(cfg, newAPIClient, toolStore, observability.Default)
+	mutationService := controlplane.NewService(
+		newAPIClient,
+		toolStore,
+		database.Get(),
+		observability.Default,
+		controlplane.RedemptionLimits{
+			MaxQuotaPerCode: cfg.RedemptionMaxQuotaPerCode,
+			MaxTotalQuota:   cfg.RedemptionMaxTotalQuota,
+		},
+	)
+	mutationHandler := handler.NewMutationHandler(mutationService)
+	storeHandler := handler.NewStoreHandler(toolStore)
+	searchHandler := handler.NewSearchHandler(toolStore)
+	healthHandler.RegisterPublicRoutes(r)
+	r.GET("/metrics", observability.Default.Handler(cfg.ObservabilityToken))
 
 	// API group with authentication
 	api := r.Group("/api")
 	api.Use(auth.AuthMiddleware())
+	api.Use(auth.RBACMiddleware())
 	{
+		healthHandler.RegisterProtectedRoutes(api)
+		mutationHandler.RegisterControlPlaneMutationRoutes(api)
+		storeHandler.RegisterRoutes(api)
+		searchHandler.RegisterRoutes(api)
+		api.GET("/control-plane/channel-quality", handler.GetChannelQuality)
+
 		// Auth routes (login/logout are whitelisted in middleware)
 		handler.RegisterAuthRoutes(api)
 
 		// Phase 2.1: Basic modules
-		handler.RegisterRedemptionRoutes(api)
-		handler.RegisterTopUpRoutes(api)
+		handler.RegisterRedemptionRoutes(api, mutationHandler)
+		handler.RegisterTopUpRoutes(api, toolStore)
 		handler.RegisterTopUpAnalyticsRoutes(api)
 		handler.RegisterStorageRoutes(api)
 		handler.RegisterSystemRoutes(api)
 
 		// Phase 2.2: Dashboard, UserManagement, LogAnalytics
 		handler.RegisterDashboardRoutes(api)
-		handler.RegisterUserManagementRoutes(api)
+		handler.RegisterUserManagementRoutes(api, mutationHandler)
 		handler.RegisterAffiliateStatsRoutes(api)
 		handler.RegisterLogAnalyticsRoutes(api)
 
@@ -96,7 +145,9 @@ func main() {
 		handler.RegisterIPMonitoringRoutes(api)
 		handler.RegisterRiskMonitoringRoutes(api)
 		handler.RegisterModelStatusRoutes(api)
-		handler.RegisterAbuseBroadcastRoutes(api)
+		// The legacy abuse-broadcast implementation creates sidecar tables inside
+		// NewAPI's database. v0.5 replaces that boundary with Tool Store risk cases,
+		// so the legacy routes and background writer are intentionally not mounted.
 
 		// Phase 2.4: Token Management
 		handler.RegisterTokenRoutes(api)
@@ -109,21 +160,6 @@ func main() {
 
 	// Public embed routes (no auth)
 	handler.RegisterModelStatusEmbedRoutes(r)
-
-	// ========== 7. Background tasks ==========
-
-	// IP recording enforcement changes every user's privacy setting, so it is
-	// opt-in rather than an unconditional background write.
-	stopIPEnforce := make(chan struct{})
-	if cfg.EnforceIPRecording {
-		logger.L.Warn("[IP记录] ENFORCE_IP_RECORDING=true，已启用每 10 分钟强制写入任务")
-		go backgroundEnforceIPRecording(stopIPEnforce)
-	} else {
-		logger.L.System("[IP记录] 自动强制开启已禁用；可在管理界面手动执行")
-	}
-
-	stopAbuseBroadcast := make(chan struct{})
-	go backgroundSyncAbuseBroadcast(stopAbuseBroadcast)
 
 	// ========== 8. Start server with graceful shutdown ==========
 	srv := &http.Server{
@@ -149,10 +185,6 @@ func main() {
 
 	logger.L.System("正在优雅关闭服务...")
 
-	// Stop background tasks
-	close(stopIPEnforce)
-	close(stopAbuseBroadcast)
-
 	// Give the server 10 seconds to finish processing requests
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -162,169 +194,4 @@ func main() {
 	}
 
 	logger.L.Success("服务已关闭")
-}
-
-// backgroundEnforceIPRecording periodically checks and enforces IP recording for all users.
-func backgroundEnforceIPRecording(stop <-chan struct{}) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.L.Error(fmt.Sprintf("[IP记录] 后台任务 panic: %v", r))
-		}
-	}()
-
-	// Wait 30 seconds after startup before first check
-	select {
-	case <-time.After(30 * time.Second):
-	case <-stop:
-		return
-	}
-
-	logger.L.System("[IP记录] 强制开启定时任务已启动 (间隔: 10分钟)")
-
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
-
-	// Run immediately on first tick, then every 10 minutes
-	for {
-		enforceIPRecordingOnce()
-
-		select {
-		case <-ticker.C:
-		case <-stop:
-			logger.L.System("[IP记录] 强制开启定时任务已停止")
-			return
-		}
-	}
-}
-
-func enforceIPRecordingOnce() {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.L.Error(fmt.Sprintf("[IP记录] 检查执行 panic: %v", r))
-		}
-	}()
-
-	svc := service.NewIPMonitoringService()
-
-	stats, err := svc.GetIPStats()
-	if err != nil {
-		logger.L.Warn("[IP记录] 获取状态失败: " + err.Error())
-		return
-	}
-
-	disabledCount := toInt64(stats["disabled_count"])
-	totalUsers := toInt64(stats["total_users"])
-
-	if disabledCount == 0 {
-		logger.L.Debug(fmt.Sprintf("[IP记录] 所有用户 (%d) 已开启 IP 记录，无需操作", totalUsers))
-		return
-	}
-
-	logger.L.System(fmt.Sprintf("[IP记录] 检测到 %d 个用户关闭了 IP 记录，正在强制开启...", disabledCount))
-
-	result, err := svc.EnableAllIPRecording()
-	if err != nil {
-		logger.L.Warn("[IP记录] 强制开启失败: " + err.Error())
-		return
-	}
-
-	logger.L.Success(fmt.Sprintf("[IP记录] %s", result["message"]))
-}
-
-// backgroundSyncAbuseBroadcast supervises the Hub pull loop. It re-reads the
-// runtime settings on every tick so admins can toggle enabled/interval from the
-// frontend without a restart.
-func backgroundSyncAbuseBroadcast(stop <-chan struct{}) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.L.Error(fmt.Sprintf("[违规广播] 后台同步任务 panic: %v", r))
-		}
-	}()
-
-	select {
-	case <-time.After(20 * time.Second):
-	case <-stop:
-		return
-	}
-
-	logger.L.System("[违规广播] Hub 同步监督任务已启动")
-
-	const idleInterval = 60 * time.Second
-	currentInterval := idleInterval
-	timer := time.NewTimer(currentInterval)
-	defer timer.Stop()
-
-	loadInterval := func() (time.Duration, bool) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		settings, err := service.NewAbuseBroadcastService().GetSettings(ctx)
-		if err != nil {
-			logger.L.Debug("[违规广播] 读取配置失败: " + err.Error())
-			return idleInterval, false
-		}
-		if !settings.Enabled {
-			return idleInterval, false
-		}
-		seconds := settings.PullIntervalSeconds
-		if seconds < service.MinAbuseBroadcastPullIntervalSeconds ||
-			seconds > service.MaxAbuseBroadcastPullIntervalSeconds {
-			seconds = service.DefaultAbuseBroadcastPullIntervalSeconds
-		}
-		return time.Duration(seconds) * time.Second, true
-	}
-
-	for {
-		select {
-		case <-timer.C:
-			next, active := loadInterval()
-			if active {
-				syncAbuseBroadcastOnce()
-			}
-			if next != currentInterval {
-				logger.L.System(fmt.Sprintf("[违规广播] 调整同步间隔为 %s (active=%v)", next, active))
-				currentInterval = next
-			}
-			timer.Reset(currentInterval)
-		case <-stop:
-			logger.L.System("[违规广播] Hub 同步监督任务已停止")
-			return
-		}
-	}
-}
-
-func syncAbuseBroadcastOnce() {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.L.Error(fmt.Sprintf("[违规广播] 同步执行 panic: %v", r))
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	result, err := service.NewAbuseBroadcastService().SyncOnce(ctx)
-	if err != nil {
-		logger.L.Warn("[违规广播] 同步失败: " + err.Error())
-		return
-	}
-	if result.PulledEvents > 0 {
-		logger.L.Success(fmt.Sprintf("[违规广播] 已同步 %d 个事件，写入 %d 条通报，cursor=%d",
-			result.PulledEvents, result.StoredReports, result.NextCursor))
-	}
-}
-
-func toInt64(v interface{}) int64 {
-	if v == nil {
-		return 0
-	}
-	switch val := v.(type) {
-	case int64:
-		return val
-	case int:
-		return int64(val)
-	case float64:
-		return int64(val)
-	default:
-		return 0
-	}
 }

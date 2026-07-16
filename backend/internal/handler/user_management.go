@@ -69,21 +69,24 @@ func classifyDestructiveOperationError(err error) (int, string, string, bool) {
 	return 0, "", "", false
 }
 
-func RegisterUserManagementRoutes(r *gin.RouterGroup) {
+func RegisterUserManagementRoutes(r *gin.RouterGroup, mutationHandler *MutationHandler) {
+	if mutationHandler == nil {
+		panic("user management routes require the audited NewAPI mutation handler")
+	}
 	g := r.Group("/users")
 	{
 		g.GET("/activity-stats", GetActivityStats)
 		g.GET("/stats", GetActivityStats)
 		g.GET("/banned", GetBannedUsers)
 		g.GET("", GetUsers)
-		g.DELETE("/:user_id", DeleteUser)
-		g.POST("/batch-delete", BatchDeleteInactiveUsers)
+		g.DELETE("/:user_id", mutationHandler.DeleteUser)
+		g.POST("/batch-delete", mutationHandler.BatchDeleteInactiveUsers)
 		g.GET("/soft-deleted/count", GetSoftDeletedCount)
-		g.POST("/soft-deleted/purge", PurgeSoftDeletedUsers)
-		g.POST("/:user_id/ban", BanUser)
-		g.POST("/:user_id/unban", UnbanUser)
+		g.POST("/soft-deleted/purge", mutationHandler.PurgeSoftDeletedUsers)
+		g.POST("/:user_id/ban", mutationHandler.BanUser)
+		g.POST("/:user_id/unban", mutationHandler.UnbanUser)
 		g.GET("/:user_id/invited", GetInvitedUsers)
-		g.POST("/tokens/:token_id/disable", DisableToken)
+		g.POST("/tokens/:token_id/disable", mutationHandler.DisableToken)
 	}
 }
 

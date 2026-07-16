@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"container/list"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ type loginAttempt struct {
 type LoginLimiter struct {
 	mu          sync.Mutex
 	attempts    map[string]loginAttempt
+	recency     *list.List
+	positions   map[string]*list.Element
 	maxAttempts int
 	window      time.Duration
 	baseBackoff time.Duration
@@ -48,6 +51,8 @@ func NewLoginLimiter(maxAttempts int, window, baseBackoff, maxBackoff time.Durat
 	}
 	return &LoginLimiter{
 		attempts:    make(map[string]loginAttempt),
+		recency:     list.New(),
+		positions:   make(map[string]*list.Element),
 		maxAttempts: maxAttempts,
 		window:      window,
 		baseBackoff: baseBackoff,
@@ -71,14 +76,16 @@ func (l *LoginLimiter) Reserve(key string) (bool, time.Duration) {
 	l.cleanupLocked(now)
 	attempt, ok := l.attempts[key]
 	if ok && now.Sub(attempt.windowStart) >= l.window {
-		delete(l.attempts, key)
+		l.removeAttemptLocked(key)
 		ok = false
 	}
 	if ok && now.Before(attempt.nextAllowed) {
 		return false, attempt.nextAllowed.Sub(now)
 	}
 	if !ok {
-		l.makeRoomLocked()
+		if !l.makeRoomLocked(now) {
+			return false, l.maxBackoff
+		}
 		attempt = loginAttempt{windowStart: now, lastSeen: now}
 	}
 	attempt.failures++
@@ -102,7 +109,7 @@ func (l *LoginLimiter) Reserve(key string) (bool, time.Duration) {
 			attempt.nextAllowed = now.Add(l.maxBackoff)
 		}
 	}
-	l.attempts[key] = attempt
+	l.recordAttemptLocked(key, attempt)
 	return true, attempt.nextAllowed.Sub(now)
 }
 
@@ -111,7 +118,7 @@ func (l *LoginLimiter) Reset(key string) {
 		key = "unknown"
 	}
 	l.mu.Lock()
-	delete(l.attempts, key)
+	l.removeAttemptLocked(key)
 	l.mu.Unlock()
 }
 
@@ -120,27 +127,102 @@ func (l *LoginLimiter) cleanupLocked(now time.Time) {
 	if l.operations%128 != 0 {
 		return
 	}
-	for key, attempt := range l.attempts {
-		if now.Sub(attempt.lastSeen) >= l.window {
-			delete(l.attempts, key)
+	l.removeExpiredLocked(now)
+}
+
+func (l *LoginLimiter) removeExpiredLocked(now time.Time) {
+	// Entries are kept in expiry order and an entry's expiry never changes during
+	// its window. Stop as soon as the earliest entry is still active instead of
+	// scanning every tracked client.
+	for l.recency != nil {
+		front := l.recency.Front()
+		if front == nil {
+			return
 		}
+		key, _ := front.Value.(string)
+		attempt, ok := l.attempts[key]
+		if !ok {
+			l.recency.Remove(front)
+			delete(l.positions, key)
+			continue
+		}
+		if !l.attemptExpiredLocked(attempt, now) {
+			return
+		}
+		l.removeAttemptLocked(key)
 	}
 }
 
-func (l *LoginLimiter) makeRoomLocked() {
+func (l *LoginLimiter) attemptExpiredLocked(attempt loginAttempt, now time.Time) bool {
+	expiresAt := l.attemptExpiryLocked(attempt)
+	return !expiresAt.IsZero() && !now.Before(expiresAt)
+}
+
+func (l *LoginLimiter) attemptExpiryLocked(attempt loginAttempt) time.Time {
+	windowStart := attempt.windowStart
+	if windowStart.IsZero() {
+		windowStart = attempt.lastSeen
+	}
+	if windowStart.IsZero() {
+		return time.Time{}
+	}
+	return windowStart.Add(l.window)
+}
+
+func (l *LoginLimiter) makeRoomLocked(now time.Time) bool {
 	if len(l.attempts) < maxTrackedLoginClients {
+		return true
+	}
+	// Capacity pressure must never evict an active client. The ordered expiry
+	// index removes only the due prefix, so unseen-key traffic cannot turn a
+	// full limiter into an O(n) scan or silently unlock an active client.
+	l.removeExpiredLocked(now)
+	return len(l.attempts) < maxTrackedLoginClients
+}
+
+func (l *LoginLimiter) recordAttemptLocked(key string, attempt loginAttempt) {
+	if l.attempts == nil {
+		l.attempts = make(map[string]loginAttempt)
+	}
+	if l.recency == nil {
+		l.recency = list.New()
+	}
+	if l.positions == nil {
+		l.positions = make(map[string]*list.Element)
+	}
+	l.attempts[key] = attempt
+	if _, ok := l.positions[key]; ok {
+		// windowStart (and therefore expiry) is immutable until this key is
+		// removed, so an update must retain its position in expiry order.
 		return
 	}
-	var oldestKey string
-	var oldestSeen time.Time
-	for key, attempt := range l.attempts {
-		if oldestKey == "" || attempt.lastSeen.Before(oldestSeen) {
-			oldestKey = key
-			oldestSeen = attempt.lastSeen
+
+	// Wall-clock corrections and deterministic tests can introduce an expiry
+	// earlier than the current tail. The common monotonic case remains O(1);
+	// only an out-of-order insertion walks backward to preserve the invariant.
+	expiresAt := l.attemptExpiryLocked(attempt)
+	for element := l.recency.Back(); element != nil; element = element.Prev() {
+		existingKey, _ := element.Value.(string)
+		existing, ok := l.attempts[existingKey]
+		if !ok {
+			continue
+		}
+		existingExpiry := l.attemptExpiryLocked(existing)
+		if existingExpiry.IsZero() || expiresAt.IsZero() || !expiresAt.Before(existingExpiry) {
+			l.positions[key] = l.recency.InsertAfter(key, element)
+			return
 		}
 	}
-	if oldestKey != "" {
-		delete(l.attempts, oldestKey)
+	l.positions[key] = l.recency.PushFront(key)
+}
+
+func (l *LoginLimiter) removeAttemptLocked(key string) {
+	delete(l.attempts, key)
+	if position, ok := l.positions[key]; ok {
+		if l.recency != nil {
+			l.recency.Remove(position)
+		}
+		delete(l.positions, key)
 	}
 }
 

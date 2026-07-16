@@ -2,7 +2,7 @@
 # Multi-stage build: Node.js build + Nginx runtime
 
 # Stage 1: Build
-FROM node:22-alpine3.23 AS builder
+FROM node:22-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS builder
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Production
-FROM nginxinc/nginx-unprivileged:1.30.3-alpine3.23
+FROM nginxinc/nginx-unprivileged:1.30.3-alpine3.23@sha256:b3f2436575bd5be7386518084d842dac414ab4962712afa31e99e0942a56e3b2
 
 # Copy custom nginx configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf

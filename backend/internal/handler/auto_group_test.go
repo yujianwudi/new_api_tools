@@ -28,23 +28,25 @@ func TestRegisterAutoGroupPendingAuditRoutes(t *testing.T) {
 	}
 }
 
-func TestResolvePendingAutoGroupAuditRejectsMalformedJSONBeforeService(t *testing.T) {
+func TestResolvePendingAutoGroupAuditReturnsFixedReadOnlyResponseBeforeParsing(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(
-		http.MethodPost,
-		"/api/auto-group/pending-audits/resolve",
-		strings.NewReader(`{"operation_id":`),
-	)
-	c.Request.Header.Set("Content-Type", "application/json")
+	for _, body := range []string{"", `{"operation_id":`, `{"operation_id":"legacy-1"}`} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(
+			http.MethodPost,
+			"/api/auto-group/pending-audits/resolve",
+			strings.NewReader(body),
+		)
+		c.Request.Header.Set("Content-Type", "application/json")
 
-	ResolvePendingAutoGroupAudit(c)
+		ResolvePendingAutoGroupAudit(c)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "INVALID_PARAMS") {
-		t.Fatalf("expected invalid request error, got %s", w.Body.String())
+		if w.Code != http.StatusNotImplemented {
+			t.Fatalf("body %q: expected status %d, got %d: %s", body, http.StatusNotImplemented, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "LEGACY_AUDIT_READ_ONLY") {
+			t.Fatalf("body %q: expected fixed read-only response, got %s", body, w.Body.String())
+		}
 	}
 }

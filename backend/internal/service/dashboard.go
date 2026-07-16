@@ -157,12 +157,13 @@ func (s *DashboardService) GetUsageStatistics(period string, noCache bool) (map[
 	}
 
 	result := map[string]interface{}{
-		"total_requests":          0,
-		"total_quota_used":        0,
-		"total_prompt_tokens":     0,
-		"total_completion_tokens": 0,
-		"average_response_time":   float64(0),
-		"period":                  period,
+		"total_requests":           0,
+		"total_quota_used":         0,
+		"total_prompt_tokens":      0,
+		"total_completion_tokens":  0,
+		"average_response_time":    float64(0), // Deprecated alias; value is milliseconds.
+		"average_response_time_ms": float64(0),
+		"period":                   period,
 	}
 
 	if row != nil {
@@ -170,9 +171,12 @@ func (s *DashboardService) GetUsageStatistics(period string, noCache bool) (map[
 		result["total_quota_used"] = row["total_quota_used"]
 		result["total_prompt_tokens"] = row["total_prompt_tokens"]
 		result["total_completion_tokens"] = row["total_completion_tokens"]
-		// Average response time in milliseconds
+		// NewAPI stores logs.use_time in seconds. Convert once at the API
+		// boundary so clients receive an explicit millisecond value.
 		if avgTime, ok := row["avg_response_time"]; ok {
-			result["average_response_time"] = toFloat64(avgTime)
+			milliseconds := toFloat64(avgTime) * 1000
+			result["average_response_time"] = milliseconds
+			result["average_response_time_ms"] = milliseconds
 		}
 	}
 

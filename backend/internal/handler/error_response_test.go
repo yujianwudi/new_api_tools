@@ -58,15 +58,23 @@ func TestRespondHandlerErrorHidesDatabaseDiagnostics(t *testing.T) {
 }
 
 func TestSanitizeHandlerErrorForLogRedactsCredentials(t *testing.T) {
-	err := errors.New("postgres://admin:password@db.internal/newapi password='second secret' root:hunter2@tcp(mysql:3306) Authorization: Bearer abc.def.ghi")
+	err := errors.New(`postgres://admin:password@db.internal/newapi password='second secret' root:hunter2@tcp(mysql:3306) Authorization: Bearer abc.def.ghi {"password":"json-secret","api_key":"sk-json","token":"escaped\"secret"} secret: colon-secret Authorization: Basic dXNlcjpwYXNz X-API-Key: x-api-secret`)
 	got := sanitizeHandlerErrorForLog(err)
 
-	for _, secret := range []string{"password@", "second secret", "hunter2", "abc.def.ghi"} {
+	for _, secret := range []string{
+		"password@", "second secret", "hunter2", "abc.def.ghi",
+		"json-secret", "sk-json", `escaped\"secret`, "colon-secret",
+		"dXNlcjpwYXNz", "x-api-secret",
+	} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("sanitized log message leaked %q: %s", secret, got)
 		}
 	}
-	for _, marker := range []string{"admin:[REDACTED]@", "password=[REDACTED]", "root:[REDACTED]@tcp(", "Bearer [REDACTED]"} {
+	for _, marker := range []string{
+		"admin:[REDACTED]@", "password=[REDACTED]", "root:[REDACTED]@tcp(",
+		"Bearer [REDACTED]", `"password":"[REDACTED]"`, `"api_key":"[REDACTED]"`,
+		`secret: "[REDACTED]"`, "Basic [REDACTED]", `X-API-Key: "[REDACTED]"`,
+	} {
 		if !strings.Contains(got, marker) {
 			t.Fatalf("sanitized log message missing %q: %s", marker, got)
 		}

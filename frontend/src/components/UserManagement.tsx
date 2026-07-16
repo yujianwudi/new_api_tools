@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import {
@@ -47,6 +47,18 @@ import { cn } from '../lib/utils'
 import { UserAnalysisDialog } from './UserAnalysisDialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs'
 import { AffiliateStats } from './AffiliateStats'
+import {
+  clearIdempotencyKey,
+  getOrCreateIdempotencyKey,
+  idempotencyHeader,
+  mutationResponseRequiresReconciliation,
+  type IdempotencyOperation,
+} from '../lib/idempotency'
+import {
+  canSafelyHardDelete,
+  fetchNewAPICapabilities,
+  type NewAPICapabilityData,
+} from '../lib/controlPlane'
 
 
 
@@ -111,13 +123,15 @@ export function UserManagement() {
   const [searchInput, setSearchInput] = useState('')
   const [activityFilter, setActivityFilter] = useState<string>('all')
   const [deleting, setDeleting] = useState(false)
-  const [deletingVeryInactive, setDeletingVeryInactive] = useState(false)
-  const [deletingNever, setDeletingNever] = useState(false)
+  const [batchPreviewing, setBatchPreviewing] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  const [newAPICapabilities, setNewAPICapabilities] = useState<NewAPICapabilityData | null>(null)
+  const [capabilitiesLoading, setCapabilitiesLoading] = useState(true)
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null)
 
   // 软删除用户清理
   const [softDeletedCount, setSoftDeletedCount] = useState(0)
-  const [purgingSoftDeleted, setPurgingSoftDeleted] = useState(false)
+  const [purgePreviewing, setPurgePreviewing] = useState(false)
 
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean
@@ -131,6 +145,7 @@ export function UserManagement() {
     hardDelete?: boolean
     requireConfirmText?: boolean
     confirmText?: string
+    previewOnly?: boolean
   }>({
     isOpen: false,
     title: '',
@@ -141,6 +156,8 @@ export function UserManagement() {
 
   // 删除类高风险操作的二次确认输入
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
+  const [deleteReason, setDeleteReason] = useState('')
+  const deleteOperationRef = useRef<IdempotencyOperation | null>(null)
 
   // 用户分析弹窗状态
   const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
@@ -161,8 +178,6 @@ export function UserManagement() {
   const [groupFilter, setGroupFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
   const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(new Set())
-  const [batchTargetGroup, setBatchTargetGroup] = useState('')
-  const [batchMoving, setBatchMoving] = useState(false)
 
   // Linux.do 用户名查询状态
   const [linuxDoLookupLoading, setLinuxDoLookupLoading] = useState<string | null>(null)
@@ -197,6 +212,24 @@ export function UserManagement() {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`,
   }), [token])
+
+  const loadNewAPICapabilities = useCallback(async (signal?: AbortSignal) => {
+    setCapabilitiesLoading(true)
+    setCapabilitiesError(null)
+    try {
+      const data = await fetchNewAPICapabilities({ apiUrl, token, signal })
+      if (!signal?.aborted) setNewAPICapabilities(data)
+    } catch (error) {
+      if (!signal?.aborted) {
+        setNewAPICapabilities(null)
+        setCapabilitiesError(error instanceof Error ? error.message : '能力探测失败')
+      }
+    } finally {
+      if (!signal?.aborted) setCapabilitiesLoading(false)
+    }
+  }, [apiUrl, token])
+
+  const hardDeleteAvailable = canSafelyHardDelete(newAPICapabilities)
 
   const fetchStats = useCallback(async (quick = false) => {
     try {
@@ -243,55 +276,20 @@ export function UserManagement() {
   }, [apiUrl, getAuthHeaders])
 
   // 批量移动用户到指定分组
-  const batchMoveUsers = async () => {
-    if (selectedUserIds.size === 0) {
-      showToast('error', '请选择用户')
-      return
-    }
-    if (!batchTargetGroup) {
-      showToast('error', '请选择目标分组')
-      return
-    }
-    setBatchMoving(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/auto-group/batch-move`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
-          user_ids: Array.from(selectedUserIds),
-          target_group: batchTargetGroup,
-        }),
-      })
-      const data = await response.json()
-      if (data.success || data.data?.success_count > 0) {
-        showToast('success', data.data?.message || `成功移动 ${data.data?.success_count || 0} 个用户`)
-        setSelectedUserIds(new Set())
-        setBatchTargetGroup('')
-        fetchUsers()
-      } else {
-        showToast('error', data.message || '移动失败')
-      }
-    } catch (error) {
-      console.error('Failed to batch move users:', error)
-      showToast('error', '网络错误')
-    } finally {
-      setBatchMoving(false)
-    }
-  }
 
   // 预览清理软删除用户
   const previewPurgeSoftDeleted = async () => {
     setDeleteConfirmText('')
+    setPurgePreviewing(true)
     setConfirmDialog({
       isOpen: true,
-      title: '清理已软删除用户',
+      title: '已软删除用户预览（只读）',
       message: '正在查询已软删除的用户...',
-      type: 'danger',
+      type: 'warning',
       loading: true,
       hardDelete: true,
-      requireConfirmText: true,
-      confirmText: HARD_DELETE_CONFIRM_TEXT,
-      onConfirm: () => undefined,
+      previewOnly: true,
+      onConfirm: () => setConfirmDialog(prev => ({ ...prev, isOpen: false })),
     })
 
     try {
@@ -304,23 +302,16 @@ export function UserManagement() {
       if (data.success && data.data) {
         const count = data.data.count ?? data.data.affected_count ?? data.data.affected ?? 0
         const usernames = Array.isArray(data.data.users) ? data.data.users : []
-        const snapshotId = typeof data.data.snapshot_id === 'string' ? data.data.snapshot_id : ''
         if (count === 0) {
           setConfirmDialog(prev => ({ ...prev, isOpen: false }))
           showToast('info', '没有需要清理的软删除用户')
           return
         }
-        if (!snapshotId) {
-          setConfirmDialog(prev => ({ ...prev, isOpen: false }))
-          showToast('error', '预览未返回安全快照，请重试')
-          return
-        }
         setConfirmDialog(prev => ({
           ...prev,
-          message: `确定要永久清理 ${count} 个已软删除的用户吗？\n\n⚠️ 这是默认禁用的兼容写库路径，只会清理本工具已覆盖的用户和令牌数据，可能遗留 2FA、Passkey、OAuth 绑定等认证记录。请优先在 NewAPI 后台完成永久删除。`,
+          message: `发现 ${count} 个已软删除用户。\n\nv0.5 禁止旁路批量写，此页面只展示候选对象，不会执行永久清理。请在 NewAPI 管理端逐个复核。`,
           details: { count, users: usernames },
           loading: false,
-          onConfirm: () => executePurgeSoftDeleted(snapshotId),
         }))
       } else {
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -330,33 +321,8 @@ export function UserManagement() {
       console.error('Failed to preview purge:', error)
       setConfirmDialog(prev => ({ ...prev, isOpen: false }))
       showToast('error', '预览失败')
-    }
-  }
-
-  // 执行清理软删除用户
-  const executePurgeSoftDeleted = async (snapshotId: string) => {
-    setConfirmDialog(prev => ({ ...prev, isOpen: false }))
-    setPurgingSoftDeleted(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/users/soft-deleted/purge`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ dry_run: false, confirm_text: HARD_DELETE_CONFIRM_TEXT, snapshot_id: snapshotId }),
-      })
-      const data = await response.json()
-      if (data.success) {
-        showToast('success', data.message)
-        setSoftDeletedCount(0)
-        // 刷新统计
-        fetchStats()
-      } else {
-        showToast('error', data.message || '清理失败')
-      }
-    } catch (error) {
-      console.error('Failed to purge soft deleted:', error)
-      showToast('error', '清理失败')
     } finally {
-      setPurgingSoftDeleted(false)
+      setPurgePreviewing(false)
     }
   }
 
@@ -387,26 +353,6 @@ export function UserManagement() {
     }
   }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, showToast])
 
-  // 添加用户到 AI 封禁白名单
-  const addToWhitelist = useCallback(async (userId: number, username: string) => {
-    try {
-      const response = await fetch(`${apiUrl}/api/ai-ban/whitelist/add`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ user_id: userId }),
-      })
-      const data = await response.json()
-      if (data.success) {
-        showToast('success', `已将 ${username} 添加到 AI 封禁白名单`)
-      } else {
-        showToast('error', data.message || '添加失败')
-      }
-    } catch (error) {
-      console.error('Failed to add to whitelist:', error)
-      showToast('error', '添加到白名单失败')
-    }
-  }, [apiUrl, getAuthHeaders, showToast])
-
   // 单个用户删除状态
   const [deleteUserTarget, setDeleteUserTarget] = useState<{ userId: number; username: string; activityLevel: string } | null>(null)
   const [deleteMode, setDeleteMode] = useState<'soft' | 'hard'>('soft')
@@ -416,6 +362,7 @@ export function UserManagement() {
     setDeleteUserTarget({ userId, username, activityLevel: userToDelete?.activity_level || '' })
     setDeleteMode('soft')
     setDeleteConfirmText('')
+    setDeleteReason('')
     setConfirmDialog({
       isOpen: true,
       title: '删除用户',
@@ -430,19 +377,30 @@ export function UserManagement() {
 
     const { userId, activityLevel } = deleteUserTarget
     const hardDelete = deleteMode === 'hard'
+    const reason = deleteReason.trim()
+    const confirmText = deleteConfirmText.trim()
+    if (hardDelete && !hardDeleteAvailable) {
+      setDeleteMode('soft')
+      setDeleteConfirmText('')
+      showToast('error', 'NewAPI 能力探测未确认安全硬删除，已切回注销模式')
+      return
+    }
+    const fingerprint = JSON.stringify({ userId, hardDelete, reason, confirmText })
+    const idempotencyKey = getOrCreateIdempotencyKey(deleteOperationRef, fingerprint, 'user-management.delete')
 
-    setConfirmDialog(prev => ({ ...prev, isOpen: false }))
     setDeleting(true)
     try {
       const response = await fetch(`${apiUrl}/api/users/${userId}?hard_delete=${hardDelete}`, {
         method: 'DELETE',
-        headers: getAuthHeaders(),
+        headers: { ...getAuthHeaders(), ...idempotencyHeader(idempotencyKey) },
         body: JSON.stringify({
-          confirm_text: deleteConfirmText,
+          confirm_text: confirmText,
+          reason,
         }),
       })
       const data = await response.json()
       if (data.success) {
+        clearIdempotencyKey(deleteOperationRef)
         showToast('success', data.message)
         // 直接从本地状态移除用户，避免重新加载
         setUsers(prev => prev.filter(u => u.id !== userId))
@@ -462,38 +420,47 @@ export function UserManagement() {
         if (!hardDelete) {
           fetchSoftDeletedCount()
         }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }))
+        setDeleteConfirmText('')
+        setDeleteReason('')
+        setDeleteUserTarget(null)
       } else {
-        showToast('error', data.message || '删除失败')
+        showToast('error', mutationResponseRequiresReconciliation(data)
+          ? '删除结果不确定，请先对账，切勿修改内容后重新提交'
+          : data.error?.message || data.message || '删除失败')
       }
     } catch (error) {
       console.error('Failed to delete user:', error)
-      showToast('error', '删除用户失败')
+      showToast('error', '网络中断，当前幂等键已保留；请用相同内容重试或先对账')
     } finally {
       setDeleting(false)
-      setDeleteUserTarget(null)
     }
   }
 
-  const previewBatchDelete = async (level: string, hardDelete: boolean = false) => {
-    // 重置确认输入
+  const closeDeleteDialog = () => {
+    setConfirmDialog(prev => ({ ...prev, isOpen: false }))
     setDeleteConfirmText('')
+    setDeleteReason('')
+    setDeleteUserTarget(null)
+  }
 
+  const previewBatchDelete = async (level: string, hardDelete: boolean = false) => {
+    setDeleteConfirmText('')
     const levelLabel = level === 'never' ? '从未请求' : level === 'inactive' ? '不活跃' : '非常不活跃'
     const actionLabel = hardDelete ? '彻底删除' : '注销'
-    const confirmText = hardDelete ? HARD_DELETE_CONFIRM_TEXT : SOFT_DELETE_CONFIRM_TEXT
+    const previewKey = `${level}:${hardDelete ? 'hard' : 'soft'}`
+    setBatchPreviewing(previewKey)
 
-    // 先立即显示弹窗，带加载状态
     setConfirmDialog({
       isOpen: true,
-      title: `批量${actionLabel}用户`,
+      title: `批量${actionLabel}候选预览（只读）`,
       message: `正在查询${levelLabel}的用户...`,
-      type: 'danger',
+      type: 'warning',
       loading: true,
       activityLevel: level,
       hardDelete,
-      requireConfirmText: true,
-      confirmText,
-      onConfirm: () => executeBatchDelete(level, hardDelete),
+      previewOnly: true,
+      onConfirm: () => setConfirmDialog(prev => ({ ...prev, isOpen: false })),
     })
 
     try {
@@ -511,22 +478,11 @@ export function UserManagement() {
           showToast('info', '没有符合条件的用户')
           return
         }
-        // 更新弹窗内容
-        const warningText = hardDelete
-          ? `⚠️ 兼容硬删除默认禁用，只会清理已覆盖的用户和令牌数据，可能遗留 2FA、Passkey、OAuth 绑定等认证记录。请优先使用 NewAPI 后台删除。`
-          : `此操作为注销（软删除），数据可通过数据库恢复。`
-        const snapshotId = typeof data.data.snapshot_id === 'string' ? data.data.snapshot_id : ''
-        if (!snapshotId) {
-          setConfirmDialog(prev => ({ ...prev, isOpen: false }))
-          showToast('error', '预览未返回安全快照，请重试')
-          return
-        }
         setConfirmDialog(prev => ({
           ...prev,
-          message: `确定要${actionLabel} ${count} 个${levelLabel}的用户吗？\n\n${warningText}`,
+          message: `发现 ${count} 个${levelLabel}用户。\n\nv0.5 禁止旁路批量写，此页面只展示${actionLabel}候选，不会提交任何用户变更。请在 NewAPI 管理端逐个复核。`,
           details: { count, users: usernames },
           loading: false,
-          onConfirm: () => executeBatchDelete(level, hardDelete, snapshotId),
         }))
       } else {
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -536,43 +492,8 @@ export function UserManagement() {
       console.error('Failed to preview batch delete:', error)
       setConfirmDialog(prev => ({ ...prev, isOpen: false }))
       showToast('error', '预览失败')
-    }
-  }
-
-  const executeBatchDelete = async (level: string, hardDelete: boolean = false, snapshotId = '') => {
-    setConfirmDialog(prev => ({ ...prev, isOpen: false }))
-    const setLoading = level === 'very_inactive' ? setDeletingVeryInactive : setDeletingNever
-    setLoading(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/users/batch-delete`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
-          activity_level: level,
-          dry_run: false,
-          hard_delete: hardDelete,
-          snapshot_id: snapshotId,
-          confirm_text: hardDelete ? HARD_DELETE_CONFIRM_TEXT : SOFT_DELETE_CONFIRM_TEXT,
-        }),
-      })
-      const data = await response.json()
-      if (data.success) {
-        showToast('success', data.message)
-        // 并行刷新数据
-        setPage(1)
-        Promise.all([fetchUsers(), fetchStats()])
-        // 如果是软删除，刷新软删除计数
-        if (!hardDelete) {
-          fetchSoftDeletedCount()
-        }
-      } else {
-        showToast('error', data.message || '批量删除失败')
-      }
-    } catch (error) {
-      console.error('Failed to batch delete:', error)
-      showToast('error', '批量删除失败')
     } finally {
-      setLoading(false)
+      setBatchPreviewing(null)
     }
   }
 
@@ -592,12 +513,18 @@ export function UserManagement() {
   }, [fetchStats, fetchSoftDeletedCount, fetchGroups])
 
   useEffect(() => {
+    const controller = new AbortController()
+    void loadNewAPICapabilities(controller.signal)
+    return () => controller.abort()
+  }, [loadNewAPICapabilities])
+
+  useEffect(() => {
     fetchUsers()
   }, [fetchUsers])
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchUsers(), fetchStats()])
+    await Promise.all([fetchUsers(), fetchStats(), loadNewAPICapabilities()])
     setRefreshing(false)
     showToast('success', '数据已刷新')
   }
@@ -705,7 +632,11 @@ export function UserManagement() {
     ? (deleteMode === 'hard' ? HARD_DELETE_CONFIRM_TEXT : SOFT_DELETE_CONFIRM_TEXT)
     : (confirmDialog.requireConfirmText ? confirmDialog.confirmText : '')
   const confirmActionDisabled = Boolean(
-    confirmDialog.loading || (currentDialogConfirmText && deleteConfirmText !== currentDialogConfirmText)
+    confirmDialog.loading ||
+    deleting ||
+    (currentDialogConfirmText && deleteConfirmText !== currentDialogConfirmText) ||
+    (deleteUserTarget && deleteReason.trim().length < 3) ||
+    (deleteUserTarget && deleteMode === 'hard' && !hardDeleteAvailable)
   )
 
   return (
@@ -788,8 +719,8 @@ export function UserManagement() {
                   <AlertTriangle className="h-5 w-5 text-orange-600 dark:text-orange-400" />
                 </div>
                 <div>
-                  <h3 className="font-medium text-orange-800 dark:text-orange-200">批量注销不活跃用户</h3>
-                  <p className="text-sm text-orange-600 dark:text-orange-400">注销：数据保留可恢复 | 兼容硬删除：默认禁用，优先使用 NewAPI 后台</p>
+                  <h3 className="font-medium text-orange-800 dark:text-orange-200">批量用户候选预览</h3>
+                  <p className="text-sm text-orange-600 dark:text-orange-400">v0.5 仅允许只读预览，禁止旁路批量写；实际处置请在 NewAPI 管理端逐个复核。</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -798,20 +729,20 @@ export function UserManagement() {
                   size="sm"
                   className="border-orange-300 text-orange-700 hover:bg-orange-100 hover:text-orange-800 dark:border-orange-800 dark:text-orange-300 dark:hover:bg-orange-900"
                   onClick={() => previewBatchDelete('very_inactive', false)}
-                  disabled={deletingVeryInactive || !stats?.very_inactive_users}
+                  disabled={batchPreviewing !== null || !stats?.very_inactive_users}
                 >
-                  {deletingVeryInactive ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                  注销非常不活跃 ({stats?.very_inactive_users || 0})
+                  {batchPreviewing === 'very_inactive:soft' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                  预览非常不活跃 ({stats?.very_inactive_users || 0})
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
                   className="border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-gray-900 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
                   onClick={() => previewBatchDelete('never', false)}
-                  disabled={deletingNever || !stats?.never_requested}
+                  disabled={batchPreviewing !== null || !stats?.never_requested}
                 >
-                  {deletingNever ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                  注销从未请求 ({stats?.never_requested || 0})
+                  {batchPreviewing === 'never:soft' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                  预览从未请求 ({stats?.never_requested || 0})
                 </Button>
               </div>
             </div>
@@ -823,8 +754,8 @@ export function UserManagement() {
                     <AlertTriangle className="h-5 w-5 text-red-600 dark:text-red-400" />
                   </div>
                   <div>
-                    <h3 className="font-medium text-red-800 dark:text-red-200">兼容硬删除（默认禁用）</h3>
-                    <p className="text-sm text-red-600 dark:text-red-400">仅清理已覆盖的用户与令牌数据，可能遗留认证绑定；请优先使用 NewAPI 后台</p>
+                    <h3 className="font-medium text-red-800 dark:text-red-200">硬删除候选（只读）</h3>
+                    <p className="text-sm text-red-600 dark:text-red-400">仅展示候选对象，不提供执行按钮，不会修改 NewAPI 或数据库。</p>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -833,20 +764,20 @@ export function UserManagement() {
                     size="sm"
                     className="border-red-300 text-red-700 hover:bg-red-100 hover:text-red-800 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900"
                     onClick={() => previewBatchDelete('very_inactive', true)}
-                    disabled={deletingVeryInactive || !stats?.very_inactive_users}
+                    disabled={batchPreviewing !== null || !stats?.very_inactive_users}
                   >
-                    {deletingVeryInactive ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                    彻底删除非常不活跃
+                    {batchPreviewing === 'very_inactive:hard' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                    预览硬删除候选
                   </Button>
                   <Button
                     variant="outline"
                     size="sm"
                     className="border-red-300 text-red-700 hover:bg-red-100 hover:text-red-800 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900"
                     onClick={() => previewBatchDelete('never', true)}
-                    disabled={deletingNever || !stats?.never_requested}
+                    disabled={batchPreviewing !== null || !stats?.never_requested}
                   >
-                    {deletingNever ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                    彻底删除从未请求
+                    {batchPreviewing === 'never:hard' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                    预览从未请求候选
                   </Button>
                 </div>
               </div>
@@ -860,8 +791,8 @@ export function UserManagement() {
                       <Trash2 className="h-5 w-5 text-purple-600 dark:text-purple-400" />
                     </div>
                     <div>
-                      <h3 className="font-medium text-purple-800 dark:text-purple-200">清理已注销用户</h3>
-                      <p className="text-sm text-purple-600 dark:text-purple-400">这些用户已被删除（注销），彻底清理可释放数据库空间</p>
+                      <h3 className="font-medium text-purple-800 dark:text-purple-200">已注销用户候选</h3>
+                      <p className="text-sm text-purple-600 dark:text-purple-400">仅预览可清理对象；v0.5 不提供旁路永久清理。</p>
                     </div>
                   </div>
                   <Button
@@ -869,10 +800,10 @@ export function UserManagement() {
                     size="sm"
                     className="border-purple-300 text-purple-700 hover:bg-purple-100 hover:text-purple-800 dark:border-purple-800 dark:text-purple-300 dark:hover:bg-purple-900"
                     onClick={previewPurgeSoftDeleted}
-                    disabled={purgingSoftDeleted}
+                    disabled={purgePreviewing}
                   >
-                    {purgingSoftDeleted ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                    彻底清理注销用户 ({softDeletedCount})
+                    {purgePreviewing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                    预览注销用户 ({softDeletedCount})
                   </Button>
                 </div>
               </div>
@@ -968,29 +899,8 @@ export function UserManagement() {
                 )}
               </div>
 
-              <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto sm:ml-auto">
-                <div className="w-full sm:w-48">
-                  <Select
-                    value={batchTargetGroup}
-                    onChange={(e) => setBatchTargetGroup(e.target.value)}
-                    disabled={batchMoving || selectedUserIds.size === 0}
-                  >
-                    <option value="">选择目标分组</option>
-                    {groups.map((g) => (
-                      <option key={g.group_name} value={g.group_name}>
-                        {g.group_name}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-                <Button
-                  size="sm"
-                  onClick={batchMoveUsers}
-                  disabled={batchMoving || selectedUserIds.size === 0 || !batchTargetGroup}
-                >
-                  {batchMoving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-                  批量移动
-                </Button>
+              <div className="w-full sm:w-auto sm:ml-auto text-xs text-muted-foreground">
+                v0.5 仅保留选择与影响范围预览；批量分组写入请在 NewAPI 管理端复核执行。
               </div>
             </div>
           )}
@@ -1126,15 +1036,6 @@ export function UserManagement() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="text-green-500 hover:text-green-600 hover:bg-green-500/10 h-7 w-7 p-0"
-                            onClick={() => addToWhitelist(user.id, user.username)}
-                            title="加入 AI 封禁白名单"
-                          >
-                            <ShieldCheck className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
                             className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 h-7 w-7 p-0"
                             onClick={() => deleteUser(user.id, user.username)}
                             disabled={deleting}
@@ -1188,7 +1089,17 @@ export function UserManagement() {
       </Card>
 
       {/* Confirm Dialog */}
-      <Dialog open={confirmDialog.isOpen} onOpenChange={(open: boolean) => { setConfirmDialog(prev => ({ ...prev, isOpen: open })); if (!open) { setDeleteConfirmText(''); setDeleteUserTarget(null) } }}>
+      <Dialog open={confirmDialog.isOpen} onOpenChange={(open: boolean) => {
+        if (!open && deleteUserTarget) {
+          closeDeleteDialog()
+          return
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: open }))
+        if (!open) {
+          setDeleteConfirmText('')
+          setDeleteReason('')
+        }
+      }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle className={confirmDialog.hardDelete || (deleteUserTarget !== null && deleteMode === 'hard') ? "text-red-600 dark:text-red-400" : ""}>{confirmDialog.title}</DialogTitle>
@@ -1219,19 +1130,45 @@ export function UserManagement() {
                     <div className="text-sm text-muted-foreground">数据保留，可通过数据库恢复。用户名仍被占用。</div>
                   </div>
                 </label>
-                <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${deleteMode === 'hard' ? 'border-red-500 bg-red-50 dark:bg-red-950/20' : 'border-border hover:border-red-300'}`}>
+                <label className={cn(
+                  'flex items-start gap-3 p-3 rounded-lg border transition-colors',
+                  hardDeleteAvailable
+                    ? 'cursor-pointer hover:border-red-300'
+                    : 'cursor-not-allowed opacity-60',
+                  deleteMode === 'hard' && hardDeleteAvailable
+                    ? 'border-red-500 bg-red-50 dark:bg-red-950/20'
+                    : 'border-border',
+                )}>
                   <input
                     type="radio"
                     name="deleteMode"
                     checked={deleteMode === 'hard'}
                     onChange={() => { setDeleteMode('hard'); setDeleteConfirmText('') }}
+                    disabled={!hardDeleteAvailable}
                     className="mt-1"
                   />
                   <div>
-                    <div className="font-medium text-red-600 dark:text-red-400">兼容硬删除（默认禁用）</div>
-                    <div className="text-sm text-muted-foreground">只清理已覆盖的用户与令牌数据，可能遗留 2FA、Passkey、OAuth 绑定；请优先使用 NewAPI 后台。</div>
+                    <div className="font-medium text-red-600 dark:text-red-400">兼容硬删除（仅管理员）</div>
+                    <div className="text-sm text-muted-foreground">
+                      {hardDeleteAvailable
+                        ? '能力探测已确认当前版本、管理员 API 与凭据均可用；仍可能遗留 2FA、Passkey、OAuth 绑定，请优先使用 NewAPI 后台。'
+                        : capabilitiesLoading
+                          ? '正在探测 NewAPI 安全硬删除能力，确认前保持关闭。'
+                          : capabilitiesError
+                            ? '能力探测失败，已按只读保护关闭硬删除。'
+                            : '当前 NewAPI 版本或写入能力未确认安全硬删除，已保持关闭。'}
+                    </div>
                   </div>
                 </label>
+              </div>
+              <div className="border-t pt-4">
+                <p className="text-sm font-medium mb-2">操作原因（必填，至少 3 个字符）：</p>
+                <Input
+                  value={deleteReason}
+                  onChange={(e) => setDeleteReason(e.target.value)}
+                  placeholder="例如：用户主动申请注销"
+                  maxLength={1000}
+                />
               </div>
               <div className="border-t pt-4">
                 <p className={cn(
@@ -1252,7 +1189,11 @@ export function UserManagement() {
             /* 批量删除 - 显示用户列表 */
             <div className="py-4 space-y-4">
               <div>
-                <p className="text-sm text-muted-foreground mb-2">将{confirmDialog.hardDelete ? '彻底删除' : '注销'}以下用户（显示前20个）：</p>
+                <p className="text-sm text-muted-foreground mb-2">
+                  {confirmDialog.previewOnly
+                    ? '以下用户仅供只读预览（显示前20个）：'
+                    : `将${confirmDialog.hardDelete ? '彻底删除' : '注销'}以下用户（显示前20个）：`}
+                </p>
                 <div className="max-h-40 overflow-y-auto bg-muted rounded-md p-3">
                   <div className="flex flex-wrap gap-2">
                     {confirmDialog.details.users.map((username, i) => (
@@ -1284,22 +1225,30 @@ export function UserManagement() {
             </div>
           )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => { setConfirmDialog(prev => ({ ...prev, isOpen: false })); setDeleteConfirmText(''); setDeleteUserTarget(null) }}>
-              取消
-            </Button>
-            <Button
-              variant={confirmDialog.type === 'danger' || (deleteUserTarget !== null && deleteMode === 'hard') ? 'destructive' : 'default'}
-              onClick={() => {
-                if (deleteUserTarget) {
-                  executeDeleteUser()
-                } else {
-                  confirmDialog.onConfirm()
-                }
-              }}
-              disabled={confirmActionDisabled}
-            >
-              {deleteUserTarget ? (deleteMode === 'hard' ? '确认彻底删除' : '确认注销') : (confirmDialog.hardDelete ? '确认彻底删除' : '确认注销')}
-            </Button>
+            {confirmDialog.previewOnly ? (
+              <Button onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}>
+                关闭预览
+              </Button>
+            ) : (
+              <>
+                <Button variant="outline" onClick={deleteUserTarget ? closeDeleteDialog : () => { setConfirmDialog(prev => ({ ...prev, isOpen: false })); setDeleteConfirmText(''); setDeleteReason('') }}>
+                  取消
+                </Button>
+                <Button
+                  variant={confirmDialog.type === 'danger' || (deleteUserTarget !== null && deleteMode === 'hard') ? 'destructive' : 'default'}
+                  onClick={() => {
+                    if (deleteUserTarget) {
+                      executeDeleteUser()
+                    } else {
+                      confirmDialog.onConfirm()
+                    }
+                  }}
+                  disabled={confirmActionDisabled}
+                >
+                  {deleting ? '正在提交...' : deleteUserTarget ? (deleteMode === 'hard' ? '确认彻底删除' : '确认注销') : (confirmDialog.hardDelete ? '确认彻底删除' : '确认注销')}
+                </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

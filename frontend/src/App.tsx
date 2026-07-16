@@ -11,12 +11,11 @@ const UserManagement = lazy(() => import('./components/UserManagement').then(m =
 const RealtimeRanking = lazy(() => import('./components/RealtimeRanking').then(m => ({ default: m.RealtimeRanking })))
 const IPAnalysis = lazy(() => import('./components/IPAnalysis').then(m => ({ default: m.IPAnalysis })))
 const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').then(m => ({ default: m.ModelStatusMonitor })))
-const AutoGroup = lazy(() => import('./components/AutoGroup').then(m => ({ default: m.AutoGroup })))
 const Tokens = lazy(() => import('./components/Tokens').then(m => ({ default: m.Tokens })))
-const AbuseBroadcast = lazy(() => import('./components/AbuseBroadcast').then(m => ({ default: m.AbuseBroadcast })))
+const ControlPlaneStatus = lazy(() => import('./components/ControlPlaneStatus').then(m => ({ default: m.ControlPlaneStatus })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'abuse-broadcast', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'auto-group', 'redemptions']
+const validTabs: TabType[] = ['dashboard', 'control-plane', 'topups', 'risk', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'redemptions']
 
 // 旧路径迁移：generator / history 现合并到 redemptions 内部 tab
 const legacyRedirects: Record<string, string> = {
@@ -24,10 +23,12 @@ const legacyRedirects: Record<string, string> = {
   history: '/redemptions?view=history',
 }
 
-// Get initial tab from URL pathname (supports sub-routes like /risk/ip)
-const getInitialTab = (): TabType => {
-  const pathname = window.location.pathname.slice(1) // Remove leading /
-  const mainPath = pathname.split('/')[0] // Get first segment for main tab
+// Resolve and normalize both current and historical routes. Invalid history
+// entries are replaced so browser back/forward cannot leave the URL and UI out
+// of sync.
+const resolveTabFromLocation = (): TabType => {
+  const pathname = window.location.pathname.replace(/^\/+/, '')
+  const mainPath = pathname.split('/')[0]
 
   if (legacyRedirects[mainPath]) {
     window.history.replaceState(null, '', legacyRedirects[mainPath])
@@ -37,27 +38,28 @@ const getInitialTab = (): TabType => {
   if (validTabs.includes(mainPath as TabType)) {
     return mainPath as TabType
   }
-  // 兼容旧的 hash 路由，自动迁移
-  const hash = window.location.hash.slice(1)
-  // 处理 #risk/ip 等格式
-  const hashMain = hash.split('/')[0].replace('risk-', 'risk/')
+  // 兼容旧的 hash 路由，自动迁移。旧版也曾生成 #risk-ip。
+  const hash = window.location.hash.replace(/^#\/?/, '')
+  const normalizedHash = hash.startsWith('risk-') ? `risk/${hash.slice('risk-'.length)}` : hash
+  const [hashMain, ...hashSubPath] = normalizedHash.split('/')
   if (legacyRedirects[hashMain]) {
     window.history.replaceState(null, '', legacyRedirects[hashMain])
     return 'redemptions'
   }
   if (validTabs.includes(hashMain as TabType)) {
-    // 重定向到新路由
-    const subPath = hash.includes('/') ? hash.split('/').slice(1).join('/') : ''
+    const subPath = hashSubPath.join('/')
     const newPath = subPath ? `/${hashMain}/${subPath}` : `/${hashMain}`
     window.history.replaceState(null, '', newPath)
     return hashMain as TabType
   }
+
+  window.history.replaceState(null, '', '/dashboard')
   return 'dashboard'
 }
 
 function App() {
   const { isAuthenticated, token, login, logout } = useAuth()
-  const [activeTab, setActiveTab] = useState<TabType>(getInitialTab)
+  const [activeTab, setActiveTab] = useState<TabType>(resolveTabFromLocation)
   const [warmupState, setWarmupState] = useState<'checking' | 'warming' | 'ready'>('checking')
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
@@ -79,6 +81,14 @@ function App() {
         if (response.status === 401) {
           console.warn('Token invalid or expired, logging out...')
           logout()
+          return
+        }
+
+        // Warmup reporting is optional. A truthful 501 means the backend does
+        // not expose a warmup state, so do not trap the UI on synthetic
+        // progress.
+        if (response.status === 501) {
+          setWarmupState('ready')
           return
         }
 
@@ -113,13 +123,7 @@ function App() {
   // Listen for popstate (browser back/forward)
   useEffect(() => {
     const handlePopState = () => {
-      const pathname = window.location.pathname.slice(1)
-      const mainPath = pathname.split('/')[0] // Extract main tab from path
-      if (validTabs.includes(mainPath as TabType)) {
-        setActiveTab(mainPath as TabType)
-      } else {
-        setActiveTab('dashboard')
-      }
+      setActiveTab(resolveTabFromLocation())
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
@@ -156,14 +160,14 @@ function App() {
     switch (activeTab) {
       case 'dashboard':
         return <Dashboard />
+      case 'control-plane':
+        return <ControlPlaneStatus />
       case 'redemptions':
         return <RedemptionCenter />
       case 'topups':
         return <TopUps />
       case 'risk':
         return <RealtimeRanking />
-      case 'abuse-broadcast':
-        return <AbuseBroadcast />
       case 'ip-analysis':
         return <IPAnalysis />
       case 'analytics':
@@ -174,8 +178,6 @@ function App() {
         return <UserManagement />
       case 'tokens':
         return <Tokens />
-      case 'auto-group':
-        return <AutoGroup />
       default:
         return <Dashboard />
     }

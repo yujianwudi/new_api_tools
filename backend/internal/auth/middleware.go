@@ -5,19 +5,17 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/models"
 )
 
 // SkipPaths are paths that don't require authentication
 var SkipPaths = map[string]bool{
-	"/api/health":    true,
-	"/api/health/db": true,
-}
-
-// SkipPrefixes are path prefixes that don't require authentication
-var SkipPrefixes = []string{
-	"/api/auth/",
+	"/api/health":      true,
+	"/api/health/db":   true,
+	"/api/auth/login":  true,
+	"/api/auth/logout": true,
 }
 
 // AuthMiddleware provides authentication via API Key or JWT Token
@@ -39,20 +37,21 @@ func AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Skip authentication for auth endpoints (login/logout)
-		for _, prefix := range SkipPrefixes {
-			if strings.HasPrefix(path, prefix) {
-				c.Set("auth_method", "skip")
-				c.Next()
-				return
-			}
-		}
-
 		// Try API Key authentication first (X-API-Key header)
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey != "" {
 			if VerifyAPIKey(apiKey) {
+				role := ParseRole(config.Get().APIKeyRole)
+				if role == RoleInvalid {
+					logger.L.Warn("API key authentication rejected because API_KEY_ROLE is invalid", logger.CatAuth)
+					c.AbortWithStatusJSON(http.StatusForbidden, models.NewErrorResponse(
+						"ROLE_INVALID",
+						"API key role configuration is invalid",
+					))
+					return
+				}
 				c.Set("auth_method", "api_key")
+				SetRole(c, role)
 				c.Next()
 				return
 			}
@@ -77,6 +76,7 @@ func AuthMiddleware() gin.HandlerFunc {
 				if err == nil && claims != nil {
 					c.Set("auth_method", "jwt")
 					c.Set("user_sub", claims.Subject)
+					SetRole(c, RoleAdmin)
 					c.Next()
 					return
 				}

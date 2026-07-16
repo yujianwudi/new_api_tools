@@ -3,14 +3,14 @@
 # 使用方式:
 #   1. 通过 install.sh 一键安装 (推荐)
 #   2. 通过 deploy.sh 自动部署: ./deploy.sh
-#   3. 手动部署: 复制 .env.example 为 .env 并配置后运行 docker-compose up -d
+#   3. 手动部署: 在 .env 中设置不可变 repo@sha256 digest 后运行 docker compose up -d
 #
 # 更新方式:
 #   docker compose pull && docker compose down && docker compose up -d
 
 services:
   newapi-tools:
-    image: "${NEWAPI_TOOLS_IMAGE:-ghcr.io/yujianwudi/new_api_tools:0.2.0}"
+    image: "${NEWAPI_TOOLS_IMAGE:?NEWAPI_TOOLS_IMAGE must be an immutable repo@sha256 digest; use install/deploy to resolve tags safely}"
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
@@ -35,6 +35,7 @@ services:
       - DB_MAX_IDLE_CONNS=${DB_MAX_IDLE_CONNS:-}
       # 认证
       - API_KEY=${API_KEY}
+      - API_KEY_ROLE=${API_KEY_ROLE:-operator}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - JWT_SECRET_KEY=${JWT_SECRET}
       - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
@@ -50,6 +51,9 @@ services:
       - PUBLIC_MODEL_MAX_BATCH=${PUBLIC_MODEL_MAX_BATCH:-50}
       - PUBLIC_MODEL_MAX_BODY_BYTES=${PUBLIC_MODEL_MAX_BODY_BYTES:-16384}
       - PUBLIC_MODEL_REQUESTS_PER_MINUTE=${PUBLIC_MODEL_REQUESTS_PER_MINUTE:-30}
+      # 兑换码财务硬上限（NewAPI quota 单位，500000 = US$1）
+      - REDEMPTION_MAX_QUOTA_PER_CODE=${REDEMPTION_MAX_QUOTA_PER_CODE:-50000000}
+      - REDEMPTION_MAX_TOTAL_QUOTA=${REDEMPTION_MAX_TOTAL_QUOTA:-500000000}
       # 仅信任精确代理地址；外层反代需追加内层 Nginx 实际看到的来源 IP
       - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
       # Redis 缓存
@@ -63,10 +67,18 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # NewAPI 连接
       - NEWAPI_BASEURL=${NEWAPI_BASEURL:-}
+      - NEWAPI_ADMIN_ACCESS_TOKEN=${NEWAPI_ADMIN_ACCESS_TOKEN:-}
+      - NEWAPI_ADMIN_USER_ID=${NEWAPI_ADMIN_USER_ID:-0}
+      - OBSERVABILITY_TOKEN=${OBSERVABILITY_TOKEN:-}
+      - LOG_FRESHNESS_MAX_SECONDS=${LOG_FRESHNESS_MAX_SECONDS:-900}
+      - TOOL_STORE_PATH=${TOOL_STORE_PATH:-/app/data/control-plane.db}
+      - GEOIP_AUTO_DOWNLOAD=${GEOIP_AUTO_DOWNLOAD:-false}
+      - GEOIP_AUTO_UPDATE=${GEOIP_AUTO_UPDATE:-false}
       # NewAPI Redis/直接写库安全边界（工具自身 Redis 与此无关）
       - NEWAPI_REDIS_DISABLED=${NEWAPI_REDIS_DISABLED:-false}
       - ALLOW_UNSAFE_BATCH_DELETE=${ALLOW_UNSAFE_BATCH_DELETE:-false}
       - ALLOW_UNSAFE_HARD_DELETE=${ALLOW_UNSAFE_HARD_DELETE:-false}
+      # v0.2 rollback compatibility; newer images ignore this legacy switch.
       - ENFORCE_IP_RECORDING=${ENFORCE_IP_RECORDING:-false}
     volumes:
       - ./data:/app/data
@@ -76,6 +88,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      image-policy:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     logging:
@@ -84,7 +98,22 @@ services:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:8080/api/health"]
+      # v0.5 readiness is authoritative and must include the main DB and Tool
+      # Store. A legacy v0.2 image serves SPA HTML for /readyz, so only that
+      # non-JSON case may fall back to the semantic DB compatibility endpoint.
+      test:
+        - CMD-SHELL
+        - >-
+          ready="$$(curl --silent --show-error http://localhost:8080/readyz 2>/dev/null || true)";
+          if printf '%s' "$$ready" | grep -Eq '^[[:space:]]*\{' &&
+             printf '%s' "$$ready" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' &&
+             printf '%s' "$$ready" | grep -Eq '"main_database"[[:space:]]*:[[:space:]]*"ok"' &&
+             printf '%s' "$$ready" | grep -Eq '"tool_store"[[:space:]]*:[[:space:]]*"ok"'; then exit 0; fi;
+          printf '%s' "$$ready" | grep -Eq '^[[:space:]]*\{' && exit 1;
+          legacy="$$(curl --fail --silent --show-error http://localhost:8080/api/health/db 2>/dev/null || true)";
+          printf '%s' "$$legacy" | grep -Eq '^[[:space:]]*\{' &&
+          printf '%s' "$$legacy" | grep -Eq '"success"[[:space:]]*:[[:space:]]*true' &&
+          printf '%s' "$$legacy" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"connected"'
       interval: 30s
       timeout: 10s
       retries: 3
@@ -93,9 +122,33 @@ services:
       - default
       - newapi-network
 
+  # Manual Compose deployments fail closed unless the application image is an
+  # exact lowercase SHA-256 digest. install.sh/deploy.sh may pull a tag first,
+  # but they resolve and persist its RepoDigest before invoking `compose up`.
+  image-policy:
+    image: alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+    environment:
+      - NEWAPI_TOOLS_IMAGE=${NEWAPI_TOOLS_IMAGE:?NEWAPI_TOOLS_IMAGE must be an immutable repo@sha256 digest; use install/deploy to resolve tags safely}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        printf '%s\n' "$$NEWAPI_TOOLS_IMAGE" |
+          grep -Eq '^[^@[:space:]]+@sha256:[0-9a-f]{64}$$' || {
+            echo 'NEWAPI_TOOLS_IMAGE must use repo@sha256:<64 lowercase hex>; refusing mutable manual deployment' >&2
+            exit 1
+          }
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   # Redis 缓存服务
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: newapi-tools-redis
     # 只允许淘汰带 TTL 的普通缓存/一次性快照；AutoGroup 审计键无 TTL，必须保留。
     command: >

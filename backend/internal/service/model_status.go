@@ -126,15 +126,17 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	// Single optimized query — aggregate by time slot using FLOOR division
 	// This reduces N queries to 1 query per model (matches Python backend)
 	//
-	// Success counting strategy:
-	//   - type=2 with completion_tokens > 0 → definite success
-	//   - type=2 with completion_tokens = 0 → empty response (likely failure)
-	//   - type=5 → explicit failure (if NewAPI version supports it)
-	// This ensures correct success rate even when NewAPI doesn't log type=5 failures.
+	// NewAPI log types are the source of truth for request outcome:
+	//   - type=2 is a successful consume record, including embeddings, rerank,
+	//     image, audio and other endpoints that legitimately emit zero
+	//     completion tokens.
+	//   - type=5 is an explicit failure.
+	// Zero completion tokens remain diagnostic metadata only; they must not
+	// lower availability.
 	slotQuery := s.logDB.RebindQuery(fmt.Sprintf(`
 		SELECT FLOOR((created_at - %d) / %d) as slot_idx,
 			COUNT(*) as total,
-			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
+			SUM(CASE WHEN type = 2 THEN 1 ELSE 0 END) as success,
 			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
 			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
 		FROM logs

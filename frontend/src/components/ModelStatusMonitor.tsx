@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
+import { mergeFilteredModelOrder } from '../lib/modelStatusOrder'
+import { chunkModelNames, normalizeModelStatusMaxBatch } from '../lib/modelStatusBatch'
 import { RefreshCw, Loader2, Timer, ChevronDown, Settings2, Check, Clock, Palette, Moon, Sun, Minimize2, Maximize2, Zap, Terminal, Leaf, Droplets, HelpCircle, Copy, X, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, ArrowUpDown, GripVertical, Search, Filter, Layers, Plus, Pencil, Trash2, FolderPlus, Tag, KeyRound } from 'lucide-react'
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable'
@@ -364,11 +366,83 @@ const SORT_MODE_KEY = 'model_status_sort_mode'
 const CUSTOM_ORDER_KEY = 'model_status_custom_order'
 // Note: MODEL_GROUP_KEY is defined alongside MODEL_GROUPS above
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function apiErrorMessage(payload: unknown, status: number): string {
+  if (isRecord(payload)) {
+    if (isRecord(payload.error) && typeof payload.error.message === 'string') {
+      return payload.error.message
+    }
+    if (typeof payload.error === 'string') return payload.error
+    if (typeof payload.message === 'string') return payload.message
+  }
+  return `HTTP ${status}`
+}
+
+async function requireSuccessfulResponse(response: Response): Promise<Record<string, unknown>> {
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new Error(`Invalid JSON response (HTTP ${response.status})`)
+  }
+  if (!response.ok || !isRecord(payload) || payload.success !== true) {
+    throw new Error(apiErrorMessage(payload, response.status))
+  }
+  return payload
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
+function getLocalStorage(): Storage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage
+  } catch {
+    return null
+  }
+}
+
+function readStoredValue(key: string): string | null {
+  try {
+    return getLocalStorage()?.getItem(key) ?? null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredValue(key: string, value: string): void {
+  try {
+    getLocalStorage()?.setItem(key, value)
+  } catch {
+    // Backend persistence remains authoritative when browser storage is blocked.
+  }
+}
+
+function readStoredStringArray(key: string): string[] | null {
+  const stored = readStoredValue(key)
+  if (stored === null) return null
+  try {
+    const parsed: unknown = JSON.parse(stored)
+    return Array.isArray(parsed) && parsed.every(value => typeof value === 'string') ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
 // Sort mode type
 type SortMode = 'default' | 'availability' | 'custom'
 
 // Status filter type
 type StatusFilter = 'all' | ModelHealthStatus
+const AUTHENTICATED_MODEL_STATUS_DEFAULT_MAX_BATCH = 200
 
 export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps) {
   const { token } = useAuth()
@@ -376,37 +450,37 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   const [availableModels, setAvailableModels] = useState<ModelWithStats[]>([])
   const [selectedModels, setSelectedModels] = useState<string[]>([])
+  const [maxBatch, setMaxBatch] = useState(AUTHENTICATED_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
   const [loading, setLoading] = useState(true)
   const [initialLoading, setInitialLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
 
   const [timeWindow, setTimeWindow] = useState(() => {
-    const saved = localStorage.getItem(TIME_WINDOW_KEY)
+    const saved = readStoredValue(TIME_WINDOW_KEY)
     return saved || '24h'
   })
 
   const [theme, setTheme] = useState(() => {
-    const saved = localStorage.getItem(THEME_KEY)
+    const saved = readStoredValue(THEME_KEY)
     // Validate saved theme exists, fallback for legacy values (light/dark/system)
     if (saved && THEMES.find(t => t.id === saved)) return saved
     return 'daylight'
   })
 
   const [refreshInterval, setRefreshInterval] = useState(() => {
-    const saved = localStorage.getItem(REFRESH_INTERVAL_KEY)
+    const saved = readStoredValue(REFRESH_INTERVAL_KEY)
     return saved ? parseInt(saved, 10) : 60
   })
   const [countdown, setCountdown] = useState(refreshInterval)
   const refreshIntervalRef = useRef(refreshInterval)
 
   const [sortMode, setSortMode] = useState<SortMode>(() => {
-    const saved = localStorage.getItem(SORT_MODE_KEY)
-    return (saved as SortMode) || 'default'
+    const saved = readStoredValue(SORT_MODE_KEY)
+    return saved === 'availability' || saved === 'custom' ? saved : 'default'
   })
   const [customOrder, setCustomOrder] = useState<string[]>(() => {
-    const saved = localStorage.getItem(CUSTOM_ORDER_KEY)
-    return saved ? JSON.parse(saved) : []
+    return readStoredStringArray(CUSTOM_ORDER_KEY) ?? []
   })
 
   const [showModelSelector, setShowModelSelector] = useState(false)
@@ -417,7 +491,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const [modelSearchQuery, setModelSearchQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [groupFilter, setGroupFilter] = useState(() => {
-    const saved = localStorage.getItem(MODEL_GROUP_KEY)
+    const saved = readStoredValue(MODEL_GROUP_KEY)
     return saved || 'all'
   })
   const [customGroups, setCustomGroups] = useState<CustomModelGroup[]>([])
@@ -430,6 +504,20 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   const intervalDropdownRef = useRef<HTMLDivElement>(null)
   const windowDropdownRef = useRef<HTMLDivElement>(null)
   const themeDropdownRef = useRef<HTMLDivElement>(null)
+  const selectedModelsRef = useRef(selectedModels)
+  const persistedSelectedModelsRef = useRef(selectedModels)
+  const selectedModelsSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const sortSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const configSaveQueuesRef = useRef(new Map<string, Promise<void>>())
+  const configMutationIdsRef = useRef({ timeWindow: 0, theme: 0, refreshInterval: 0, sort: 0, siteTitle: 0 })
+  const statusRequestIdRef = useRef(0)
+  const statusRequestControllerRef = useRef<AbortController | null>(null)
+  const persistedTimeWindowRef = useRef(timeWindow)
+  const persistedThemeRef = useRef(theme)
+  const persistedRefreshIntervalRef = useRef(refreshInterval)
+  const persistedSortModeRef = useRef(sortMode)
+  const persistedCustomOrderRef = useRef(customOrder)
+  const persistedSiteTitleRef = useRef('')
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
 
@@ -453,6 +541,15 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   useClickOutside(windowDropdownRef, () => setShowWindowDropdown(false), showWindowDropdown)
   useClickOutside(themeDropdownRef, () => setShowThemeDropdown(false), showThemeDropdown)
 
+  useEffect(() => {
+    selectedModelsRef.current = selectedModels
+  }, [selectedModels])
+
+  useEffect(() => () => {
+    statusRequestIdRef.current += 1
+    statusRequestControllerRef.current?.abort()
+  }, [])
+
   // Fullscreen change listener
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -471,149 +568,221 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }
   }, [])
 
-  // Save time window to backend cache
-  const saveTimeWindowToBackend = useCallback(async (window: string) => {
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/window`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ time_window: window }),
-      })
-      localStorage.setItem(TIME_WINDOW_KEY, window)
-    } catch (error) {
-      console.error('Failed to save time window:', error)
-    }
-  }, [apiUrl, getAuthHeaders])
-
-  // Save theme to backend cache
-  const saveThemeToBackend = useCallback(async (newTheme: string) => {
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/theme`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ theme: newTheme }),
-      })
-      localStorage.setItem(THEME_KEY, newTheme)
-      showToast('success', `主题已切换为 ${THEMES.find(t => t.id === newTheme)?.name || newTheme}`)
-    } catch (error) {
-      console.error('Failed to save theme:', error)
-    }
+  const saveConfigMutation = useCallback((
+    path: string,
+    body: Record<string, unknown>,
+    label: string,
+    method: 'POST' | 'PUT' = 'POST',
+  ): Promise<boolean> => {
+    const previousSave = configSaveQueuesRef.current.get(path) ?? Promise.resolve()
+    const saveAttempt = previousSave.then(async () => {
+      try {
+        const response = await fetch(`${apiUrl}${path}`, {
+          method,
+          headers: getAuthHeaders(),
+          body: JSON.stringify(body),
+        })
+        await requireSuccessfulResponse(response)
+        return true
+      } catch (error) {
+        console.error(`Failed to save ${label}:`, error)
+        showToast('error', `${label}保存失败，已保留有效设置`)
+        return false
+      }
+    })
+    configSaveQueuesRef.current.set(path, saveAttempt.then(() => undefined))
+    return saveAttempt
   }, [apiUrl, getAuthHeaders, showToast])
 
-  // Save refresh interval to backend cache
-  const saveRefreshIntervalToBackend = useCallback(async (interval: number) => {
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/refresh`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ refresh_interval: interval }),
-      })
-      localStorage.setItem(REFRESH_INTERVAL_KEY, interval.toString())
-    } catch (error) {
-      console.error('Failed to save refresh interval:', error)
+  // Save time window to backend cache
+  const saveTimeWindowToBackend = useCallback(async (window: string): Promise<boolean> => {
+    const saved = await saveConfigMutation(
+      '/api/model-status/config/window',
+      { time_window: window },
+      '时间窗口',
+    )
+    if (saved) {
+      persistedTimeWindowRef.current = window
+      writeStoredValue(TIME_WINDOW_KEY, window)
     }
-  }, [apiUrl, getAuthHeaders])
+    return saved
+  }, [saveConfigMutation])
+
+  // Save theme to backend cache
+  const saveThemeToBackend = useCallback(async (newTheme: string): Promise<boolean> => {
+    const saved = await saveConfigMutation(
+      '/api/model-status/config/theme',
+      { theme: newTheme },
+      '主题',
+    )
+    if (saved) {
+      persistedThemeRef.current = newTheme
+      writeStoredValue(THEME_KEY, newTheme)
+      showToast('success', `主题已切换为 ${THEMES.find(t => t.id === newTheme)?.name || newTheme}`)
+    }
+    return saved
+  }, [saveConfigMutation, showToast])
+
+  // Save refresh interval to backend cache
+  const saveRefreshIntervalToBackend = useCallback(async (interval: number): Promise<boolean> => {
+    const saved = await saveConfigMutation(
+      '/api/model-status/config/refresh',
+      { refresh_interval: interval },
+      '刷新间隔',
+    )
+    if (saved) {
+      persistedRefreshIntervalRef.current = interval
+      writeStoredValue(REFRESH_INTERVAL_KEY, interval.toString())
+    }
+    return saved
+  }, [saveConfigMutation])
 
   // Save selected models to backend cache
-  const saveSelectedModelsToBackend = useCallback(async (models: string[]) => {
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/selected`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ models }),
-      })
-      localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(models))
-    } catch (error) {
-      console.error('Failed to save selected models:', error)
-    }
-  }, [apiUrl, getAuthHeaders])
+  const saveSelectedModelsToBackend = useCallback((models: string[]): Promise<boolean> => {
+    const saveAttempt = selectedModelsSaveQueueRef.current.then(async () => {
+      const saved = await saveConfigMutation(
+        '/api/model-status/config/selected',
+        { models },
+        '模型选择',
+      )
+      if (saved) {
+        persistedSelectedModelsRef.current = [...models]
+        writeStoredValue(SELECTED_MODELS_KEY, JSON.stringify(models))
+      }
+      return saved
+    })
+    selectedModelsSaveQueueRef.current = saveAttempt.then(() => undefined)
+    return saveAttempt
+  }, [saveConfigMutation])
 
   // Save sort config to backend cache
-  const saveSortConfigToBackend = useCallback(async (mode: SortMode, order?: string[]) => {
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/sort`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ sort_mode: mode, custom_order: order }),
-      })
-      localStorage.setItem(SORT_MODE_KEY, mode)
-      if (order) {
-        localStorage.setItem(CUSTOM_ORDER_KEY, JSON.stringify(order))
+  const saveSortConfigToBackend = useCallback((mode: SortMode, order?: string[]): Promise<boolean> => {
+    const saveAttempt = sortSaveQueueRef.current.then(async () => {
+      const previousPersistedOrder = [...persistedCustomOrderRef.current]
+      let customOrderChanged = false
+      if (order !== undefined) {
+        const orderSaved = await saveConfigMutation(
+          '/api/model-status/config/custom-order',
+          { custom_order: order },
+          '自定义排序',
+          'PUT',
+        )
+        if (!orderSaved) return false
+        customOrderChanged = true
       }
-    } catch (error) {
-      console.error('Failed to save sort config:', error)
-    }
-  }, [apiUrl, getAuthHeaders])
+
+      const modeSaved = await saveConfigMutation(
+        '/api/model-status/config/sort',
+        { sort_mode: mode },
+        '排序方式',
+      )
+      if (!modeSaved) {
+        if (customOrderChanged) {
+          await saveConfigMutation(
+            '/api/model-status/config/custom-order',
+            { custom_order: previousPersistedOrder },
+            '自定义排序回滚',
+            'PUT',
+          )
+        }
+        return false
+      }
+
+      persistedSortModeRef.current = mode
+      if (order !== undefined) persistedCustomOrderRef.current = [...order]
+      writeStoredValue(SORT_MODE_KEY, mode)
+      if (order !== undefined) writeStoredValue(CUSTOM_ORDER_KEY, JSON.stringify(order))
+      return true
+    })
+    sortSaveQueueRef.current = saveAttempt.then(() => undefined)
+    return saveAttempt
+  }, [saveConfigMutation])
 
   // Load config from backend on mount
-  const loadConfigFromBackend = useCallback(async () => {
+  const loadConfigFromBackend = useCallback(async (signal?: AbortSignal): Promise<string[] | null> => {
     try {
       const response = await fetch(`${apiUrl}/api/model-status/config/selected`, {
         headers: getAuthHeaders(),
+        signal,
       })
-      const data = await response.json()
-      if (data.success) {
-        if (Array.isArray(data.data) && data.data.length > 0) {
-          setSelectedModels(data.data)
-          localStorage.setItem(SELECTED_MODELS_KEY, JSON.stringify(data.data))
-        }
-        if (data.time_window) {
-          setTimeWindow(data.time_window)
-          localStorage.setItem(TIME_WINDOW_KEY, data.time_window)
-        }
-        if (data.theme) {
-          // Validate theme exists, fallback to daylight for legacy values (light/dark/system)
-          const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
-          setTheme(validTheme)
-          localStorage.setItem(THEME_KEY, validTheme)
-        }
-        if (data.refresh_interval !== undefined && data.refresh_interval !== null) {
-          setRefreshInterval(data.refresh_interval)
-          setCountdown(data.refresh_interval)
-          localStorage.setItem(REFRESH_INTERVAL_KEY, data.refresh_interval.toString())
-        }
-        if (data.sort_mode) {
-          setSortMode(data.sort_mode as SortMode)
-          localStorage.setItem(SORT_MODE_KEY, data.sort_mode)
-        }
-        if (data.custom_order && data.custom_order.length > 0) {
-          setCustomOrder(data.custom_order)
-          localStorage.setItem(CUSTOM_ORDER_KEY, JSON.stringify(data.custom_order))
-        }
-        // Load custom groups from backend
-        if (data.custom_groups && Array.isArray(data.custom_groups)) {
-          setCustomGroups(data.custom_groups as CustomModelGroup[])
-        }
-        // Load site title
-        if (data.site_title !== undefined) {
-          setSiteTitle(data.site_title || '')
-        }
-        return data.data || []
+      const data = await requireSuccessfulResponse(response)
+      setMaxBatch(normalizeModelStatusMaxBatch(data.max_batch, AUTHENTICATED_MODEL_STATUS_DEFAULT_MAX_BATCH))
+
+      let selectedConfig: string[] | null = null
+      if (Array.isArray(data.data) && data.data.every(value => typeof value === 'string')) {
+        selectedConfig = [...data.data]
+        selectedModelsRef.current = selectedConfig
+        persistedSelectedModelsRef.current = selectedConfig
+        setSelectedModels(selectedConfig)
+        writeStoredValue(SELECTED_MODELS_KEY, JSON.stringify(selectedConfig))
       }
+      if (typeof data.time_window === 'string' && TIME_WINDOWS.some(item => item.value === data.time_window)) {
+        persistedTimeWindowRef.current = data.time_window
+        setTimeWindow(data.time_window)
+        writeStoredValue(TIME_WINDOW_KEY, data.time_window)
+      }
+      if (typeof data.theme === 'string') {
+        // Validate theme exists, fallback to daylight for legacy values (light/dark/system)
+        const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
+        persistedThemeRef.current = validTheme
+        setTheme(validTheme)
+        writeStoredValue(THEME_KEY, validTheme)
+      }
+      if (typeof data.refresh_interval === 'number') {
+        persistedRefreshIntervalRef.current = data.refresh_interval
+        setRefreshInterval(data.refresh_interval)
+        setCountdown(data.refresh_interval)
+        writeStoredValue(REFRESH_INTERVAL_KEY, data.refresh_interval.toString())
+      }
+      if (data.sort_mode === 'default' || data.sort_mode === 'availability' || data.sort_mode === 'custom') {
+        persistedSortModeRef.current = data.sort_mode
+        setSortMode(data.sort_mode)
+        writeStoredValue(SORT_MODE_KEY, data.sort_mode)
+      }
+      if (Array.isArray(data.custom_order) && data.custom_order.every(value => typeof value === 'string')) {
+        const order = [...data.custom_order]
+        persistedCustomOrderRef.current = order
+        setCustomOrder(order)
+        writeStoredValue(CUSTOM_ORDER_KEY, JSON.stringify(order))
+      }
+      // Load custom groups from backend
+      if (Array.isArray(data.custom_groups)) {
+        setCustomGroups(data.custom_groups as CustomModelGroup[])
+      }
+      // Load site title
+      if (typeof data.site_title === 'string') {
+        persistedSiteTitleRef.current = data.site_title
+        setSiteTitle(data.site_title)
+      }
+      if (selectedConfig !== null) return selectedConfig
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return null
       console.error('Failed to load config from backend:', error)
     }
     // Fallback to localStorage
-    const saved = localStorage.getItem(SELECTED_MODELS_KEY)
-    if (saved) {
-      const models = JSON.parse(saved)
-      setSelectedModels(models)
-      return models
+    const savedModels = readStoredStringArray(SELECTED_MODELS_KEY)
+    if (savedModels !== null) {
+      selectedModelsRef.current = savedModels
+      persistedSelectedModelsRef.current = savedModels
+      setSelectedModels(savedModels)
+      return savedModels
     }
-    return []
+    return null
   }, [apiUrl, getAuthHeaders])
 
   // 加载令牌分组列表
-  const fetchTokenGroups = useCallback(async () => {
+  const fetchTokenGroups = useCallback(async (signal?: AbortSignal) => {
     try {
       const response = await fetch(`${apiUrl}${getApiPrefix()}/token-groups`, {
         headers: getAuthHeaders(),
+        signal,
       })
-      const data = await response.json()
-      if (data.success && Array.isArray(data.data)) {
+      const data = await requireSuccessfulResponse(response)
+      if (Array.isArray(data.data)) {
         setTokenGroups(data.data)
       }
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return
       console.error('Failed to fetch token groups:', error)
     }
   }, [apiUrl, getApiPrefix, getAuthHeaders])
@@ -621,40 +790,49 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   // Update refresh interval ref
   useEffect(() => {
     refreshIntervalRef.current = refreshInterval
-    localStorage.setItem(REFRESH_INTERVAL_KEY, refreshInterval.toString())
   }, [refreshInterval])
 
   // Fetch available models and load config
-  const fetchAvailableModels = useCallback(async () => {
+  const fetchAvailableModels = useCallback(async (signal?: AbortSignal) => {
     try {
       const response = await fetch(`${apiUrl}${getApiPrefix()}/models`, {
         headers: getAuthHeaders(),
+        signal,
       })
-      const data = await response.json()
-      if (data.success) {
-        // data.data is now an array of { model_name, request_count_24h }
-        // 后端无数据时可能返回 null（Go nil 切片 → JSON null），统一兜底成数组，避免渲染崩溃
-        const models: ModelWithStats[] = Array.isArray(data.data) ? data.data : []
-        setAvailableModels(models)
-        // Load config from backend
-        const savedModels = await loadConfigFromBackend()
-        // Auto-select models with requests in last 24h if none selected
-        if (savedModels.length === 0 && models.length > 0) {
-          // Filter models that have requests in the last 24 hours
-          const activeModels = models
-            .filter((m: ModelWithStats) => m.request_count_24h > 0)
-            .map((m: ModelWithStats) => m.model_name)
-          // If no active models, fall back to first 5
-          const defaultModels = activeModels.length > 0
-            ? activeModels
-            : models.slice(0, 5).map((m: ModelWithStats) => m.model_name)
-          setSelectedModels(defaultModels)
-          saveSelectedModelsToBackend(defaultModels)
+      const data = await requireSuccessfulResponse(response)
+      // data.data is now an array of { model_name, request_count_24h }
+      // 后端无数据时可能返回 null（Go nil 切片 → JSON null），统一兜底成数组，避免渲染崩溃
+      const models: ModelWithStats[] = Array.isArray(data.data) ? data.data as ModelWithStats[] : []
+      setAvailableModels(models)
+      // Load config from backend. null means no usable config; [] is an explicit empty selection.
+      const savedModels = await loadConfigFromBackend(signal)
+      if (signal?.aborted) return
+      if ((savedModels !== null && savedModels.length === 0) || (savedModels === null && models.length === 0)) {
+        setModelStatuses([])
+        setLoading(false)
+        setInitialLoading(false)
+      }
+      // Auto-select active models only when neither backend nor browser storage has a selection.
+      if (savedModels === null && models.length > 0) {
+        const activeModels = models
+          .filter((m: ModelWithStats) => m.request_count_24h > 0)
+          .map((m: ModelWithStats) => m.model_name)
+        const defaultModels = activeModels.length > 0
+          ? activeModels
+          : models.slice(0, 5).map((m: ModelWithStats) => m.model_name)
+        selectedModelsRef.current = defaultModels
+        setSelectedModels(defaultModels)
+        const saved = await saveSelectedModelsToBackend(defaultModels)
+        if (!saved && sameStringArray(selectedModelsRef.current, defaultModels)) {
+          const persistedModels = persistedSelectedModelsRef.current
+          selectedModelsRef.current = persistedModels
+          setSelectedModels(persistedModels)
         }
       }
       // 同时加载令牌分组
-      fetchTokenGroups()
+      await fetchTokenGroups(signal)
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) return
       console.error('Failed to fetch available models:', error)
     }
   }, [apiUrl, getApiPrefix, getAuthHeaders, loadConfigFromBackend, saveSelectedModelsToBackend, fetchTokenGroups])
@@ -673,10 +851,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       return tg ? tg.models : []
     })()
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
+    const requestId = ++statusRequestIdRef.current
+    statusRequestControllerRef.current?.abort()
 
     if (fetchSet.length === 0) {
+      statusRequestControllerRef.current = null
       setModelStatuses([])
       setLoading(false)
+      setRefreshing(false)
       // Only clear initialLoading when we know models have been loaded
       if (availableModels.length > 0) {
         setInitialLoading(false)
@@ -684,6 +866,8 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       return
     }
 
+    const controller = new AbortController()
+    statusRequestControllerRef.current = controller
     if (forceRefresh) {
       setRefreshing(true)
     }
@@ -691,30 +875,41 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     try {
       // Add no_cache=true when force refreshing to bypass backend cache
       const cacheParam = forceRefresh ? '&no_cache=true' : ''
-      const response = await fetch(`${apiUrl}${getApiPrefix()}/status/batch?window=${timeWindow}${cacheParam}`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify(fetchSet),
-      })
-      const data = await response.json()
-      if (data.success) {
-        setModelStatuses(data.data ?? [])
-        setInitialLoading(false)
-      }
+      const chunkResults = await Promise.all(chunkModelNames(fetchSet, maxBatch).map(async modelNames => {
+        const response = await fetch(`${apiUrl}${getApiPrefix()}/status/batch?window=${timeWindow}${cacheParam}`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify(modelNames),
+          signal: controller.signal,
+        })
+        const data = await requireSuccessfulResponse(response)
+        if (!Array.isArray(data.data)) throw new Error('Invalid model status batch response')
+        return data.data as ModelStatus[]
+      }))
+      if (requestId !== statusRequestIdRef.current) return
+      setModelStatuses(chunkResults.flat())
+      setInitialLoading(false)
     } catch (error) {
+      if (controller.signal.aborted || requestId !== statusRequestIdRef.current || isAbortError(error)) return
+      controller.abort()
       console.error('Failed to fetch model statuses:', error)
       if (!isEmbed) {
         showToast('error', '获取模型状态失败')
       }
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (requestId === statusRequestIdRef.current) {
+        statusRequestControllerRef.current = null
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
-  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, timeWindow, isEmbed, showToast, groupFilter, tokenGroups, availableModels.length])
+  }, [apiUrl, getApiPrefix, getAuthHeaders, selectedModels, timeWindow, isEmbed, showToast, groupFilter, tokenGroups, availableModels.length, maxBatch])
 
   // Initial load
   useEffect(() => {
-    fetchAvailableModels()
+    const controller = new AbortController()
+    void fetchAvailableModels(controller.signal)
+    return () => controller.abort()
   }, [fetchAvailableModels])
 
   // Track if models/window changed (not initial load)
@@ -754,7 +949,6 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       // Models selection changed - fetch fresh data for new models
       fetchModelStatuses(true)
     } else if (windowChanged) {
-      // Only time window changed - can use cache (pre-warmed)
       fetchModelStatuses(false)
     }
   }, [selectedModels, timeWindow, groupFilter, fetchModelStatuses])
@@ -804,6 +998,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     [modelStatuses]
   )
 
+  const groupManagerModels = useMemo(() => Array.from(new Set([
+    ...availableModels.map(model => model.model_name),
+    ...tokenGroups.flatMap(group => group.models),
+    ...selectedModels,
+    ...customGroups.flatMap(group => group.models),
+    ...modelStatuses.map(model => model.model_name),
+  ])), [availableModels, tokenGroups, selectedModels, customGroups, modelStatuses])
+
   // Status counts for overview
   const statusCounts = useMemo(() => {
     const counts = { green: 0, yellow: 0, red: 0, unknown: 0 }
@@ -844,73 +1046,83 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
   // Handle group filter change
   const handleGroupFilterChange = useCallback((gid: string) => {
     setGroupFilter(gid)
-    localStorage.setItem(MODEL_GROUP_KEY, gid)
+    writeStoredValue(MODEL_GROUP_KEY, gid)
   }, [])
 
   // Save custom groups to backend
-  const saveCustomGroups = useCallback(async (groups: CustomModelGroup[]) => {
-    setCustomGroups(groups)
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/groups`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ groups }),
-      })
-    } catch (error) {
-      console.error('Failed to save custom groups:', error)
-    }
-  }, [apiUrl, getAuthHeaders])
+  const saveCustomGroups = useCallback(async (groups: CustomModelGroup[]): Promise<boolean> => {
+    const saved = await saveConfigMutation(
+      '/api/model-status/config/groups',
+      { groups },
+      '自定义分组',
+    )
+    if (saved) setCustomGroups(groups)
+    return saved
+  }, [saveConfigMutation])
 
   // Save site title to backend
-  const saveSiteTitleToBackend = useCallback(async (title: string) => {
-    setSiteTitle(title)
-    try {
-      await fetch(`${apiUrl}/api/model-status/config/site-title`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ site_title: title }),
-      })
-    } catch (error) {
-      console.error('Failed to save site title:', error)
+  const saveSiteTitleToBackend = useCallback(async (title: string): Promise<boolean> => {
+    const mutationId = ++configMutationIdsRef.current.siteTitle
+    const saved = await saveConfigMutation(
+      '/api/model-status/config/site-title',
+      { site_title: title },
+      '站点标题',
+    )
+    if (saved) {
+      persistedSiteTitleRef.current = title
+    } else if (mutationId === configMutationIdsRef.current.siteTitle) {
+      const persistedTitle = persistedSiteTitleRef.current
+      setSiteTitle(current => current === title ? persistedTitle : current)
     }
-  }, [apiUrl, getAuthHeaders])
+    return saved
+  }, [saveConfigMutation])
+
+  const applySelectedModels = useCallback(async (models: string[]): Promise<boolean> => {
+    const nextModels = [...models]
+    selectedModelsRef.current = nextModels
+    setSelectedModels(nextModels)
+    const saved = await saveSelectedModelsToBackend(nextModels)
+    if (!saved && sameStringArray(selectedModelsRef.current, nextModels)) {
+      const persistedModels = persistedSelectedModelsRef.current
+      selectedModelsRef.current = persistedModels
+      setSelectedModels(persistedModels)
+    }
+    return saved
+  }, [saveSelectedModelsToBackend])
 
   // Select all models in a group
   const selectGroupModels = useCallback((group: CustomModelGroup) => {
     const newModels = [...new Set([...selectedModels, ...group.models.filter(m => availableModels.some(a => a.model_name === m))])]
-    setSelectedModels(newModels)
-    saveSelectedModelsToBackend(newModels)
-  }, [selectedModels, availableModels, saveSelectedModelsToBackend])
+    void applySelectedModels(newModels)
+  }, [selectedModels, availableModels, applySelectedModels])
 
-  // Sorted model statuses based on sort mode
-  const sortedModelStatuses = useMemo(() => {
+  // Order the complete visible catalogue before applying view filters so drag
+  // operations can preserve models that are temporarily hidden by a filter.
+  const orderedModelStatuses = useMemo(() => {
     if (visibleModelStatuses.length === 0) return []
 
-    let result: ModelStatus[]
     switch (sortMode) {
       case 'availability':
-        // Sort by success rate descending
-        result = [...visibleModelStatuses].sort((a, b) => b.success_rate - a.success_rate)
-        break
+        return [...visibleModelStatuses].sort((a, b) => b.success_rate - a.success_rate)
       case 'custom':
         if (customOrder.length === 0) {
-          result = visibleModelStatuses
-        } else {
-          // Sort by custom order
-          result = [...visibleModelStatuses].sort((a, b) => {
-            const indexA = customOrder.indexOf(a.model_name)
-            const indexB = customOrder.indexOf(b.model_name)
-            // Models not in customOrder go to the end
-            if (indexA === -1 && indexB === -1) return 0
-            if (indexA === -1) return 1
-            if (indexB === -1) return -1
-            return indexA - indexB
-          })
+          return visibleModelStatuses
         }
-        break
+        return [...visibleModelStatuses].sort((a, b) => {
+          const indexA = customOrder.indexOf(a.model_name)
+          const indexB = customOrder.indexOf(b.model_name)
+          if (indexA === -1 && indexB === -1) return 0
+          if (indexA === -1) return 1
+          if (indexB === -1) return -1
+          return indexA - indexB
+        })
       default:
-        result = visibleModelStatuses
+        return visibleModelStatuses
     }
+  }, [visibleModelStatuses, sortMode, customOrder])
+
+  const sortedModelStatuses = useMemo(() => {
+    let result = orderedModelStatuses
 
     // Apply group filter
     if (groupFilter !== 'all') {
@@ -936,7 +1148,30 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     }
 
     return result
-  }, [visibleModelStatuses, sortMode, customOrder, statusFilter, groupFilter, customGroups, tokenGroups])
+  }, [orderedModelStatuses, statusFilter, groupFilter, customGroups, tokenGroups])
+
+  const applySortConfig = useCallback(async (
+    mode: SortMode,
+    order: string[] | undefined,
+    successMessage: string,
+  ) => {
+    const mutationId = ++configMutationIdsRef.current.sort
+    setSortMode(mode)
+    if (order !== undefined) setCustomOrder(order)
+
+    const saved = await saveSortConfigToBackend(mode, order)
+    if (mutationId !== configMutationIdsRef.current.sort) return
+    if (!saved) {
+      const persistedMode = persistedSortModeRef.current
+      setSortMode(current => current === mode ? persistedMode : current)
+      if (order !== undefined) {
+        const persistedOrder = persistedCustomOrderRef.current
+        setCustomOrder(current => sameStringArray(current, order) ? persistedOrder : current)
+      }
+      return
+    }
+    showToast('success', successMessage)
+  }, [saveSortConfigToBackend, showToast])
 
   // Handle drag end for reordering
   const handleDragEnd = (event: DragEndEvent) => {
@@ -947,44 +1182,74 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       const newIndex = sortedModelStatuses.findIndex(m => m.model_name === over.id)
 
       if (oldIndex !== -1 && newIndex !== -1) {
-        // Create new order
-        const newOrder = sortedModelStatuses.map(m => m.model_name)
-        const [movedItem] = newOrder.splice(oldIndex, 1)
-        newOrder.splice(newIndex, 0, movedItem)
+        const newOrder = mergeFilteredModelOrder(
+          orderedModelStatuses.map(model => model.model_name),
+          sortedModelStatuses.map(model => model.model_name),
+          String(active.id),
+          String(over.id),
+          customOrder,
+        )
 
-        // Update state and save
-        setCustomOrder(newOrder)
-        setSortMode('custom')
-        saveSortConfigToBackend('custom', newOrder)
-        showToast('success', '已切换为自定义排序')
+        void applySortConfig('custom', newOrder, '已切换为自定义排序')
       }
     }
   }
 
   // Handle availability sort button click
   const handleAvailabilitySort = () => {
-    setSortMode('availability')
-    saveSortConfigToBackend('availability')
-    showToast('success', '已按成功率排序')
+    void applySortConfig('availability', undefined, '已按成功率排序')
   }
 
   const toggleModelSelection = (model: string) => {
     const newModels = selectedModels.includes(model)
       ? selectedModels.filter(m => m !== model)
       : [...selectedModels, model]
-    setSelectedModels(newModels)
-    saveSelectedModelsToBackend(newModels)
+    void applySelectedModels(newModels)
   }
 
   const selectAllModels = () => {
     const allModelNames = availableModels.map(m => m.model_name)
-    setSelectedModels(allModelNames)
-    saveSelectedModelsToBackend(allModelNames)
+    void applySelectedModels(allModelNames)
   }
 
   const clearAllModels = () => {
-    setSelectedModels([])
-    saveSelectedModelsToBackend([])
+    void applySelectedModels([])
+  }
+
+  const handleTimeWindowChange = (value: string) => {
+    const mutationId = ++configMutationIdsRef.current.timeWindow
+    setTimeWindow(value)
+    setShowWindowDropdown(false)
+    void saveTimeWindowToBackend(value).then(saved => {
+      if (!saved && mutationId === configMutationIdsRef.current.timeWindow) {
+        const persistedValue = persistedTimeWindowRef.current
+        setTimeWindow(current => current === value ? persistedValue : current)
+      }
+    })
+  }
+
+  const handleThemeChange = (value: string) => {
+    const mutationId = ++configMutationIdsRef.current.theme
+    setTheme(value)
+    setShowThemeDropdown(false)
+    void saveThemeToBackend(value).then(saved => {
+      if (!saved && mutationId === configMutationIdsRef.current.theme) {
+        const persistedValue = persistedThemeRef.current
+        setTheme(current => current === value ? persistedValue : current)
+      }
+    })
+  }
+
+  const handleRefreshIntervalChange = (value: number) => {
+    const mutationId = ++configMutationIdsRef.current.refreshInterval
+    setRefreshInterval(value)
+    setShowIntervalDropdown(false)
+    void saveRefreshIntervalToBackend(value).then(saved => {
+      if (!saved && mutationId === configMutationIdsRef.current.refreshInterval) {
+        const persistedValue = persistedRefreshIntervalRef.current
+        setRefreshInterval(current => current === value ? persistedValue : current)
+      }
+    })
   }
 
   if (loading && modelStatuses.length === 0) {
@@ -1121,11 +1386,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       {TIME_WINDOWS.map(({ value, label }) => (
                         <button
                           key={value}
-                          onClick={() => {
-                            setTimeWindow(value)
-                            saveTimeWindowToBackend(value)
-                            setShowWindowDropdown(false)
-                          }}
+                          onClick={() => handleTimeWindowChange(value)}
                           className={cn(
                             "w-full text-left px-3 py-2 text-sm rounded hover:bg-accent transition-colors",
                             timeWindow === value && "bg-accent text-accent-foreground"
@@ -1163,11 +1424,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                         return (
                           <button
                             key={t.id}
-                            onClick={() => {
-                              setTheme(t.id)
-                              saveThemeToBackend(t.id)
-                              setShowThemeDropdown(false)
-                            }}
+                            onClick={() => handleThemeChange(t.id)}
                             className={cn(
                               "w-full text-left px-3 py-2 text-sm rounded hover:bg-accent transition-colors flex items-center gap-3",
                               theme === t.id && "bg-accent text-accent-foreground"
@@ -1214,8 +1471,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                           const activeModels = availableModels
                             .filter(m => m.request_count_24h > 0)
                             .map(m => m.model_name)
-                          setSelectedModels(activeModels)
-                          saveSelectedModelsToBackend(activeModels)
+                          void applySelectedModels(activeModels)
                         }}>
                           有记录
                         </Button>
@@ -1239,8 +1495,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                                 onClick={() => {
                                   if (allSelected) {
                                     const newModels = selectedModels.filter(m => !group.models.includes(m))
-                                    setSelectedModels(newModels)
-                                    saveSelectedModelsToBackend(newModels)
+                                    void applySelectedModels(newModels)
                                   } else {
                                     selectGroupModels(group)
                                   }
@@ -1352,11 +1607,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       {REFRESH_INTERVALS.map(({ value, label }) => (
                         <button
                           key={value}
-                          onClick={() => {
-                            setRefreshInterval(value)
-                            saveRefreshIntervalToBackend(value)
-                            setShowIntervalDropdown(false)
-                          }}
+                          onClick={() => handleRefreshIntervalChange(value)}
                           className={cn(
                             "w-full text-left px-3 py-2 text-sm rounded hover:bg-accent transition-colors",
                             refreshInterval === value && "bg-accent text-accent-foreground"
@@ -1427,10 +1678,10 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       placeholder="例如：OpenAI-模型状态监控"
                       value={siteTitle}
                       onChange={(e) => setSiteTitle(e.target.value)}
-                      onBlur={() => saveSiteTitleToBackend(siteTitle)}
+                      onBlur={() => { void saveSiteTitleToBackend(siteTitle) }}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
-                          saveSiteTitleToBackend(siteTitle)
+                          e.currentTarget.blur()
                           setShowSiteTitleInput(false)
                         }
                         if (e.key === 'Escape') {
@@ -1594,13 +1845,14 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       {showGroupManager && (
         <GroupManagerModal
           groups={customGroups}
-          allModels={visibleModelStatuses.map(m => m.model_name)}
-          onSave={(groups) => {
-            saveCustomGroups(groups)
+          allModels={groupManagerModels}
+          onSave={async (groups) => {
+            const saved = await saveCustomGroups(groups)
             // Reset filter if the active group was deleted
-            if (groupFilter !== 'all' && !groups.find(g => g.id === groupFilter)) {
+            if (saved && groupFilter !== 'all' && !groups.find(g => g.id === groupFilter)) {
               handleGroupFilterChange('all')
             }
+            return saved
           }}
           onClose={() => setShowGroupManager(false)}
         />
@@ -1708,7 +1960,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 interface GroupManagerModalProps {
   groups: CustomModelGroup[]
   allModels: string[]
-  onSave: (groups: CustomModelGroup[]) => void
+  onSave: (groups: CustomModelGroup[]) => Promise<boolean>
   onClose: () => void
 }
 
@@ -1751,13 +2003,12 @@ function GroupManagerModal({ groups, allModels, onSave, onClose }: GroupManagerM
     setIsCreating(true)
   }
 
-  const handleDeleteGroup = (groupId: string) => {
+  const handleDeleteGroup = async (groupId: string) => {
     const newGroups = localGroups.filter(g => g.id !== groupId)
-    setLocalGroups(newGroups)
-    onSave(newGroups)
+    if (await onSave(newGroups)) setLocalGroups(newGroups)
   }
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     if (!editingName.trim()) return
 
     let newGroups: CustomModelGroup[]
@@ -1779,8 +2030,8 @@ function GroupManagerModal({ groups, allModels, onSave, onClose }: GroupManagerM
       newGroups = [...localGroups, newGroup]
     }
 
+    if (!await onSave(newGroups)) return
     setLocalGroups(newGroups)
-    onSave(newGroups)
     setIsCreating(false)
     setEditingGroup(null)
   }

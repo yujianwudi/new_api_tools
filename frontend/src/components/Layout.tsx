@@ -1,12 +1,10 @@
-import { ReactNode, useCallback, useEffect, useState, useRef } from 'react'
-import { LayoutDashboard, Ticket, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, UserPlus, Key, RadioTower, Bell, Menu, X } from 'lucide-react'
+import { ReactNode, useEffect, useState, useRef } from 'react'
+import { LayoutDashboard, Ticket, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, Key, Menu, X, ShieldCheck } from 'lucide-react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { cn } from '../lib/utils'
-import { useAuth } from '../contexts/AuthContext'
-import { apiFetch, createAuthHeaders } from '../lib/api'
 
-export type TabType = 'dashboard' | 'risk' | 'abuse-broadcast' | 'ip-analysis' | 'redemptions' | 'topups' | 'analytics' | 'model-status' | 'users' | 'auto-group' | 'tokens'
+export type TabType = 'dashboard' | 'control-plane' | 'risk' | 'ip-analysis' | 'redemptions' | 'topups' | 'analytics' | 'model-status' | 'users' | 'tokens'
 
 interface DbStatus {
   connected: boolean
@@ -24,22 +22,19 @@ interface LayoutProps {
 
 const tabs: { id: TabType; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: '仪表板', icon: LayoutDashboard },
+  { id: 'control-plane', label: '控制平面', icon: ShieldCheck },
   { id: 'topups', label: '充值记录', icon: DollarSign },
   { id: 'risk', label: '风控中心', icon: Activity },
-  { id: 'abuse-broadcast', label: '联合广播', icon: RadioTower },
   { id: 'ip-analysis', label: 'IP分析', icon: Globe },
   { id: 'analytics', label: '日志分析', icon: BarChart3 },
   { id: 'model-status', label: '模型监控', icon: Monitor },
   { id: 'users', label: '用户管理', icon: Users },
   { id: 'tokens', label: '令牌管理', icon: Key },
-  { id: 'auto-group', label: '自动分组', icon: UserPlus },
   { id: 'redemptions', label: '兑换码管理', icon: Ticket },
 ]
 
 export function Layout({ children, activeTab, onTabChange, onLogout }: LayoutProps) {
-  const { token } = useAuth()
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null)
-  const [unreadBroadcasts, setUnreadBroadcasts] = useState(0)
   const [indicatorStyle, setIndicatorStyle] = useState({ left: 0, width: 0, opacity: 0 })
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const tabsRef = useRef<(HTMLButtonElement | null)[]>([])
@@ -55,22 +50,6 @@ export function Layout({ children, activeTab, onTabChange, onLogout }: LayoutPro
   useEffect(() => {
     setMobileNavOpen(false)
   }, [activeTab])
-
-  const fetchUnreadBroadcasts = useCallback(async () => {
-    if (!token) return
-    try {
-      const apiUrl = import.meta.env.VITE_API_URL || ''
-      const response = await apiFetch(`${apiUrl}/api/abuse-broadcast/unread-count`, {
-        headers: createAuthHeaders(token),
-      })
-      const data = await response.json()
-      if (data.success) {
-        setUnreadBroadcasts(Number(data.data?.unread || 0))
-      }
-    } catch {
-      setUnreadBroadcasts(0)
-    }
-  }, [token])
 
   useEffect(() => {
     const fetchDbStatus = async () => {
@@ -94,17 +73,6 @@ export function Layout({ children, activeTab, onTabChange, onLogout }: LayoutPro
     }
     fetchDbStatus()
   }, [])
-
-  useEffect(() => {
-    void fetchUnreadBroadcasts()
-    const timer = window.setInterval(() => void fetchUnreadBroadcasts(), 60000)
-    const listener = () => void fetchUnreadBroadcasts()
-    window.addEventListener('abuse-broadcast-unread-changed', listener)
-    return () => {
-      window.clearInterval(timer)
-      window.removeEventListener('abuse-broadcast-unread-changed', listener)
-    }
-  }, [fetchUnreadBroadcasts])
 
   useEffect(() => {
     const activeTabIndex = tabs.findIndex(tab => tab.id === activeTab)
@@ -176,24 +144,6 @@ export function Layout({ children, activeTab, onTabChange, onLogout }: LayoutPro
                 )}
               </div>
               <div className="flex items-center gap-1.5">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    window.history.pushState(null, '', '/abuse-broadcast?view=inbox')
-                    window.dispatchEvent(new CustomEvent('abuse-broadcast-open-inbox'))
-                    onTabChange('abuse-broadcast')
-                  }}
-                  className="relative text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-                  title="联合广播收件箱"
-                >
-                  <Bell className="h-4 w-4" />
-                  {unreadBroadcasts > 0 && (
-                    <span className="absolute -right-1 -top-1 min-w-4 h-4 rounded-full bg-red-500 px-1 text-[10px] leading-4 text-white font-bold text-center">
-                      {unreadBroadcasts > 99 ? '99+' : unreadBroadcasts}
-                    </span>
-                  )}
-                </Button>
                 <Button variant="ghost" size="sm" onClick={onLogout} className="text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors">
                   <LogOut className="h-4 w-4 sm:mr-2" />
                   <span className="hidden sm:inline">退出</span>

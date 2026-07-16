@@ -220,8 +220,13 @@ func (s *fakeAutoGroupAuditStore) ResolvePending(
 		}
 		newHead := make([]string, len(ids))
 		for i, id := range ids {
-			entries[i]["revertible"] = false
-			entries[i]["recovery_state"] = "manually_finalized_ambiguous"
+			if s.pendingState[id] == autoGroupPendingStateSQLCommitted {
+				entries[i]["revertible"] = true
+				entries[i]["recovery_state"] = "manually_finalized_sql_committed"
+			} else {
+				entries[i]["revertible"] = false
+				entries[i]["recovery_state"] = "manually_finalized_ambiguous"
+			}
 			entries[i]["resolved_by"] = actor
 			entries[i]["resolved_at"] = resolvedAt.Unix()
 			raw, err := json.Marshal(entries[i])
@@ -509,7 +514,7 @@ func TestAutoGroupCommitFailureLeavesOnlyPendingNonActionableAudit(t *testing.T)
 	}
 }
 
-func TestPendingAuditManualFinalizePreservesEvidenceButDisablesRevert(t *testing.T) {
+func TestPendingAuditManualFinalizeKeepsSQLCommittedEntryRevertible(t *testing.T) {
 	store := &fakeAutoGroupAuditStore{commitErr: errors.New("simulated Redis finalize failure")}
 	db, svc := newAutoGroupAuditTestService(t, store)
 	insertAutoGroupUser(t, db, 1, "alice", "default")
@@ -542,8 +547,8 @@ func TestPendingAuditManualFinalizePreservesEvidenceButDisablesRevert(t *testing
 	if err != nil {
 		t.Fatalf("manual finalize: %v", err)
 	}
-	if revertible, _ := resolved["revertible"].(bool); revertible {
-		t.Fatalf("ambiguous manual finalize unexpectedly became revertible: %#v", resolved)
+	if revertible, _ := resolved["revertible"].(bool); !revertible {
+		t.Fatalf("SQL-committed manual finalize was not revertible: %#v", resolved)
 	}
 	if got := len(store.pendingSnapshot()); got != 0 {
 		t.Fatalf("manual finalize retained %d pending records", got)
@@ -556,15 +561,77 @@ func TestPendingAuditManualFinalizePreservesEvidenceButDisablesRevert(t *testing
 	if err := json.Unmarshal([]byte(logs[0]), &archived); err != nil {
 		t.Fatalf("decode manually finalized record: %v", err)
 	}
-	if archived["revertible"] != false || toString(archived["recovery_state"]) != "manually_finalized_ambiguous" {
-		t.Fatalf("manual finalize did not mark the record non-revertible: %#v", archived)
+	if archived["revertible"] != true || toString(archived["recovery_state"]) != "manually_finalized_sql_committed" {
+		t.Fatalf("manual finalize did not preserve SQL-committed recovery state: %#v", archived)
 	}
+	store.mu.Lock()
+	store.commitErr = nil
+	store.mu.Unlock()
 	reverted := svc.RevertUser(int(ids[0]))
+	if success, _ := reverted["success"].(bool); !success {
+		t.Fatalf("manually finalized SQL commit was not revertible: %#v", reverted)
+	}
+	if got := autoGroupForUser(t, db, 1); got != "default" {
+		t.Fatalf("manual finalize revert restored group %q, want default", got)
+	}
+}
+
+func TestPendingAuditManualFinalizeKeepsAmbiguousEntryNonRevertible(t *testing.T) {
+	store := &fakeAutoGroupAuditStore{}
+	db, svc := newAutoGroupAuditTestService(t, store)
+	insertAutoGroupUser(t, db, 1, "alice", "vip")
+
+	ctx := context.Background()
+	logs, err := prepareAutoGroupAuditLogs(ctx, store, "assign", []autoGroupLogUser{{
+		ID: 1, Username: "alice", Source: "password",
+	}}, "default", "vip", "admin")
+	if err != nil {
+		t.Fatalf("prepare pending audit: %v", err)
+	}
+	if err := store.StageLogs(ctx, logs); err != nil {
+		t.Fatalf("stage pending audit: %v", err)
+	}
+	ids, err := autoGroupAuditLogIDs(logs)
+	if err != nil {
+		t.Fatalf("parse pending audit IDs: %v", err)
+	}
+	if err := store.SetPendingState(ctx, ids, autoGroupPendingStateAmbiguous); err != nil {
+		t.Fatalf("mark pending audit ambiguous: %v", err)
+	}
+	var entry autoGroupAuditEntry
+	if err := json.Unmarshal([]byte(logs[0]), &entry); err != nil {
+		t.Fatalf("decode pending audit: %v", err)
+	}
+
+	resolved, err := svc.ResolvePendingAudit(
+		entry.OperationID,
+		autoGroupPendingResolutionFinalize,
+		"FINALIZE "+entry.OperationID,
+		"security-admin",
+	)
+	if err != nil {
+		t.Fatalf("manual finalize ambiguous audit: %v", err)
+	}
+	if revertible, _ := resolved["revertible"].(bool); revertible {
+		t.Fatalf("ambiguous manual finalize unexpectedly became revertible: %#v", resolved)
+	}
+	archivedLogs, archivedIDs := store.snapshot()
+	if len(archivedLogs) != 1 || len(archivedIDs) != 1 {
+		t.Fatalf("manual finalize did not archive ambiguous evidence: logs=%d ids=%d", len(archivedLogs), len(archivedIDs))
+	}
+	var archived map[string]interface{}
+	if err := json.Unmarshal([]byte(archivedLogs[0]), &archived); err != nil {
+		t.Fatalf("decode manually finalized ambiguous record: %v", err)
+	}
+	if archived["revertible"] != false || toString(archived["recovery_state"]) != "manually_finalized_ambiguous" {
+		t.Fatalf("ambiguous finalize did not disable automatic recovery: %#v", archived)
+	}
+	reverted := svc.RevertUser(int(archivedIDs[0]))
 	if success, _ := reverted["success"].(bool); success {
 		t.Fatalf("manually finalized ambiguous audit unexpectedly reverted the user: %#v", reverted)
 	}
-	if message := toString(reverted["message"]); !strings.Contains(message, "不允许自动恢复") {
-		t.Fatalf("unexpected non-revertible error: %q", message)
+	if got := autoGroupForUser(t, db, 1); got != "vip" {
+		t.Fatalf("ambiguous audit changed user group to %q", got)
 	}
 }
 

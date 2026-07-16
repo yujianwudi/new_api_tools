@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/database"
 	_ "modernc.org/sqlite"
@@ -60,6 +61,122 @@ func TestSanitizeModelNamesBoundsAndDeduplicates(t *testing.T) {
 	}
 	if _, message := sanitizeModelNames([]string{""}, 2); message == "" {
 		t.Fatal("expected empty model name to be rejected")
+	}
+}
+
+func TestSanitizeSelectedModelNamesAllowsExplicitEmptyAndBounds(t *testing.T) {
+	empty, message := sanitizeSelectedModelNames(nil)
+	if message != "" || empty == nil || len(empty) != 0 {
+		t.Fatalf("explicit empty selection was not preserved: models=%#v message=%q", empty, message)
+	}
+
+	got, message := sanitizeSelectedModelNames([]string{" gpt-4 ", "gpt-4", " claude "})
+	if message != "" {
+		t.Fatalf("unexpected validation error: %s", message)
+	}
+	if len(got) != 2 || got[0] != "gpt-4" || got[1] != "claude" {
+		t.Fatalf("unexpected sanitized selection: %#v", got)
+	}
+
+	tooMany := make([]string, authenticatedModelStatusMaxBatch+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("model-%d", i)
+	}
+	if _, message := sanitizeSelectedModelNames(tooMany); message == "" {
+		t.Fatal("expected oversized selected-model configuration to be rejected")
+	}
+}
+
+func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configurePublicModelStatusTest(t)
+	installEmptyHandlerDatabase(t)
+	cache.Get().ClearLocal()
+	t.Cleanup(func() { cache.Get().ClearLocal() })
+
+	router := gin.New()
+	api := router.Group("/api")
+	RegisterModelStatusRoutes(api)
+	RegisterModelStatusEmbedRoutes(router)
+
+	requestJSON := func(method, path, payload string) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(method, path, strings.NewReader(payload))
+		request.Header.Set("Content-Type", "application/json")
+		request.RemoteAddr = "192.0.2.30:12345"
+		router.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	readConfig := func(path string) struct {
+		Success  bool     `json:"success"`
+		Data     []string `json:"data"`
+		MaxBatch int      `json:"max_batch"`
+	} {
+		t.Helper()
+		recorder := requestJSON(http.MethodGet, path, "")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("read %s: status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+		var response struct {
+			Success  bool     `json:"success"`
+			Data     []string `json:"data"`
+			MaxBatch int      `json:"max_batch"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		return response
+	}
+
+	recorder := requestJSON(
+		http.MethodPost,
+		"/api/model-status/config/selected",
+		`{"models":[" gpt-4 ","gpt-4"," claude "]}`,
+	)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"data":["gpt-4","claude"]`) {
+		t.Fatalf("selected models were not sanitized: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	authConfig := readConfig("/api/model-status/config/selected")
+	if !authConfig.Success || authConfig.MaxBatch != authenticatedModelStatusMaxBatch ||
+		len(authConfig.Data) != 2 || authConfig.Data[0] != "gpt-4" || authConfig.Data[1] != "claude" {
+		t.Fatalf("unexpected authenticated config response: %#v", authConfig)
+	}
+	for _, path := range []string{
+		"/api/embed/model-status/config/selected",
+		"/api/model-status/embed/config/selected",
+	} {
+		publicConfig := readConfig(path)
+		if !publicConfig.Success || publicConfig.MaxBatch != 50 {
+			t.Fatalf("public config did not publish its batch limit for %s: %#v", path, publicConfig)
+		}
+	}
+
+	tooMany := make([]string, authenticatedModelStatusMaxBatch+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("model-%d", i)
+	}
+	payload, err := json.Marshal(map[string]interface{}{"models": tooMany})
+	if err != nil {
+		t.Fatalf("marshal oversized selection: %v", err)
+	}
+	recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", string(payload))
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "At most 200") {
+		t.Fatalf("oversized selected-model config was not rejected: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if persisted := readConfig("/api/model-status/config/selected"); len(persisted.Data) != 2 {
+		t.Fatalf("rejected selection overwrote the last valid config: %#v", persisted)
+	}
+
+	recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", `{"models":[]}`)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"data":[]`) {
+		t.Fatalf("explicit empty selection was rejected or normalized to null: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	emptyConfig := readConfig("/api/model-status/config/selected")
+	if emptyConfig.Data == nil || len(emptyConfig.Data) != 0 {
+		t.Fatalf("explicit empty selection was not persisted: %#v", emptyConfig)
 	}
 }
 

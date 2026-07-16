@@ -1,12 +1,13 @@
 import { useEffect, useRef } from 'react'
 import { useToast } from './Toast'
-import { CheckCircle, X, Copy, Download, ExternalLink } from 'lucide-react'
+import { AlertTriangle, CheckCircle, X, Copy, Download, ExternalLink } from 'lucide-react'
 import { Button } from './ui/button'
 
 export interface GenerateResult {
   keys: string[]
   count: number
   name?: string
+  deliveryStatus?: 'confirmed' | 'applied_audit_uncertain'
 }
 
 interface ResultModalProps {
@@ -17,6 +18,7 @@ interface ResultModalProps {
 export function ResultModal({ result, onClose }: ResultModalProps) {
   const { showToast } = useToast()
   const modalRef = useRef<HTMLDivElement>(null)
+  const auditUncertain = result.deliveryStatus === 'applied_audit_uncertain'
 
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
@@ -80,15 +82,17 @@ export function ResultModal({ result, onClose }: ResultModalProps) {
     >
       <div className="bg-card rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="bg-gradient-to-r from-green-500 to-emerald-600 px-6 py-4 flex-shrink-0">
+        <div className={`${auditUncertain ? 'bg-gradient-to-r from-amber-500 to-orange-600' : 'bg-gradient-to-r from-green-500 to-emerald-600'} px-6 py-4 flex-shrink-0`}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="bg-white/20 rounded-full p-2">
-                <CheckCircle className="h-6 w-6 text-white" />
+                {auditUncertain
+                  ? <AlertTriangle className="h-6 w-6 text-white" />
+                  : <CheckCircle className="h-6 w-6 text-white" />}
               </div>
               <div>
-                <h2 className="text-xl font-bold text-white">添加成功</h2>
-                <p className="text-green-100 text-sm">已生成 {result.count} 个兑换码</p>
+                <h2 className="text-xl font-bold text-white">{auditUncertain ? '已创建，审计待对账' : '添加成功'}</h2>
+                <p className={`${auditUncertain ? 'text-amber-50' : 'text-green-100'} text-sm`}>已生成 {result.count} 个兑换码</p>
               </div>
             </div>
             <button onClick={onClose} className="text-white hover:bg-white/20 rounded-full p-2 transition-colors">
@@ -96,6 +100,12 @@ export function ResultModal({ result, onClose }: ResultModalProps) {
             </button>
           </div>
         </div>
+
+        {auditUncertain ? (
+          <div role="alert" className="border-b border-amber-500/30 bg-amber-500/10 px-6 py-3 text-sm text-amber-950 dark:text-amber-100">
+            NewAPI 已应用本次操作，但 outcome 审计落盘失败。请立即复制或下载这些一次性明文，切勿重试；关闭后无法再次查看。
+          </div>
+        ) : null}
 
         {/* Main Copy Buttons */}
         <div className="px-6 py-4 border-b bg-muted/50 space-y-2 flex-shrink-0">
@@ -142,7 +152,9 @@ export function ResultModal({ result, onClose }: ResultModalProps) {
 
         {/* Footer */}
         <div className="px-6 py-4 bg-muted/50 border-t flex justify-between items-center flex-shrink-0">
-          <p className="text-sm text-muted-foreground">提示：关闭后不保留兑换码明文，请先复制或下载</p>
+          <p className="text-sm text-muted-foreground">
+            {auditUncertain ? '已应用、勿重试；关闭后立即清空明文' : '提示：关闭后不保留兑换码明文，请先复制或下载'}
+          </p>
           <Button variant="secondary" onClick={onClose}>关闭</Button>
         </div>
       </div>

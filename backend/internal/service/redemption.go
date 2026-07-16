@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -13,17 +14,18 @@ import (
 
 // RedemptionCode represents a redemption code from the database
 type RedemptionCode struct {
-	ID           int64  `json:"id" db:"id"`
-	Key          string `json:"key" db:"key"`
-	Name         string `json:"name" db:"name"`
-	Quota        int64  `json:"quota" db:"quota"`
-	CreatedTime  int64  `json:"created_time" db:"created_time"`
-	RedeemedTime int64  `json:"redeemed_time" db:"redeemed_time"`
-	UsedUserID   int64  `json:"used_user_id" db:"used_user_id"`
-	UsedUsername string `json:"used_username" db:"used_username"`
-	ExpiredTime  int64  `json:"expired_time" db:"expired_time"`
-	DBStatus     int64  `json:"-" db:"db_status"`
-	Status       string `json:"status"` // "unused", "disabled", "used", "expired"
+	ID             int64  `json:"id" db:"id"`
+	Key            string `json:"key" db:"key"`
+	KeyFingerprint string `json:"key_fingerprint" db:"-"`
+	Name           string `json:"name" db:"name"`
+	Quota          int64  `json:"quota" db:"quota"`
+	CreatedTime    int64  `json:"created_time" db:"created_time"`
+	RedeemedTime   int64  `json:"redeemed_time" db:"redeemed_time"`
+	UsedUserID     int64  `json:"used_user_id" db:"used_user_id"`
+	UsedUsername   string `json:"used_username" db:"used_username"`
+	ExpiredTime    int64  `json:"expired_time" db:"expired_time"`
+	DBStatus       int64  `json:"-" db:"db_status"`
+	Status         string `json:"status"` // "unused", "disabled", "used", "expired"
 }
 
 // RedemptionStatistics holds aggregate statistics
@@ -43,6 +45,7 @@ type RedemptionStatistics struct {
 // GenerateParams holds parameters for code generation
 type GenerateParams struct {
 	Name        string   `json:"name"`
+	Reason      string   `json:"reason"`
 	Count       int      `json:"count"`
 	KeyPrefix   string   `json:"key_prefix"`
 	QuotaMode   string   `json:"quota_mode"` // "fixed" or "random"
@@ -312,6 +315,7 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 		} else {
 			code.Status = "unused"
 		}
+		code.Key, code.KeyFingerprint = redactRedemptionKey(code.Key)
 		items = append(items, code)
 	}
 
@@ -326,6 +330,12 @@ func ListCodes(params ListRedemptionParams) (*PaginatedRedemptions, error) {
 		PageSize:   params.PageSize,
 		TotalPages: totalPages,
 	}, nil
+}
+
+func redactRedemptionKey(raw string) (string, string) {
+	digest := sha256.Sum256([]byte(raw))
+	fingerprint := hex.EncodeToString(digest[:])
+	return "redacted:" + fingerprint[:12], fingerprint
 }
 
 // DeleteCodes soft-deletes redemption codes by IDs

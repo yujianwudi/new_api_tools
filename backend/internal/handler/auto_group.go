@@ -1,10 +1,8 @@
 package handler
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/models"
@@ -38,51 +36,11 @@ func GetAutoGroupConfig(c *gin.Context) {
 
 // POST /api/auto-group/config
 func SaveAutoGroupConfig(c *gin.Context) {
-	var req map[string]interface{}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", ""))
-		return
-	}
-
-	// Validate mode if provided
-	if mode, ok := req["mode"].(string); ok && mode != "simple" && mode != "by_source" {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "无效的分组模式", ""))
-		return
-	}
-
-	// Validate scan_interval_minutes if provided
-	if interval, ok := req["scan_interval_minutes"]; ok {
-		var minutes int64
-		switch v := interval.(type) {
-		case float64:
-			minutes = int64(v)
-		case int:
-			minutes = int64(v)
-		case int64:
-			minutes = v
-		}
-		if minutes < 1 || minutes > 1440 {
-			c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "扫描间隔必须在 1-1440 分钟之间", ""))
-			return
-		}
-	}
-
-	// Validate no empty config
-	if len(req) == 0 {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "没有要保存的配置", ""))
-		return
-	}
-
-	svc := service.NewAutoGroupService()
-	if !svc.SaveConfig(req) {
-		respondInternalError(c, "SAVE_ERROR", "Unable to save auto-group configuration", "auto-group configuration save", nil)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "配置已保存",
-		"data":    svc.GetConfig(),
-	})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"AUDITED_CONFIGURATION_REQUIRED",
+		"Auto-group configuration is read-only until it is migrated to the audited Tool Store",
+		"",
+	))
 }
 
 // GET /api/auto-group/stats
@@ -143,6 +101,14 @@ func GetAutoGroupUsers(c *gin.Context) {
 func RunAutoGroupScan(c *gin.Context) {
 	dryRunStr := c.DefaultQuery("dry_run", "true")
 	dryRun := dryRunStr == "true"
+	if !dryRun {
+		c.JSON(http.StatusNotImplemented, models.ErrorResp(
+			"NEWAPI_ADAPTER_REQUIRED",
+			"Auto-group execution is preview-only until a versioned NewAPI group-management API is available",
+			"",
+		))
+		return
+	}
 
 	svc := service.NewAutoGroupService()
 	if !svc.IsEnabled() {
@@ -156,27 +122,11 @@ func RunAutoGroupScan(c *gin.Context) {
 
 // POST /api/auto-group/batch-move
 func BatchMoveAutoGroupUsers(c *gin.Context) {
-	var req struct {
-		UserIDs     []int64 `json:"user_ids"`
-		TargetGroup string  `json:"target_group"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	if len(req.UserIDs) == 0 {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "未选择用户", ""))
-		return
-	}
-	if req.TargetGroup == "" {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "未指定目标分组", ""))
-		return
-	}
-
-	svc := service.NewAutoGroupService()
-	data := svc.BatchMoveUsers(req.UserIDs, req.TargetGroup)
-	success, _ := data["success"].(bool)
-	c.JSON(http.StatusOK, gin.H{"success": success, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NEWAPI_ADAPTER_REQUIRED",
+		"Direct batch group mutation is disabled; use preview and apply changes through NewAPI",
+		"",
+	))
 }
 
 // GET /api/auto-group/logs
@@ -209,41 +159,18 @@ func GetPendingAutoGroupAudits(c *gin.Context) {
 
 // POST /api/auto-group/pending-audits/resolve
 func ResolvePendingAutoGroupAudit(c *gin.Context) {
-	var req struct {
-		OperationID  string `json:"operation_id"`
-		Resolution   string `json:"resolution"`
-		Confirmation string `json:"confirmation"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	actor := "admin"
-	if subject, exists := c.Get("user_sub"); exists {
-		if value := strings.TrimSpace(fmt.Sprint(subject)); value != "" {
-			actor = value
-		}
-	}
-	svc := service.NewAutoGroupService()
-	data, err := svc.ResolvePendingAudit(req.OperationID, req.Resolution, req.Confirmation, actor)
-	if err != nil {
-		respondHandlerError(c, http.StatusBadRequest, "PENDING_AUDIT_RESOLUTION_ERROR", "Unable to resolve pending audit operation", "auto-group pending audit resolution", err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"LEGACY_AUDIT_READ_ONLY",
+		"Legacy pending auto-group audits are read-only in v0.5; create a Tool Store risk case for reconciliation",
+		"",
+	))
 }
 
 // POST /api/auto-group/revert
 func RevertAutoGroupUser(c *gin.Context) {
-	var req struct {
-		LogID int `json:"log_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
-		return
-	}
-	svc := service.NewAutoGroupService()
-	data := svc.RevertUser(req.LogID)
-	success, _ := data["success"].(bool)
-	c.JSON(http.StatusOK, gin.H{"success": success, "data": data})
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NEWAPI_ADAPTER_REQUIRED",
+		"Direct group rollback is disabled until a versioned NewAPI group-management API is available",
+		"",
+	))
 }

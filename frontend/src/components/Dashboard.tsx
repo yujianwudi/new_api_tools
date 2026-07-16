@@ -27,7 +27,7 @@ interface UsageStatistics {
   total_quota_used: number
   total_prompt_tokens: number
   total_completion_tokens: number
-  average_response_time: number
+  average_response_time_ms: number
 }
 
 interface ModelUsage {
@@ -859,7 +859,7 @@ export function Dashboard() {
           />
           <StatCard
             title="平均响应"
-            value={`${(usage?.average_response_time || 0).toFixed(3)}ms`}
+            value={`${(usage?.average_response_time_ms || 0).toFixed(0)}ms`}
             icon={Clock}
             color="rose"
             variant="compact"

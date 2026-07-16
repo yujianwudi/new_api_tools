@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +44,8 @@ func waitForGeoIPCondition(t *testing.T, timeout time.Duration, condition func()
 }
 
 func TestIPGeoCloseWaitsForUpdaterAndPreventsReaderRevival(t *testing.T) {
+	payload := []byte("valid-test-mmdb")
+	digest := sha256.Sum256(payload)
 	oldReader := &fakeGeoIPCityReader{}
 	newReader := &fakeGeoIPCityReader{}
 	openStarted := make(chan struct{})
@@ -54,8 +58,11 @@ func TestIPGeoCloseWaitsForUpdaterAndPreventsReaderRevival(t *testing.T) {
 		dbPath:         filepath.Join(t.TempDir(), "GeoLite2-City.mmdb"),
 		retryInterval:  5 * time.Millisecond,
 		updateInterval: 5 * time.Millisecond,
-		downloadFn: func(context.Context, string) error {
-			return nil
+		minFileSize:    1,
+		maxFileSize:    1024,
+		expectedSHA256: fmt.Sprintf("%x", digest[:]),
+		downloadFn: func(_ context.Context, path string) error {
+			return os.WriteFile(path, payload, 0644)
 		},
 		openReaderFn: func(string) (geoIPCityReader, error) {
 			if openCalls.Add(1) == 1 {
@@ -121,17 +128,22 @@ func TestIPGeoCloseWaitsForUpdaterAndPreventsReaderRevival(t *testing.T) {
 }
 
 func TestIPGeoBackgroundRetriesUntilReaderIsAvailable(t *testing.T) {
+	payload := []byte("valid-retry-mmdb")
+	digest := sha256.Sum256(payload)
 	reader := &fakeGeoIPCityReader{}
 	var attempts atomic.Int32
 	svc := &IPGeoService{
 		dbPath:         filepath.Join(t.TempDir(), "GeoLite2-City.mmdb"),
 		retryInterval:  5 * time.Millisecond,
 		updateInterval: time.Hour,
-		downloadFn: func(context.Context, string) error {
+		minFileSize:    1,
+		maxFileSize:    1024,
+		expectedSHA256: fmt.Sprintf("%x", digest[:]),
+		downloadFn: func(_ context.Context, path string) error {
 			if attempts.Add(1) < 3 {
 				return errors.New("temporary mirror failure")
 			}
-			return nil
+			return os.WriteFile(path, payload, 0644)
 		},
 		openReaderFn: func(string) (geoIPCityReader, error) {
 			return reader, nil
@@ -147,6 +159,47 @@ func TestIPGeoBackgroundRetriesUntilReaderIsAvailable(t *testing.T) {
 	time.Sleep(4 * svc.retryEvery())
 	if got := attempts.Load(); got != stableAttempts {
 		t.Fatalf("available service kept using retry interval: attempts %d -> %d", stableAttempts, got)
+	}
+}
+
+func TestIPGeoParserUsesTheVerifiedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "GeoLite2-City.mmdb")
+	verifiedPayload := []byte("verified-mmdb-snapshot")
+	replacementPayload := []byte("path-was-replaced-after-verification")
+	digest := sha256.Sum256(verifiedPayload)
+	if err := os.WriteFile(path, verifiedPayload, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := &fakeGeoIPCityReader{}
+	svc := &IPGeoService{
+		minFileSize:    1,
+		maxFileSize:    1024,
+		expectedSHA256: fmt.Sprintf("%x", digest[:]),
+		openReaderBytesFn: func(payload []byte) (geoIPCityReader, error) {
+			if err := os.WriteFile(path, replacementPayload, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if string(payload) != string(verifiedPayload) {
+				t.Fatalf("parser payload = %q, want verified snapshot %q", payload, verifiedPayload)
+			}
+			return reader, nil
+		},
+	}
+
+	opened, err := svc.openVerifiedDatabase(path)
+	if err != nil {
+		t.Fatalf("openVerifiedDatabase() error = %v", err)
+	}
+	if opened != reader {
+		t.Fatalf("opened reader = %T, want test reader", opened)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(replacementPayload) {
+		t.Fatalf("replacement file = %q, %v", got, err)
 	}
 }
 
@@ -197,6 +250,82 @@ func TestIPGeoFreshFileOnlySkipsWhenReaderIsAvailable(t *testing.T) {
 	})
 }
 
+func TestIPGeoInitDoesNotDownloadWithoutExplicitOptIn(t *testing.T) {
+	t.Setenv("GEOIP_DATA_DIR", t.TempDir())
+	t.Setenv("GEOIP_AUTO_DOWNLOAD", "false")
+	t.Setenv("GEOIP_AUTO_UPDATE", "false")
+	var downloads atomic.Int32
+	svc := &IPGeoService{
+		downloadFn: func(context.Context, string) error {
+			downloads.Add(1)
+			return nil
+		},
+	}
+	svc.init()
+	svc.Close()
+	if got := downloads.Load(); got != 0 {
+		t.Fatalf("GeoIP GET initialization triggered an implicit download: %d", got)
+	}
+}
+
+func TestIPGeoInitRequiresPinnedChecksumForLocalDatabase(t *testing.T) {
+	payload := []byte("local-test-mmdb")
+	sum := sha256.Sum256(payload)
+
+	t.Run("matching local file is opened", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "GeoLite2-City.mmdb")
+		if err := os.WriteFile(path, payload, 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GEOIP_DATA_DIR", dir)
+		t.Setenv("GEOIP_AUTO_DOWNLOAD", "false")
+		reader := &fakeGeoIPCityReader{}
+		var openCalls atomic.Int32
+		svc := &IPGeoService{
+			minFileSize:    1,
+			maxFileSize:    1024,
+			expectedSHA256: fmt.Sprintf("%x", sum[:]),
+			openReaderFn: func(got string) (geoIPCityReader, error) {
+				openCalls.Add(1)
+				if got != path {
+					t.Fatalf("opened path = %q, want %q", got, path)
+				}
+				return reader, nil
+			},
+		}
+		svc.init()
+		if !svc.IsAvailable() || openCalls.Load() != 1 {
+			t.Fatalf("verified local database was not installed: available=%v calls=%d", svc.IsAvailable(), openCalls.Load())
+		}
+		svc.Close()
+	})
+
+	t.Run("mismatched local file never reaches parser", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "GeoLite2-City.mmdb"), payload, 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GEOIP_DATA_DIR", dir)
+		t.Setenv("GEOIP_AUTO_DOWNLOAD", "false")
+		var openCalls atomic.Int32
+		svc := &IPGeoService{
+			minFileSize:    1,
+			maxFileSize:    1024,
+			expectedSHA256: strings.Repeat("0", 64),
+			openReaderFn: func(string) (geoIPCityReader, error) {
+				openCalls.Add(1)
+				return &fakeGeoIPCityReader{}, nil
+			},
+		}
+		svc.init()
+		if svc.IsAvailable() || openCalls.Load() != 0 {
+			t.Fatalf("unverified local database reached parser: available=%v calls=%d", svc.IsAvailable(), openCalls.Load())
+		}
+		svc.Close()
+	})
+}
+
 func TestIPGeoDownloadRejectsChunkedBodyOverMaximumSize(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -223,6 +352,69 @@ func TestIPGeoDownloadRejectsChunkedBodyOverMaximumSize(t *testing.T) {
 			t.Fatalf("oversized download left file %s: %v", path, statErr)
 		}
 	}
+}
+
+func TestIPGeoDownloadRequiresPinnedChecksumBeforeInstall(t *testing.T) {
+	payload := []byte("test-mmdb-payload")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	t.Run("matching checksum installs atomically", func(t *testing.T) {
+		sum := sha256.Sum256(payload)
+		reader := &fakeGeoIPCityReader{}
+		destPath := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
+		svc := &IPGeoService{
+			downloadURLs:   []string{server.URL},
+			downloadClient: server.Client(),
+			minFileSize:    1,
+			maxFileSize:    1024,
+			expectedSHA256: fmt.Sprintf("%x", sum[:]),
+			openReaderFn: func(string) (geoIPCityReader, error) {
+				return reader, nil
+			},
+		}
+		if err := svc.downloadDatabase(context.Background(), destPath); err != nil {
+			t.Fatalf("downloadDatabase returned error: %v", err)
+		}
+		installed, err := os.ReadFile(destPath)
+		if err != nil {
+			t.Fatalf("read installed database: %v", err)
+		}
+		if string(installed) != string(payload) {
+			t.Fatalf("installed payload = %q, want %q", installed, payload)
+		}
+		if reader.closeCount.Load() != 1 {
+			t.Fatalf("validation reader close count = %d, want 1", reader.closeCount.Load())
+		}
+	})
+
+	t.Run("mismatch never reaches parser or destination", func(t *testing.T) {
+		var openCalls atomic.Int32
+		destPath := filepath.Join(t.TempDir(), "GeoLite2-City.mmdb")
+		svc := &IPGeoService{
+			downloadURLs:   []string{server.URL},
+			downloadClient: server.Client(),
+			minFileSize:    1,
+			maxFileSize:    1024,
+			expectedSHA256: strings.Repeat("0", 64),
+			openReaderFn: func(string) (geoIPCityReader, error) {
+				openCalls.Add(1)
+				return &fakeGeoIPCityReader{}, nil
+			},
+		}
+		if err := svc.downloadDatabase(context.Background(), destPath); err == nil {
+			t.Fatal("checksum mismatch unexpectedly succeeded")
+		}
+		if openCalls.Load() != 0 {
+			t.Fatalf("checksum mismatch reached mmdb parser: calls=%d", openCalls.Load())
+		}
+		if _, err := os.Stat(destPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("checksum mismatch left destination file: %v", err)
+		}
+	})
 }
 
 func TestIPGeoDefaultDownloadClientRejectsPlainHTTP(t *testing.T) {

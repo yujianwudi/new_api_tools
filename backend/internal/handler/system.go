@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/logger"
+	"github.com/new-api-tools/backend/internal/models"
+	"github.com/new-api-tools/backend/internal/service"
 )
 
 // RegisterSystemRoutes registers /api/system endpoints
@@ -19,47 +22,53 @@ func RegisterSystemRoutes(r *gin.RouterGroup) {
 	}
 }
 
-// GET /api/system/scale — placeholder until system_scale service is migrated
+// GET /api/system/scale
 func GetSystemScale(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"scale": "medium",
-			"metrics": gin.H{
-				"total_users": 0,
-				"total_logs":  0,
-			},
-			"settings": gin.H{
-				"cache_ttl":                 300,
-				"refresh_interval":          300,
-				"frontend_refresh_interval": 60,
-				"description":               "中型系统",
-			},
-		},
-	})
+	info, err := service.NewDashboardService().GetDashboardSystemInfo()
+	if err != nil {
+		// Scale controls refresh pressure in multiple frontend views. Preserve a
+		// usable fail-closed response while truthfully marking it degraded.
+		logger.L.Error(fmt.Sprintf("System scale detection failed: %v", err), logger.CatAnalytics)
+		info = service.FailClosedDashboardSystemInfo()
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": systemScaleResponse(info)})
 }
 
 // POST /api/system/scale/refresh
 func RefreshSystemScale(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"scale":   "medium",
-			"message": "Scale detection refreshed",
-		},
-	})
+	svc := service.NewDashboardService()
+	svc.InvalidateDashboardCache()
+	info, err := svc.GetDashboardSystemInfo()
+	if err != nil {
+		respondHandlerError(c, http.StatusServiceUnavailable, "QUERY_ERROR", "System scale refresh unavailable", "system scale refresh", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": systemScaleResponse(info)})
 }
 
 // GET /api/system/warmup-status
 func GetWarmupStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data": gin.H{
-			"status":   "ready",
-			"progress": 100,
-			"message":  "System is ready",
+	c.JSON(http.StatusNotImplemented, models.ErrorResp(
+		"NOT_IMPLEMENTED",
+		"Cache warmup status is not implemented; readiness is reported by the health endpoints",
+		"",
+	))
+}
+
+func systemScaleResponse(info service.DashboardSystemInfo) gin.H {
+	return gin.H{
+		"scale":           info.Scale,
+		"is_large_system": info.IsLargeSystem,
+		"degraded":        info.Degraded,
+		"metrics":         info.Metrics,
+		"settings": gin.H{
+			"cache_ttl":                 info.CacheTTL,
+			"refresh_interval":          info.CacheTTL,
+			"frontend_refresh_interval": info.CacheSettings.FrontendRefreshInterval,
+			"leaderboard_cache_ttl":     info.CacheSettings.LeaderboardCacheTTL,
+			"description":               info.ScaleDescription,
 		},
-	})
+	}
 }
 
 // GET /api/system/indexes
