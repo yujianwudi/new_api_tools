@@ -139,10 +139,14 @@ if grep -Eqs 'bash[[:space:]]*<\([[:space:]]*curl|curl[^#|]*\|[[:space:]]*(ba)?s
   fail 'installer and release docs must not execute unchecked remote scripts'
 fi
 
-# The repository copy is a release-time template: the final manifest digest
-# and merge commit are only known after the protected tag build completes.
-# Release notes replace these fail-closed placeholders with the verified
-# values before publishing the executable installation command.
+# The image manifest digest and merge commit are only known after the protected
+# tag build completes, so those values stay fail-closed placeholders in the
+# repository copy. The installer itself is already committed: pin its exact
+# commit and the SHA-256 of the current Git blob so documentation cannot drift
+# back to executing an unchecked remote script.
+installer_sha256="$(git cat-file blob HEAD:install.sh | sha256sum | awk '{print $1}')"
+[[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'could not calculate the committed install.sh SHA-256'
 for release_doc in "${release_docs[@]}"; do
   grep -Fq \
     'NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>' \
@@ -150,8 +154,14 @@ for release_doc in "${release_docs[@]}"; do
     fail "$release_doc release install template must require the exact manifest digest"
   grep -Fq 'NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA>' "$release_doc" ||
     fail "$release_doc release install template must bind the image to the expected release commit"
-  grep -Fq 'INSTALL_SCRIPT_SHA256=<INSTALL_SCRIPT_SHA256>' "$release_doc" ||
-    fail "$release_doc release install template must require the install script checksum"
+  grep -Eq '^INSTALLER_COMMIT_SHA=[0-9a-f]{40}$' "$release_doc" ||
+    fail "$release_doc release install template must pin an exact installer commit"
+  grep -Fq "INSTALL_SCRIPT_SHA256=${installer_sha256}" "$release_doc" ||
+    fail "$release_doc release install template must pin the committed install.sh checksum"
+  grep -Fq \
+    'https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh' \
+    "$release_doc" ||
+    fail "$release_doc release install template must download from the pinned installer commit"
   grep -Fq 'sha256sum -c -' "$release_doc" ||
     fail "$release_doc release install template must verify the downloaded installer"
 done
