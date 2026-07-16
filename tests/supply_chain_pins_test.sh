@@ -374,7 +374,10 @@ grep -Fq 'sha256sum "$destination"' .github/workflows/release-recovery.yml ||
 grep -Fq 'attestation manifest was not found' .github/workflows/release-recovery.yml ||
   fail 'release recovery must distinguish missing attestations from other registry errors'
 grep -Fq '"${image}@${version_digest}"' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must pin exact release verification to one manifest digest'
+  fail 'release recovery must publish the minor alias from the exact manifest digest'
+[[ "$(grep -Fc '[[ "$current_version_digest" == "$version_digest" ]]' \
+  .github/workflows/release-recovery.yml)" -ge 3 ]] ||
+  fail 'release recovery must recheck the pinned exact digest before and after minor publication'
 [[ "$(grep -Fc 'refresh_release_versions' .github/workflows/release-recovery.yml)" -ge 3 ]] ||
   fail 'release recovery must refresh release ordering immediately before minor publication'
 grep -Fq '.schemaVersion == 2' .github/workflows/release-recovery.yml ||
