@@ -244,9 +244,98 @@ var migrations = []migration{
 				END`,
 		},
 	},
+	{
+		version: 8,
+		name:    "invoice documents and events",
+		statements: []string{
+			`CREATE TABLE invoice_documents (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				invoice_number TEXT NOT NULL CHECK(length(trim(invoice_number)) BETWEEN 1 AND 128),
+				seller_entity TEXT NOT NULL CHECK(length(trim(seller_entity)) BETWEEN 1 AND 128),
+				buyer_name TEXT NOT NULL CHECK(length(trim(buyer_name)) BETWEEN 1 AND 256),
+				buyer_tax_id TEXT NOT NULL DEFAULT '' CHECK(length(buyer_tax_id) <= 128),
+				document_kind TEXT NOT NULL CHECK(document_kind IN ('blue', 'red')),
+				related_invoice_number TEXT NOT NULL DEFAULT '' CHECK(length(related_invoice_number) <= 128),
+				currency TEXT NOT NULL CHECK(length(currency) = 3 AND currency = upper(currency) AND currency GLOB '[A-Z][A-Z][A-Z]'),
+				amount_minor INTEGER NOT NULL CHECK(amount_minor > 0),
+				tax_amount_minor INTEGER NOT NULL DEFAULT 0 CHECK(tax_amount_minor >= 0 AND tax_amount_minor <= amount_minor),
+				minor_unit_scale INTEGER NOT NULL CHECK(minor_unit_scale BETWEEN 0 AND 9),
+				status TEXT NOT NULL CHECK(status IN ('issued', 'voided')),
+				source TEXT NOT NULL CHECK(source IN ('manual', 'csv')),
+				idempotency_key TEXT NOT NULL UNIQUE CHECK(length(trim(idempotency_key)) > 0),
+				request_fingerprint TEXT NOT NULL CHECK(
+					length(request_fingerprint) = 64 AND
+					request_fingerprint NOT GLOB '*[^0-9a-f]*'
+				),
+				issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+				voided_at INTEGER,
+				void_reason TEXT NOT NULL DEFAULT '',
+				created_by TEXT NOT NULL CHECK(length(trim(created_by)) BETWEEN 1 AND 256),
+				created_at INTEGER NOT NULL CHECK(created_at >= 0),
+				updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+				UNIQUE(seller_entity, invoice_number),
+				CHECK(issued_at <= created_at),
+				CHECK(
+					(document_kind = 'blue' AND related_invoice_number = '') OR
+					(document_kind = 'red' AND length(trim(related_invoice_number)) > 0 AND related_invoice_number <> invoice_number)
+				),
+				CHECK(
+					(status = 'issued' AND voided_at IS NULL AND void_reason = '') OR
+					(status = 'voided' AND voided_at IS NOT NULL AND voided_at >= issued_at AND length(trim(void_reason)) > 0)
+				)
+			)`,
+			`CREATE INDEX idx_invoice_documents_issued
+				ON invoice_documents(issued_at DESC, id DESC)`,
+			`CREATE UNIQUE INDEX idx_invoice_documents_seller_number_nocase
+				ON invoice_documents(seller_entity COLLATE NOCASE, invoice_number COLLATE NOCASE)`,
+			`CREATE INDEX idx_invoice_documents_status
+				ON invoice_documents(status, currency, minor_unit_scale, issued_at DESC, id DESC)`,
+			`CREATE TRIGGER invoice_documents_restrict_update
+				BEFORE UPDATE ON invoice_documents WHEN NOT (
+					OLD.status = 'issued' AND NEW.status = 'voided' AND
+					OLD.invoice_number = NEW.invoice_number AND OLD.seller_entity = NEW.seller_entity AND
+					OLD.buyer_name = NEW.buyer_name AND OLD.buyer_tax_id = NEW.buyer_tax_id AND
+					OLD.document_kind = NEW.document_kind AND OLD.related_invoice_number = NEW.related_invoice_number AND
+					OLD.currency = NEW.currency AND OLD.amount_minor = NEW.amount_minor AND
+					OLD.tax_amount_minor = NEW.tax_amount_minor AND OLD.minor_unit_scale = NEW.minor_unit_scale AND
+					OLD.source = NEW.source AND OLD.idempotency_key = NEW.idempotency_key AND
+					OLD.request_fingerprint = NEW.request_fingerprint AND OLD.issued_at = NEW.issued_at AND
+					OLD.voided_at IS NULL AND NEW.voided_at IS NOT NULL AND
+					OLD.void_reason = '' AND length(trim(NEW.void_reason)) > 0 AND
+					OLD.created_by = NEW.created_by AND OLD.created_at = NEW.created_at AND
+					NEW.updated_at >= OLD.updated_at
+				) BEGIN
+					SELECT RAISE(ABORT, 'invoice_documents only permits issued-to-voided transitions');
+				END`,
+			`CREATE TRIGGER invoice_documents_no_delete
+				BEFORE DELETE ON invoice_documents BEGIN
+					SELECT RAISE(ABORT, 'invoice_documents cannot be deleted');
+				END`,
+			`CREATE TABLE invoice_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				invoice_id INTEGER NOT NULL REFERENCES invoice_documents(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+				event_type TEXT NOT NULL CHECK(event_type IN ('created', 'imported', 'voided')),
+				actor TEXT NOT NULL CHECK(length(trim(actor)) BETWEEN 1 AND 256),
+				details_json TEXT NOT NULL CHECK(json_valid(details_json) AND json_type(details_json) = 'object'),
+				idempotency_key TEXT NOT NULL UNIQUE CHECK(length(trim(idempotency_key)) > 0),
+				occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0),
+				created_at INTEGER NOT NULL CHECK(created_at >= 0)
+			)`,
+			`CREATE INDEX idx_invoice_events_invoice
+				ON invoice_events(invoice_id, id ASC)`,
+			`CREATE TRIGGER invoice_events_no_update
+				BEFORE UPDATE ON invoice_events BEGIN
+					SELECT RAISE(ABORT, 'invoice_events is append-only');
+				END`,
+			`CREATE TRIGGER invoice_events_no_delete
+				BEFORE DELETE ON invoice_events BEGIN
+					SELECT RAISE(ABORT, 'invoice_events is append-only');
+				END`,
+		},
+	},
 }
 
-const latestSchemaVersion = 7
+const latestSchemaVersion = 8
 
 const migrationLedgerCreateStatement = `CREATE TABLE schema_migrations (
 	version INTEGER PRIMARY KEY,

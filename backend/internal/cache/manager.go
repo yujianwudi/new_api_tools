@@ -37,14 +37,14 @@ func (e *localEntry) isExpired() bool {
 type Manager struct {
 	rdb           *redis.Client
 	localCache    sync.Map // level-1 local cache (stores *localEntry)
-	localCount    int64
+	localCount    atomic.Int64
 	localEviction sync.Mutex
 	cleanupOnce   sync.Once
 	ctx           context.Context
 
 	// Stats — use atomic for lock-free incrementing
-	hits   int64
-	misses int64
+	hits   atomic.Int64
+	misses atomic.Int64
 }
 
 // Global cache manager
@@ -112,19 +112,19 @@ func (m *Manager) removeExpiredLocalEntries() {
 
 func (m *Manager) storeLocal(key string, entry *localEntry) {
 	if _, loaded := m.localCache.Swap(key, entry); !loaded {
-		atomic.AddInt64(&m.localCount, 1)
+		m.localCount.Add(1)
 	}
 	m.enforceLocalCacheLimit()
 }
 
 func (m *Manager) deleteLocal(key interface{}) {
 	if _, loaded := m.localCache.LoadAndDelete(key); loaded {
-		atomic.AddInt64(&m.localCount, -1)
+		m.localCount.Add(-1)
 	}
 }
 
 func (m *Manager) enforceLocalCacheLimit() {
-	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+	if m.localCount.Load() <= maxLocalCacheEntries {
 		return
 	}
 
@@ -132,7 +132,7 @@ func (m *Manager) enforceLocalCacheLimit() {
 	defer m.localEviction.Unlock()
 
 	m.removeExpiredLocalEntries()
-	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+	if m.localCount.Load() <= maxLocalCacheEntries {
 		return
 	}
 
@@ -144,9 +144,9 @@ func (m *Manager) enforceLocalCacheLimit() {
 		if ok && !entry.expiresAt.IsZero() {
 			m.deleteLocal(key)
 		}
-		return atomic.LoadInt64(&m.localCount) > maxLocalCacheEntries
+		return m.localCount.Load() > maxLocalCacheEntries
 	})
-	if atomic.LoadInt64(&m.localCount) <= maxLocalCacheEntries {
+	if m.localCount.Load() <= maxLocalCacheEntries {
 		return
 	}
 
@@ -154,7 +154,7 @@ func (m *Manager) enforceLocalCacheLimit() {
 	// priority over cache retention.
 	m.localCache.Range(func(key, _ interface{}) bool {
 		m.deleteLocal(key)
-		return atomic.LoadInt64(&m.localCount) > maxLocalCacheEntries
+		return m.localCount.Load() > maxLocalCacheEntries
 	})
 }
 
@@ -219,7 +219,7 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 	if val, ok := m.localCache.Load(key); ok {
 		if entry, ok := val.(*localEntry); ok {
 			if !entry.isExpired() {
-				atomic.AddInt64(&m.hits, 1)
+				m.hits.Add(1)
 				return true, json.Unmarshal(entry.data, dest)
 			}
 			// Expired — remove from local cache
@@ -229,14 +229,14 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 
 	// Skip Redis if not connected
 	if m.rdb == nil {
-		atomic.AddInt64(&m.misses, 1)
+		m.misses.Add(1)
 		return false, nil
 	}
 
 	// Try Redis
 	data, err := m.rdb.Get(m.ctx, key).Bytes()
 	if err == redis.Nil {
-		atomic.AddInt64(&m.misses, 1)
+		m.misses.Add(1)
 		return false, nil
 	}
 	if err != nil {
@@ -250,7 +250,7 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 	}
 	m.storeLocal(key, entry)
 
-	atomic.AddInt64(&m.hits, 1)
+	m.hits.Add(1)
 
 	return true, json.Unmarshal(data, dest)
 }
@@ -353,8 +353,8 @@ func (m *Manager) ClearAll() (int64, error) {
 
 // Stats returns cache statistics
 func (m *Manager) Stats() map[string]interface{} {
-	hits := atomic.LoadInt64(&m.hits)
-	misses := atomic.LoadInt64(&m.misses)
+	hits := m.hits.Load()
+	misses := m.misses.Load()
 
 	total := hits + misses
 	hitRate := float64(0)
@@ -367,7 +367,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"hits":        hits,
 		"misses":      misses,
 		"hit_rate":    fmt.Sprintf("%.1f%%", hitRate),
-		"local_count": atomic.LoadInt64(&m.localCount),
+		"local_count": m.localCount.Load(),
 	}
 
 	// Try to get Redis memory info (skip if not connected)

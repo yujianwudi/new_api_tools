@@ -31,7 +31,7 @@ die() { log_error "$*"; exit 1; }
 REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
-INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.5.1}"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.5.2}"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
 INSTALL_COMMIT=""
@@ -764,7 +764,7 @@ migrate_image_env_file() {
     if [[ -n "$existing_image" ]]; then
       selected_image="$existing_image"
     else
-      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.5.1"
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.5.2"
     fi
   fi
   validate_newapi_tools_image "$selected_image"
@@ -2889,7 +2889,7 @@ NewAPI Middleware Tool - 安装管理脚本
 环境变量:
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
-  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.5.1；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.5.2；main 会锁定本次 commit 的短 SHA 镜像）
   NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；发行/自定义 ref 必填
   NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 

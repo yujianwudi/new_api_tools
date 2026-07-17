@@ -2,7 +2,6 @@ package cache
 
 import (
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -15,7 +14,7 @@ func TestLocalCacheRemovesExpiredEntriesWithoutRedis(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	m.removeExpiredLocalEntries()
-	if got := atomic.LoadInt64(&m.localCount); got != 0 {
+	if got := m.localCount.Load(); got != 0 {
 		t.Fatalf("expired local entry count = %d, want 0", got)
 	}
 	var value map[string]string
@@ -36,7 +35,7 @@ func TestLocalCacheEnforcesHardEntryLimitWithoutRedis(t *testing.T) {
 		}
 	}
 
-	if got := atomic.LoadInt64(&m.localCount); got > maxLocalCacheEntries {
+	if got := m.localCount.Load(); got > maxLocalCacheEntries {
 		t.Fatalf("local entry count = %d, exceeds hard limit %d", got, maxLocalCacheEntries)
 	}
 	actual := int64(0)
@@ -47,7 +46,7 @@ func TestLocalCacheEnforcesHardEntryLimitWithoutRedis(t *testing.T) {
 	if actual > maxLocalCacheEntries {
 		t.Fatalf("actual local entries = %d, exceeds hard limit %d", actual, maxLocalCacheEntries)
 	}
-	if counted := atomic.LoadInt64(&m.localCount); counted != actual {
+	if counted := m.localCount.Load(); counted != actual {
 		t.Fatalf("tracked local count = %d, actual entries = %d", counted, actual)
 	}
 	if got := m.Stats()["local_count"]; got != int64(maxLocalCacheEntries) {
@@ -68,7 +67,7 @@ func TestClearLocalMaintainsEntryCount(t *testing.T) {
 	}
 
 	m.ClearLocal()
-	if got := atomic.LoadInt64(&m.localCount); got != 0 {
+	if got := m.localCount.Load(); got != 0 {
 		t.Fatalf("local entry count after clear = %d, want 0", got)
 	}
 }

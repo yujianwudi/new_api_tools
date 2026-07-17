@@ -182,6 +182,9 @@ jobs:
       - name: Test frontend control-plane reliability guards
         run: node tests/frontend_control_plane_reliability_test.mjs
 
+      - name: Test frontend invoice reliability guards
+        run: node tests/frontend_invoice_reliability_test.mjs
+
       - name: Lint frontend
         working-directory: frontend
         run: npm run lint

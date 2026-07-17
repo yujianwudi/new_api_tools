@@ -192,6 +192,9 @@ jobs:
       - name: Test frontend control-plane reliability guards
         run: node tests/frontend_control_plane_reliability_test.mjs
 
+      - name: Test frontend invoice reliability guards
+        run: node tests/frontend_invoice_reliability_test.mjs
+
       - name: Lint frontend
         working-directory: frontend
         run: npm run lint
@@ -252,7 +255,7 @@ jobs:
         id: build_identity
         shell: bash
         run: |
-          version="0.5.1-dev"
+          version="0.5.2-dev"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           fi
