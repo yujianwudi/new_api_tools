@@ -1,10 +1,10 @@
 import { ReactNode, useEffect, useState, useRef } from 'react'
-import { LayoutDashboard, Ticket, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, Key, Menu, X, ShieldCheck } from 'lucide-react'
+import { LayoutDashboard, Ticket, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, Key, Menu, X, ShieldCheck, ReceiptText } from 'lucide-react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { cn } from '../lib/utils'
 
-export type TabType = 'dashboard' | 'control-plane' | 'risk' | 'ip-analysis' | 'redemptions' | 'topups' | 'analytics' | 'model-status' | 'users' | 'tokens'
+export type TabType = 'dashboard' | 'control-plane' | 'risk' | 'ip-analysis' | 'redemptions' | 'topups' | 'invoices' | 'analytics' | 'model-status' | 'users' | 'tokens'
 
 interface DbStatus {
   connected: boolean
@@ -24,6 +24,7 @@ const tabs: { id: TabType; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: '仪表板', icon: LayoutDashboard },
   { id: 'control-plane', label: '控制平面', icon: ShieldCheck },
   { id: 'topups', label: '充值记录', icon: DollarSign },
+  { id: 'invoices', label: '发票统计', icon: ReceiptText },
   { id: 'risk', label: '风控中心', icon: Activity },
   { id: 'ip-analysis', label: 'IP分析', icon: Globe },
   { id: 'analytics', label: '日志分析', icon: BarChart3 },

@@ -19,7 +19,7 @@ RUN npm run build
 # Stage 2: 构建 Go 后端
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS backend-builder
 ARG TARGETARCH
-ARG APP_VERSION=0.5.1
+ARG APP_VERSION=0.5.2
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 WORKDIR /build

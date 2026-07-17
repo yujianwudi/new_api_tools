@@ -5,6 +5,7 @@ import { WarmupScreen } from './components/WarmupScreen'
 
 // 懒加载非首屏 tab — 显著降低初始包体积
 const TopUps = lazy(() => import('./components/TopUps').then(m => ({ default: m.TopUps })))
+const Invoices = lazy(() => import('./components/Invoices').then(m => ({ default: m.Invoices })))
 const RedemptionCenter = lazy(() => import('./components/RedemptionCenter').then(m => ({ default: m.RedemptionCenter })))
 const Analytics = lazy(() => import('./components/Analytics').then(m => ({ default: m.Analytics })))
 const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })))
@@ -15,7 +16,7 @@ const Tokens = lazy(() => import('./components/Tokens').then(m => ({ default: m.
 const ControlPlaneStatus = lazy(() => import('./components/ControlPlaneStatus').then(m => ({ default: m.ControlPlaneStatus })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'control-plane', 'topups', 'risk', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'redemptions']
+const validTabs: TabType[] = ['dashboard', 'control-plane', 'topups', 'invoices', 'risk', 'ip-analysis', 'analytics', 'model-status', 'users', 'tokens', 'redemptions']
 
 // 旧路径迁移：generator / history 现合并到 redemptions 内部 tab
 const legacyRedirects: Record<string, string> = {
@@ -180,6 +181,8 @@ function App() {
         return <RedemptionCenter />
       case 'topups':
         return <TopUps />
+      case 'invoices':
+        return <Invoices />
       case 'risk':
         return <RealtimeRanking />
       case 'ip-analysis':

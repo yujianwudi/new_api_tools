@@ -17,7 +17,7 @@ import (
 
 var testNow = time.Date(2026, time.July, 16, 4, 0, 0, 0, time.UTC)
 
-// These literals freeze every migration shipped in v0.5.0. Deriving the
+// These literals freeze every migration shipped in a release. Deriving the
 // expected value with migrationChecksum would let an accidental edit update
 // both sides of the assertion and silently rewrite deployed history.
 var publishedMigrationChecksums = [...]string{
@@ -28,6 +28,7 @@ var publishedMigrationChecksums = [...]string{
 	5: "893e236c9ae0bff35164ae5dd85875cbac819e38b5da1f25e56b36bd20499fd0",
 	6: "eb327500f42f69382e84e92ae60796150951b3f4f993a676dfb625921f1131d6",
 	7: "46bf2630ba99b331e05928bd77d19057a488796918c6c613f728b4e40b10f5af",
+	8: "d8188bc47e1eec96a81e58bfff272e0404c6428c2cfced89afc9d180dfbad495",
 }
 
 func newTestStore(t *testing.T) (*Store, string) {

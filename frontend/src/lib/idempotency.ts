@@ -18,7 +18,9 @@ const STORAGE_KEY = 'new_api_tools.pending_idempotency.v1'
 const PENDING_MUTATION_STORAGE_KEY = 'new_api_tools.pending_mutations.v1'
 const DEFAULT_OPERATION_IDENTIFIER = 'legacy'
 const OPERATION_IDENTIFIER_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/
-const FINGERPRINT_PATTERN = /^[a-f0-9]{32}$/
+const LEGACY_FINGERPRINT_PATTERN = /^[a-f0-9]{32}$/
+const SHA256_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/
+const FINGERPRINT_PATTERN = /^(?:[a-f0-9]{32}|sha256:[a-f0-9]{64})$/
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export type OperationReconciliationStatus =
@@ -185,6 +187,10 @@ function writePendingMutations(pendingMutations: PendingMutationRecord[]): boole
 // Store only an opaque digest. Mutation payloads and reasons must never be
 // persisted in browser storage merely to recover an idempotency key.
 function digestFingerprint(value: string): string {
+  // Callers that already computed a versioned cryptographic digest must not
+  // have it weakened by the legacy compact browser-storage fingerprint.
+  if (SHA256_FINGERPRINT_PATTERN.test(value)) return value
+
   const seeds = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35]
   const hashes = seeds.map((seed, index) => {
     let hash = seed >>> 0
@@ -196,7 +202,11 @@ function digestFingerprint(value: string): string {
     hash = Math.imul(hash ^ value.length, multiplier)
     return (hash >>> 0).toString(16).padStart(8, '0')
   })
-  return hashes.join('')
+  const digest = hashes.join('')
+  if (!LEGACY_FINGERPRINT_PATTERN.test(digest)) {
+    throw new Error('Failed to create idempotency fingerprint')
+  }
+  return digest
 }
 
 function normalizeOperationIdentifier(operationIdentifier?: string): string {
