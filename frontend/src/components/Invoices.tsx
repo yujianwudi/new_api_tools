@@ -36,7 +36,6 @@ import {
   operationReleaseCandidateMatches,
   type OperationReleaseCandidate,
   type PendingMutationRecord,
-  type PendingMutationSnapshot,
 } from '../lib/idempotency'
 import {
   decodeUtf8Csv,
@@ -166,8 +165,7 @@ interface ApiEnvelope<T> {
 }
 
 type LoadStatus = 'loading' | 'ready' | 'empty' | 'stale' | 'error'
-type InvoiceMutationPayload = { body: Record<string, unknown> }
-type InvoicePendingMutation = PendingMutationRecord | PendingMutationSnapshot<InvoiceMutationPayload>
+type InvoicePendingMutation = PendingMutationRecord
 
 const EMPTY_FILTERS: InvoiceFilters = { currency: '', status: '', issuedFrom: '', issuedTo: '' }
 
@@ -239,6 +237,7 @@ export function Invoices() {
   const [summary, setSummary] = useState<SummaryData | null>(null)
   const [summaryStatus, setSummaryStatus] = useState<LoadStatus>('loading')
   const [summaryError, setSummaryError] = useState('')
+  const [freshnessNow, setFreshnessNow] = useState(() => Date.now())
   const [items, setItems] = useState<InvoiceDocument[]>([])
   const [listStatus, setListStatus] = useState<LoadStatus>('loading')
   const [listError, setListError] = useState('')
@@ -294,6 +293,11 @@ export function Invoices() {
   const fileReadSequence = useRef(0)
   const loadSummaryRef = useRef<(silent?: boolean) => Promise<boolean>>(async () => false)
   const loadListRef = useRef<(silent?: boolean) => Promise<boolean>>(async () => false)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setFreshnessNow(Date.now()), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   const summaryFilters = useMemo<InvoiceFilters>(() => ({
     currency: filters.currency,
@@ -369,15 +373,17 @@ export function Invoices() {
       throw new Error('该操作已有待对账的幂等所有权，禁止修改内容或生成新请求')
     }
 
-    let pending: PendingMutationSnapshot<InvoiceMutationPayload>
+    const bodyJson = JSON.stringify(input.body)
+    const fingerprint = `sha256:${await sha256Utf8(bodyJson)}`
+    let pending: PendingMutationRecord
     try {
       pending = beginPendingMutation({
         operationIdentifier: input.operationIdentifier,
-        fingerprint: JSON.stringify(input.body),
+        fingerprint,
         action: input.action,
         targetType: input.targetType,
         targetId: input.targetId,
-        payload: { body: input.body },
+        payload: {},
       })
     } catch (error) {
       const stored = getPendingMutation(input.operationIdentifier)
@@ -390,7 +396,7 @@ export function Invoices() {
       const { data } = await requestJson<T>(input.url, {
         method: 'POST',
         headers: { ...authHeaders, ...idempotencyHeader(pending.key) },
-        body: JSON.stringify(pending.payload.body),
+        body: bodyJson,
       })
       const lockCleared = clearPendingMutation(pending)
       if (lockCleared) forgetPendingMutation(pending)
@@ -502,6 +508,7 @@ export function Invoices() {
       const groups = Array.isArray(data.groups) ? data.groups : []
       const normalized = { ...data, groups }
       setSummary(normalized)
+      setFreshnessNow(Date.now())
       summaryRef.current = normalized
       setSummaryStatus(groups.length === 0 ? 'empty' : sourceFreshness(data.generated_at) === 'stale' ? 'stale' : 'ready')
       return true
@@ -813,7 +820,7 @@ export function Invoices() {
   }
 
   const can = (capability: keyof InvoiceCapabilities) => capabilities?.[capability] === true
-  const generatedFreshness = sourceFreshness(summary?.generated_at)
+  const generatedFreshness = sourceFreshness(summary?.generated_at, freshnessNow)
   const pendingList = Array.from(pendingMutations.values())
   const pendingCreate = pendingMutations.get('invoice.create') ?? null
   const pendingImport = pendingMutations.get('invoice.import') ?? null

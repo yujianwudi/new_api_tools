@@ -277,7 +277,8 @@ var migrations = []migration{
 				CHECK(issued_at <= created_at),
 				CHECK(
 					(document_kind = 'blue' AND related_invoice_number = '') OR
-					(document_kind = 'red' AND length(trim(related_invoice_number)) > 0 AND related_invoice_number <> invoice_number)
+					(document_kind = 'red' AND length(trim(related_invoice_number)) > 0 AND
+					 trim(related_invoice_number) COLLATE NOCASE <> trim(invoice_number) COLLATE NOCASE)
 				),
 				CHECK(
 					(status = 'issued' AND voided_at IS NULL AND void_reason = '') OR

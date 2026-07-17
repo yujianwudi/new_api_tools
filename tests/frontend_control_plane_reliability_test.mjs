@@ -130,6 +130,27 @@ const persistedPendingJSON = pendingStorage.getItem(PENDING_MUTATION_STORAGE_KEY
 assert.ok(persistedPendingJSON, 'pending marker must be persisted before submission')
 assert.doesNotMatch(persistedPendingJSON, /operator secret reason|confirm-delete/)
 assert.match(persistedPendingJSON, /"action":"user\.delete"/)
+
+const invoiceStorage = new MemoryStorage()
+const invoiceIdempotency = loadTypeScriptModule('frontend/src/lib/idempotency.ts', {
+  crypto: webcrypto,
+  window: { sessionStorage: invoiceStorage },
+})
+const invoiceFingerprint = `sha256:${'a'.repeat(64)}`
+const invoicePending = invoiceIdempotency.beginPendingMutation({
+  operationIdentifier: 'invoice.create',
+  fingerprint: invoiceFingerprint,
+  action: 'invoice.create',
+  targetType: 'invoice_document',
+  targetId: 'INV-2026-001',
+  payload: {},
+})
+assert.equal(invoicePending.fingerprint, invoiceFingerprint, 'a versioned SHA-256 digest must not be weakened before persistence')
+assert.equal(
+  JSON.parse(invoiceStorage.getItem(PENDING_MUTATION_STORAGE_KEY))[0].fingerprint,
+  invoiceFingerprint,
+  'recoverable invoice metadata must retain the cryptographic request digest',
+)
 pendingIdempotency.clearReusableIdempotencyKeys()
 assert.equal(
   pendingStorage.getItem(IDEMPOTENCY_STORAGE_KEY),

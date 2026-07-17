@@ -23,6 +23,9 @@ func TestInvoiceCreateIsExactIdempotentAndRedactsGenericAudit(t *testing.T) {
 	if created.AmountMinor != 9007199254740993 || created.DocumentKind != InvoiceBlue || created.Status != InvoiceIssued {
 		t.Fatalf("created invoice = %+v", created)
 	}
+	if created.CreatedBy != auditInput.Actor || audit.Reason != auditInput.Reason {
+		t.Fatalf("create attribution diverged from audit input: document=%+v audit=%+v", created, audit)
+	}
 	retry, retryAudit, err := store.CreateInvoiceAudited(ctx, input, auditInput)
 	if err != nil || retry.ID != created.ID || retryAudit.ID != audit.ID {
 		t.Fatalf("idempotent retry = %+v audit=%+v err=%v", retry, retryAudit, err)
@@ -35,6 +38,9 @@ func TestInvoiceCreateIsExactIdempotentAndRedactsGenericAudit(t *testing.T) {
 	detail, err := store.GetInvoice(ctx, created.ID)
 	if err != nil || len(detail.Events) != 1 || detail.Events[0].EventType != "created" {
 		t.Fatalf("invoice detail = %+v err=%v", detail, err)
+	}
+	if detail.Events[0].Actor != auditInput.Actor {
+		t.Fatalf("created event actor = %q, want %q", detail.Events[0].Actor, auditInput.Actor)
 	}
 	for label, encoded := range map[string]string{"operation audit": string(audit.AfterJSON), "event": string(detail.Events[0].DetailsJSON)} {
 		if strings.Contains(encoded, input.BuyerName) || strings.Contains(encoded, input.BuyerTaxID) {
@@ -89,6 +95,70 @@ func TestInvoiceSummarySubtractsEffectiveRedDocumentsAndReversesVoidedRed(t *tes
 		return audit
 	}()); !errors.Is(err, ErrConflict) {
 		t.Fatalf("void before issue error = %v, want ErrConflict", err)
+	}
+	futureVoidAudit := testMutationAudit(actionInvoiceVoid)
+	futureVoidAudit.IdempotencyKey = "invoice-future-void"
+	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: blueDoc.ID, Reason: "spoofed reason", IdempotencyKey: futureVoidAudit.IdempotencyKey,
+		VoidedAt: testNow.Add(time.Millisecond), Actor: "spoofed@example.com",
+	}, futureVoidAudit); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("future void error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestInvoiceAuditInputIsAuthoritativeForAttribution(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	createInput := testInvoiceInput("invoice-attribution-create", "ATTRIBUTION-CREATE", InvoiceBlue, 100)
+	createInput.CreatedBy = "spoofed-create@example.com"
+	createAudit := testMutationAudit(actionInvoiceCreate)
+	createAudit.Actor = "authoritative-create@example.com"
+	createAudit.Reason = "authoritative create reason"
+	createAudit.IdempotencyKey = createInput.IdempotencyKey
+	created, createdAudit, err := store.CreateInvoiceAudited(ctx, createInput, createAudit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdDetail, err := store.GetInvoice(ctx, created.ID)
+	if err != nil || created.CreatedBy != createAudit.Actor || createdAudit.Reason != createAudit.Reason ||
+		len(createdDetail.Events) != 1 || createdDetail.Events[0].Actor != createAudit.Actor {
+		t.Fatalf("create attribution = document=%+v audit=%+v detail=%+v err=%v", created, createdAudit, createdDetail, err)
+	}
+
+	importInput := testInvoiceInput("", "ATTRIBUTION-IMPORT", InvoiceBlue, 200)
+	importInput.CreatedBy = "spoofed-import@example.com"
+	importAudit := testMutationAudit(actionInvoiceImport)
+	importAudit.Actor = "authoritative-import@example.com"
+	importAudit.Reason = "authoritative import reason"
+	importAudit.IdempotencyKey = "invoice-attribution-import"
+	imported, importedAudit, err := store.ImportInvoicesAudited(ctx, []InvoiceDocumentInput{importInput}, importAudit)
+	if err != nil || imported.Count != 1 || len(imported.Items) != 1 {
+		t.Fatalf("import attribution result=%+v audit=%+v err=%v", imported, importedAudit, err)
+	}
+	importedDetail, err := store.GetInvoice(ctx, imported.Items[0].ID)
+	if err != nil || imported.Items[0].CreatedBy != importAudit.Actor || importedAudit.Reason != importAudit.Reason ||
+		len(importedDetail.Events) != 1 || importedDetail.Events[0].Actor != importAudit.Actor {
+		t.Fatalf("import attribution = result=%+v audit=%+v detail=%+v err=%v", imported, importedAudit, importedDetail, err)
+	}
+
+	voidAudit := testMutationAudit(actionInvoiceVoid)
+	voidAudit.Actor = "authoritative-void@example.com"
+	voidAudit.Reason = "authoritative void reason"
+	voidAudit.IdempotencyKey = "invoice-attribution-void"
+	voided, voidedAudit, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: created.ID, Reason: "spoofed void reason", Actor: "spoofed-void@example.com",
+		IdempotencyKey: voidAudit.IdempotencyKey,
+	}, voidAudit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	voidedDetail, err := store.GetInvoice(ctx, voided.ID)
+	if err != nil || voided.VoidReason != voidAudit.Reason || voidedAudit.Reason != voidAudit.Reason ||
+		len(voidedDetail.Events) != 2 || voidedDetail.Events[1].Actor != voidAudit.Actor ||
+		!strings.Contains(string(voidedDetail.Events[1].DetailsJSON), voidAudit.Reason) ||
+		strings.Contains(string(voidedDetail.Events[1].DetailsJSON), "spoofed void reason") {
+		t.Fatalf("void attribution = document=%+v audit=%+v detail=%+v err=%v", voided, voidedAudit, voidedDetail, err)
 	}
 }
 
@@ -159,6 +229,15 @@ func TestInvoiceSchemaPreventsEvidenceMutationAndRejectsAmbiguousAmounts(t *test
 	audit.IdempotencyKey = selfRed.IdempotencyKey
 	if _, _, err := store.CreateInvoiceAudited(context.Background(), selfRed, audit); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("case-insensitive self-related red invoice error = %v, want ErrInvalid", err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO invoice_documents(
+		invoice_number, seller_entity, buyer_name, buyer_tax_id, document_kind, related_invoice_number, currency,
+		amount_minor, tax_amount_minor, minor_unit_scale, status, source, idempotency_key, request_fingerprint,
+		issued_at, voided_at, void_reason, created_by, created_at, updated_at
+	) VALUES (?, ?, ?, '', 'red', ?, 'CNY', 100, 0, 2, 'issued', 'manual', ?, ?, ?, NULL, '', ?, ?, ?)`,
+		"  DIRECT-SELF", "Example Seller", "Private Buyer", "direct-self  ", "invoice-direct-self",
+		strings.Repeat("a", 64), dbTime(testNow.Add(-time.Hour)), "admin@example.com", dbTime(testNow), dbTime(testNow)); err == nil {
+		t.Fatal("database accepted a case-insensitive, whitespace-padded red self-reference")
 	}
 	future := testInvoiceInput("invoice-future-create", "FUTURE-CREATE", InvoiceBlue, 100)
 	future.IssuedAt = testNow.Add(time.Millisecond)

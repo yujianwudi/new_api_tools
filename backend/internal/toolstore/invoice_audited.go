@@ -25,6 +25,7 @@ func (s *Store) CreateInvoiceAudited(ctx context.Context, input InvoiceDocumentI
 	if err != nil {
 		return InvoiceDocument{}, OperationAudit{}, err
 	}
+	input.CreatedBy = strings.TrimSpace(auditInput.Actor)
 	input.IdempotencyKey = invoiceResourceKey(auditInput.Actor, actionInvoiceCreate, rawKey)
 	normalized, fingerprint, err := normalizeInvoiceInput(input)
 	if err != nil {
@@ -102,15 +103,19 @@ func (s *Store) VoidInvoiceAudited(ctx context.Context, input InvoiceVoidInput, 
 	if err != nil {
 		return InvoiceDocument{}, OperationAudit{}, err
 	}
-	input.Reason = strings.TrimSpace(input.Reason)
-	input.Actor = strings.TrimSpace(input.Actor)
+	input.Reason = strings.TrimSpace(auditInput.Reason)
+	input.Actor = strings.TrimSpace(auditInput.Actor)
 	if input.ID <= 0 || !validInvoiceText(input.Reason, 1000, true, false) ||
 		!validInvoiceText(input.Actor, 256, true, false) || (!input.VoidedAt.IsZero() && input.VoidedAt.UnixMilli() < 0) {
 		return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: invalid invoice void input", ErrInvalid)
 	}
 	explicitVoidedAt := !input.VoidedAt.IsZero()
+	now := s.clock().UTC().Truncate(time.Millisecond)
 	if explicitVoidedAt {
 		input.VoidedAt = input.VoidedAt.UTC().Truncate(time.Millisecond)
+		if input.VoidedAt.After(now) {
+			return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: voided_at cannot be in the future", ErrInvalid)
+		}
 	}
 	reasonHash := sha256Hex(input.Reason)
 	requestBytes, _ := json.Marshal(struct {
@@ -158,7 +163,6 @@ func (s *Store) VoidInvoiceAudited(ctx context.Context, input InvoiceVoidInput, 
 	if before.Status != InvoiceIssued {
 		return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: invoice is not eligible for voiding", ErrConflict)
 	}
-	now := s.clock()
 	if !explicitVoidedAt {
 		input.VoidedAt = now
 	}
@@ -236,6 +240,7 @@ func (s *Store) ImportInvoicesAudited(ctx context.Context, inputs []InvoiceDocum
 	normalized := make([]InvoiceDocumentInput, len(inputs))
 	fingerprints := make([]string, len(inputs))
 	for index, input := range inputs {
+		input.CreatedBy = strings.TrimSpace(auditInput.Actor)
 		input.Source = "csv"
 		input.IdempotencyKey = invoiceImportRowKey(resourceRoot, index)
 		var err error
