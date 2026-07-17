@@ -98,7 +98,7 @@ INSTALL_SCRIPT_SHA256=773d4ce81a0cbb7e5b230bae5f6002745498876963cd3267a3cc54d214
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  "https://raw.githubusercontent.com/yujianwudi/new_api_tools/$INSTALLER_COMMIT_SHA/install.sh" \
+  "https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh" \
   --output "$install_script"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1
 NEWAPI_TOOLS_REF=v0.5.2 \
