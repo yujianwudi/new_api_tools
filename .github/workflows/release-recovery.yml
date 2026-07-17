@@ -621,9 +621,10 @@ jobs:
           for entry in "${platform_entries[@]}"; do
             read -r platform platform_digest <<< "$entry"
             image_config="$(docker buildx imagetools inspect "${image}@${platform_digest}" --format '{{json .Image}}')"
-            jq -e --arg revision "$EXPECTED_TAG_COMMIT" --arg version "$RELEASE_VERSION" '
+            jq -e --arg revision "$EXPECTED_TAG_COMMIT" --arg version "$RELEASE_VERSION" --arg tag "$RELEASE_TAG" '
               (.config.Labels // {})["org.opencontainers.image.revision"] == $revision and
-              (.config.Labels // {})["org.opencontainers.image.version"] == $version
+              ((.config.Labels // {})["org.opencontainers.image.version"] == $version or
+               (.config.Labels // {})["org.opencontainers.image.version"] == $tag)
             ' <<< "$image_config"
 
             mapfile -t attestation_digests < <(
