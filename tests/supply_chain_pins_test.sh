@@ -342,6 +342,11 @@ grep -Fq 'refusing to overwrite existing release image tag' .github/workflows/bu
   fail 'normal release publication must keep exact version image tags immutable'
 grep -Fq 'release_image_exists=true' .github/workflows/release-recovery.yml ||
   fail 'release recovery must reuse an existing exact version image tag'
+grep -Fq -- '--arg tag "$RELEASE_TAG"' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must validate the normal tag workflow OCI version label'
+grep -Fq 'org.opencontainers.image.version"] == $tag' \
+  .github/workflows/release-recovery.yml ||
+  fail 'release recovery must accept only the exact release tag as the version-label alternative'
 grep -Fq 'candidate_source_version=' .github/workflows/build.yml ||
   fail 'normal release publication must ignore invalid higher-version tags'
 grep -Fq 'candidate_source_version=' .github/workflows/release-recovery.yml ||
