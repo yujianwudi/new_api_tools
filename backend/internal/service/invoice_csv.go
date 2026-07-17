@@ -239,7 +239,8 @@ func parseInvoiceCSVRow(rowNumber int, record []string, header map[string]int, n
 			row.Errors = append(row.Errors, InvoiceCSVError{Code: "INVALID_TAX_AMOUNT", Field: "tax_amount_minor", Message: "Tax amount must be an integer between zero and amount_minor"})
 		}
 	}
-	scale64, scaleOK := parseInvoiceCSVInt(value("minor_unit_scale"), 0, 9)
+	scale, scaleErr := strconv.Atoi(value("minor_unit_scale"))
+	scaleOK := scaleErr == nil && scale >= 0 && scale <= 9
 	if !scaleOK {
 		row.Errors = append(row.Errors, InvoiceCSVError{Code: "INVALID_SCALE", Field: "minor_unit_scale", Message: "Minor unit scale must be an integer from 0 to 9"})
 	}
@@ -253,14 +254,14 @@ func parseInvoiceCSVRow(rowNumber int, record []string, header map[string]int, n
 		InvoiceNumber: value("invoice_number"), SellerEntity: value("seller_entity"),
 		BuyerName: value("buyer_name"), BuyerTaxID: value("buyer_tax_id"),
 		DocumentKind: documentKind, RelatedInvoiceNumber: relatedInvoiceNumber, Currency: currency,
-		AmountMinor: amountMinor, TaxAmountMinor: taxAmountMinor, MinorUnitScale: int(scale64),
+		AmountMinor: amountMinor, TaxAmountMinor: taxAmountMinor, MinorUnitScale: scale,
 		Source: "csv", IssuedAt: issuedAt.UTC(),
 	}
 	row.Preview = &InvoiceCSVPreviewDocument{
 		InvoiceNumber: value("invoice_number"), SellerEntity: value("seller_entity"),
 		DocumentKind: documentKind, RelatedInvoiceNumber: relatedInvoiceNumber, Currency: currency,
 		AmountMinor: strconv.FormatInt(amountMinor, 10), TaxAmountMinor: strconv.FormatInt(taxAmountMinor, 10),
-		MinorUnitScale: int(scale64), IssuedAt: issuedAt.UTC().Format(time.RFC3339),
+		MinorUnitScale: scale, IssuedAt: issuedAt.UTC().Format(time.RFC3339),
 	}
 	return row
 }
