@@ -131,8 +131,8 @@ sqlite3 "$backup_dir/control-plane.db" "PRAGMA integrity_check;"
 发行安装必须同时固定 installer commit、installer SHA-256、镜像 manifest digest 和发行 commit。以下占位符必须从本发行页替换为真实值：
 
 ```bash
-INSTALLER_COMMIT_SHA=<INSTALLER_COMMIT_SHA>
-INSTALL_SCRIPT_SHA256=<INSTALL_SCRIPT_SHA256>
+INSTALLER_COMMIT_SHA=4b0819645d17ba3c1873967ce86239dba3a73a7c
+INSTALL_SCRIPT_SHA256=b72f5e35ea33a9059b96b020f89d990d712cd168ff6338edae7c9359712e84eb
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \

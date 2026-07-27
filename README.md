@@ -249,8 +249,8 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 ### 一键安装
 
 ```bash
-INSTALLER_COMMIT_SHA=2d8a8f87c57f51b4dc49ce380f09d678e4a48b6b
-INSTALL_SCRIPT_SHA256=773d4ce81a0cbb7e5b230bae5f6002745498876963cd3267a3cc54d214fdc419
+INSTALLER_COMMIT_SHA=4b0819645d17ba3c1873967ce86239dba3a73a7c
+INSTALL_SCRIPT_SHA256=b72f5e35ea33a9059b96b020f89d990d712cd168ff6338edae7c9359712e84eb
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
