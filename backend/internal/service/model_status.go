@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
+	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/database"
 )
 
@@ -96,9 +99,53 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 	if err != nil {
 		return nil, err
 	}
+	byName := make(map[string]map[string]interface{}, len(rows))
+	for _, row := range rows {
+		name := strings.TrimSpace(fmt.Sprintf("%v", row["model_name"]))
+		if name == "" {
+			continue
+		}
+		row["model_name"] = name
+		row["catalog_state"] = "observed"
+		byName[name] = row
+	}
 
-	cm.Set("model_status:available_models", rows, 5*time.Minute)
-	return rows, nil
+	// Active probes must also be able to monitor catalog models that have no
+	// recent user traffic. Abilities is read from the NewAPI main database and
+	// merged with log counts without writing to either upstream database.
+	catalogRows, catalogErr := s.db.Query(`SELECT DISTINCT model AS model_name
+		FROM abilities WHERE model IS NOT NULL AND model <> '' ORDER BY model`)
+	if catalogErr == nil {
+		for _, row := range catalogRows {
+			name := strings.TrimSpace(fmt.Sprintf("%v", row["model_name"]))
+			if name == "" {
+				continue
+			}
+			if existing, ok := byName[name]; ok {
+				existing["catalog_state"] = "catalog_and_observed"
+				continue
+			}
+			byName[name] = map[string]interface{}{
+				"model_name": name, "request_count_24h": int64(0), "catalog_state": "catalog_only",
+			}
+		}
+	}
+
+	result := make([]map[string]interface{}, 0, len(byName))
+	for _, item := range byName {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		leftCount := toInt64(result[left]["request_count_24h"])
+		rightCount := toInt64(result[right]["request_count_24h"])
+		if leftCount != rightCount {
+			return leftCount > rightCount
+		}
+		return fmt.Sprintf("%v", result[left]["model_name"]) < fmt.Sprintf("%v", result[right]["model_name"])
+	})
+
+	cm.Set("model_status:available_models", result, 5*time.Minute)
+	return result, nil
 }
 
 // GetModelStatus returns status for a specific model
@@ -138,7 +185,8 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			COUNT(*) as total,
 			SUM(CASE WHEN type = 2 THEN 1 ELSE 0 END) as success,
 			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
+			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty,
+			MAX(created_at) as latest_at
 		FROM logs
 		WHERE model_name = ?
 			AND created_at >= ? AND created_at < ?
@@ -158,6 +206,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		success int64
 		failure int64
 		empty   int64
+		latest  int64
 	}
 	slotMap := make(map[int64]*slotInfo, numSlots)
 
@@ -171,6 +220,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 					success: toInt64(row["success"]),
 					failure: toInt64(row["failure"]),
 					empty:   toInt64(row["empty"]),
+					latest:  toInt64(row["latest_at"]),
 				}
 			}
 		}
@@ -182,6 +232,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	totalSuccess := int64(0)
 	totalFailure := int64(0)
 	totalEmpty := int64(0)
+	latestTrafficAt := int64(0)
 
 	for i := 0; i < numSlots; i++ {
 		slotStart := startTime + int64(i)*slotSeconds
@@ -197,6 +248,9 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			slotSuccess = si.success
 			slotFailure = si.failure
 			slotEmpty = si.empty
+			if si.latest > latestTrafficAt {
+				latestTrafficAt = si.latest
+			}
 		}
 
 		slotRate := float64(0)
@@ -227,17 +281,36 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		overallRate = float64(totalSuccess) / float64(totalReqs) * 100
 	}
 
+	legacyStatus := getStatusColor(overallRate, totalReqs)
+	trafficHealth := map[string]string{
+		"green": "healthy", "yellow": "degraded", "red": "unhealthy", "unknown": "unknown",
+	}[legacyStatus]
+	sourceState := "empty"
+	if totalReqs > 0 {
+		freshness := 15 * time.Minute
+		if cfg := config.GetOptional(); cfg != nil && cfg.LogFreshnessMaxAge > 0 {
+			freshness = cfg.LogFreshnessMaxAge
+		}
+		sourceState = "fresh"
+		if latestTrafficAt == 0 || time.Unix(latestTrafficAt, 0).Before(time.Now().Add(-freshness)) {
+			sourceState = "stale"
+		}
+	}
+
 	result := map[string]interface{}{
-		"model_name":     modelName,
-		"display_name":   modelName,
-		"time_window":    window,
-		"total_requests": totalReqs,
-		"success_count":  totalSuccess,
-		"failure_count":  totalFailure,
-		"empty_count":    totalEmpty,
-		"success_rate":   roundRate(overallRate),
-		"current_status": getStatusColor(overallRate, totalReqs),
-		"slot_data":      slotData,
+		"model_name":      modelName,
+		"display_name":    modelName,
+		"time_window":     window,
+		"total_requests":  totalReqs,
+		"success_count":   totalSuccess,
+		"failure_count":   totalFailure,
+		"empty_count":     totalEmpty,
+		"success_rate":    roundRate(overallRate),
+		"current_status":  legacyStatus,
+		"traffic_health":  trafficHealth,
+		"source_state":    sourceState,
+		"last_traffic_at": latestTrafficAt,
+		"slot_data":       slotData,
 	}
 
 	cm.Set(cacheKey, result, 30*time.Second)

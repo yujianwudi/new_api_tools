@@ -88,3 +88,29 @@ func TestGetModelStatusMarksSuccessfulEmptyQueryUnknown(t *testing.T) {
 		t.Fatalf("empty model reported a non-zero success rate: %+v", status)
 	}
 }
+
+func TestGetAvailableModelsIncludesCatalogModelsWithoutTraffic(t *testing.T) {
+	db := installSQLiteForTests(t)
+	db.MustExec(`CREATE TABLE logs (
+		model_name TEXT,
+		created_at INTEGER,
+		type INTEGER,
+		completion_tokens INTEGER
+	)`)
+	db.MustExec(`CREATE TABLE abilities (model TEXT)`)
+	db.MustExec(`INSERT INTO abilities(model) VALUES ('gpt-catalog-only'), ('gpt-observed')`)
+	db.MustExec(`INSERT INTO logs(model_name, created_at, type, completion_tokens)
+		VALUES ('gpt-observed', ?, 2, 1)`, time.Now().Unix()-1)
+	cache.Get().ClearLocal()
+
+	models, err := NewModelStatusService().GetAvailableModels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 || models[0]["model_name"] != "gpt-observed" || models[0]["catalog_state"] != "catalog_and_observed" {
+		t.Fatalf("observed catalog merge = %+v", models)
+	}
+	if models[1]["model_name"] != "gpt-catalog-only" || models[1]["request_count_24h"] != int64(0) || models[1]["catalog_state"] != "catalog_only" {
+		t.Fatalf("catalog-only model missing = %+v", models)
+	}
+}

@@ -417,7 +417,7 @@ func TestAutoGroupFinalizeFailureKeepsCommittedMutationPendingAndNonActionable(t
 		}
 	}
 	for id := range pending {
-		revert := svc.RevertUser(int(id))
+		revert := svc.RevertUser(id)
 		if success, _ := revert["success"].(bool); success {
 			t.Fatalf("pending finalize record unexpectedly reverted the user: %#v", revert)
 		}
@@ -482,7 +482,7 @@ func TestAutoGroupCommitFailureLeavesOnlyPendingNonActionableAudit(t *testing.T)
 	for id := range pending {
 		ghostID = id
 	}
-	revert := svc.RevertUser(int(ghostID))
+	revert := svc.RevertUser(ghostID)
 	if success, _ := revert["success"].(bool); success {
 		t.Fatalf("ghost audit unexpectedly became actionable: %#v", revert)
 	}
@@ -502,7 +502,7 @@ func TestAutoGroupCommitFailureLeavesOnlyPendingNonActionableAudit(t *testing.T)
 		t.Fatalf("later assignment left group %q, want vip", got)
 	}
 
-	revert = svc.RevertUser(int(ghostID))
+	revert = svc.RevertUser(ghostID)
 	if success, _ := revert["success"].(bool); success {
 		t.Fatalf("old ghost audit became actionable after an ABA group change: %#v", revert)
 	}
@@ -567,7 +567,7 @@ func TestPendingAuditManualFinalizeKeepsSQLCommittedEntryRevertible(t *testing.T
 	store.mu.Lock()
 	store.commitErr = nil
 	store.mu.Unlock()
-	reverted := svc.RevertUser(int(ids[0]))
+	reverted := svc.RevertUser(ids[0])
 	if success, _ := reverted["success"].(bool); !success {
 		t.Fatalf("manually finalized SQL commit was not revertible: %#v", reverted)
 	}
@@ -626,7 +626,7 @@ func TestPendingAuditManualFinalizeKeepsAmbiguousEntryNonRevertible(t *testing.T
 	if archived["revertible"] != false || toString(archived["recovery_state"]) != "manually_finalized_ambiguous" {
 		t.Fatalf("ambiguous finalize did not disable automatic recovery: %#v", archived)
 	}
-	reverted := svc.RevertUser(int(archivedIDs[0]))
+	reverted := svc.RevertUser(archivedIDs[0])
 	if success, _ := reverted["success"].(bool); success {
 		t.Fatalf("manually finalized ambiguous audit unexpectedly reverted the user: %#v", reverted)
 	}
@@ -809,7 +809,7 @@ func TestAutoGroupAssignmentAndRevertUseDistinctLogIDs(t *testing.T) {
 		t.Fatalf("new audit ID should not overlap legacy LLEN IDs: %d", ids[0])
 	}
 
-	reverted := svc.RevertUser(int(ids[0]))
+	reverted := svc.RevertUser(ids[0])
 	if success, _ := reverted["success"].(bool); !success {
 		t.Fatalf("revert failed: %#v", reverted)
 	}

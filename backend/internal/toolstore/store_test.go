@@ -29,6 +29,7 @@ var publishedMigrationChecksums = [...]string{
 	6: "eb327500f42f69382e84e92ae60796150951b3f4f993a676dfb625921f1131d6",
 	7: "46bf2630ba99b331e05928bd77d19057a488796918c6c613f728b4e40b10f5af",
 	8: "d8188bc47e1eec96a81e58bfff272e0404c6428c2cfced89afc9d180dfbad495",
+	9: "63bb055051bc84501eb3ebc0e9b9c4cc88b82adb11634d8ed2c19a3e6a3aca1d",
 }
 
 func newTestStore(t *testing.T) (*Store, string) {

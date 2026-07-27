@@ -148,6 +148,13 @@ func validateBaseURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// ValidateBaseURL exposes the already-audited NewAPI endpoint policy to other
+// internal adapters such as active model probes. The returned URL is a copy
+// owned by the caller and never contains credentials, query, or fragments.
+func ValidateBaseURL(raw string) (*url.URL, error) {
+	return validateBaseURL(raw)
+}
+
 func isPrivateHTTPHost(host string) bool {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {

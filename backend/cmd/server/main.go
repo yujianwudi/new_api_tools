@@ -18,6 +18,7 @@ import (
 	"github.com/new-api-tools/backend/internal/handler"
 	"github.com/new-api-tools/backend/internal/logger"
 	"github.com/new-api-tools/backend/internal/middleware"
+	"github.com/new-api-tools/backend/internal/modelprobe"
 	"github.com/new-api-tools/backend/internal/newapi"
 	"github.com/new-api-tools/backend/internal/observability"
 	"github.com/new-api-tools/backend/internal/toolstore"
@@ -47,6 +48,16 @@ func main() {
 		logger.L.Fatal("Tool Store initialization failed: " + err.Error())
 	}
 	defer toolStore.Close()
+
+	// Active model probes are a bounded, opt-in synthetic workload. They use a
+	// dedicated model token and write only redacted telemetry to Tool Store.
+	modelProbeManager := modelprobe.NewManager(cfg, toolStore)
+	modelProbeLifecycle, cancelModelProbes := context.WithCancel(context.Background())
+	modelProbeManager.Start(modelProbeLifecycle)
+	defer func() {
+		cancelModelProbes()
+		modelProbeManager.Close()
+	}()
 
 	// NewAPI is an adapter dependency, not this process's persistence layer. A
 	// bad endpoint disables upstream operations but keeps the recovery console
@@ -111,6 +122,7 @@ func main() {
 	mutationHandler := handler.NewMutationHandler(mutationService)
 	storeHandler := handler.NewStoreHandler(toolStore)
 	searchHandler := handler.NewSearchHandler(toolStore)
+	modelProbeHandler := handler.NewModelProbeHandler(modelProbeManager)
 	healthHandler.RegisterPublicRoutes(r)
 	r.GET("/metrics", observability.Default.Handler(cfg.ObservabilityToken))
 
@@ -146,6 +158,7 @@ func main() {
 		handler.RegisterIPMonitoringRoutes(api)
 		handler.RegisterRiskMonitoringRoutes(api)
 		handler.RegisterModelStatusRoutes(api)
+		modelProbeHandler.RegisterRoutes(api)
 		// The legacy abuse-broadcast implementation creates sidecar tables inside
 		// NewAPI's database. v0.5 replaces that boundary with Tool Store risk cases,
 		// so the legacy routes and background writer are intentionally not mounted.
@@ -185,6 +198,7 @@ func main() {
 	<-quit
 
 	logger.L.System("正在优雅关闭服务...")
+	cancelModelProbes()
 
 	// Give the server 10 seconds to finish processing requests
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

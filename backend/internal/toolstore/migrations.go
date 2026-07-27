@@ -334,9 +334,97 @@ var migrations = []migration{
 				END`,
 		},
 	},
+	{
+		version: 9,
+		name:    "active model probes",
+		statements: []string{
+			`CREATE TABLE model_probe_runs (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_key TEXT NOT NULL UNIQUE CHECK(length(trim(run_key)) BETWEEN 8 AND 256),
+				request_fingerprint TEXT NOT NULL CHECK(
+					length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+				),
+				trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('scheduled', 'manual')),
+				actor TEXT NOT NULL CHECK(length(trim(actor)) BETWEEN 1 AND 256),
+				status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'partial', 'failed', 'skipped', 'cancelled')),
+				requested_count INTEGER NOT NULL CHECK(requested_count >= 0),
+				attempted_count INTEGER NOT NULL DEFAULT 0 CHECK(attempted_count >= 0),
+				success_count INTEGER NOT NULL DEFAULT 0 CHECK(success_count >= 0),
+				failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+				skipped_count INTEGER NOT NULL DEFAULT 0 CHECK(skipped_count >= 0),
+				error_code TEXT NOT NULL DEFAULT '' CHECK(length(error_code) <= 64),
+				error_message TEXT NOT NULL DEFAULT '' CHECK(length(error_message) <= 512),
+				started_at INTEGER NOT NULL CHECK(started_at >= 0),
+				finished_at INTEGER,
+				created_at INTEGER NOT NULL CHECK(created_at >= 0),
+				updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+				CHECK(attempted_count = success_count + failure_count + skipped_count),
+				CHECK(attempted_count <= requested_count),
+				CHECK((status = 'running' AND finished_at IS NULL) OR
+					(status <> 'running' AND finished_at IS NOT NULL AND finished_at >= started_at))
+			)`,
+			`CREATE INDEX idx_model_probe_runs_started
+				ON model_probe_runs(started_at DESC, id DESC)`,
+			`CREATE INDEX idx_model_probe_runs_status
+				ON model_probe_runs(status, started_at DESC, id DESC)`,
+			`CREATE TABLE model_probe_attempts (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id INTEGER NOT NULL REFERENCES model_probe_runs(id) ON UPDATE RESTRICT ON DELETE CASCADE,
+				model_name TEXT NOT NULL CHECK(length(trim(model_name)) BETWEEN 1 AND 256),
+				capability TEXT NOT NULL CHECK(capability IN ('chat_completions', 'responses', 'embeddings', 'rerank', 'unsupported')),
+				endpoint TEXT NOT NULL CHECK(length(endpoint) <= 128),
+				outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failure', 'skipped')),
+				protocol_success INTEGER NOT NULL CHECK(protocol_success IN (0, 1)),
+				semantic_success INTEGER CHECK(semantic_success IS NULL OR semantic_success IN (0, 1)),
+				http_status INTEGER NOT NULL DEFAULT 0 CHECK(http_status BETWEEN 0 AND 599),
+				header_latency_ms INTEGER CHECK(header_latency_ms IS NULL OR header_latency_ms >= 0),
+				first_token_latency_ms INTEGER CHECK(first_token_latency_ms IS NULL OR first_token_latency_ms >= 0),
+				total_latency_ms INTEGER NOT NULL CHECK(total_latency_ms >= 0),
+				error_code TEXT NOT NULL DEFAULT '' CHECK(length(error_code) <= 64),
+				error_message TEXT NOT NULL DEFAULT '' CHECK(length(error_message) <= 512),
+				response_sha256 TEXT NOT NULL DEFAULT '' CHECK(
+					response_sha256 = '' OR (length(response_sha256) = 64 AND response_sha256 NOT GLOB '*[^0-9a-f]*')
+				),
+				started_at INTEGER NOT NULL CHECK(started_at >= 0),
+				finished_at INTEGER NOT NULL CHECK(finished_at >= started_at),
+				created_at INTEGER NOT NULL CHECK(created_at >= 0),
+				CHECK((outcome = 'success' AND protocol_success = 1 AND semantic_success = 1 AND error_code = '') OR outcome <> 'success'),
+				CHECK((outcome = 'skipped' AND protocol_success = 0) OR outcome <> 'skipped')
+			)`,
+			`CREATE INDEX idx_model_probe_attempts_model_started
+				ON model_probe_attempts(model_name, started_at DESC, id DESC)`,
+			`CREATE INDEX idx_model_probe_attempts_run
+				ON model_probe_attempts(run_id, id ASC)`,
+			`CREATE INDEX idx_model_probe_attempts_started
+				ON model_probe_attempts(started_at DESC, id DESC)`,
+			`CREATE TRIGGER model_probe_attempts_no_update
+				BEFORE UPDATE ON model_probe_attempts BEGIN
+					SELECT RAISE(ABORT, 'model_probe_attempts is append-only');
+				END`,
+			`CREATE TABLE model_probe_rollups (
+				bucket_start INTEGER NOT NULL CHECK(bucket_start >= 0),
+				model_name TEXT NOT NULL CHECK(length(trim(model_name)) BETWEEN 1 AND 256),
+				capability TEXT NOT NULL CHECK(capability IN ('chat_completions', 'responses', 'embeddings', 'rerank', 'unsupported')),
+				attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+				success_count INTEGER NOT NULL DEFAULT 0 CHECK(success_count >= 0),
+				failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+				skipped_count INTEGER NOT NULL DEFAULT 0 CHECK(skipped_count >= 0),
+				header_latency_sum_ms INTEGER NOT NULL DEFAULT 0 CHECK(header_latency_sum_ms >= 0),
+				header_latency_samples INTEGER NOT NULL DEFAULT 0 CHECK(header_latency_samples >= 0),
+				first_token_latency_sum_ms INTEGER NOT NULL DEFAULT 0 CHECK(first_token_latency_sum_ms >= 0),
+				first_token_latency_samples INTEGER NOT NULL DEFAULT 0 CHECK(first_token_latency_samples >= 0),
+				total_latency_sum_ms INTEGER NOT NULL DEFAULT 0 CHECK(total_latency_sum_ms >= 0),
+				last_attempt_at INTEGER NOT NULL CHECK(last_attempt_at >= bucket_start),
+				PRIMARY KEY(bucket_start, model_name, capability),
+				CHECK(attempt_count = success_count + failure_count + skipped_count)
+			)`,
+			`CREATE INDEX idx_model_probe_rollups_model_bucket
+				ON model_probe_rollups(model_name, bucket_start DESC)`,
+		},
+	},
 }
 
-const latestSchemaVersion = 8
+const latestSchemaVersion = 9
 
 const migrationLedgerCreateStatement = `CREATE TABLE schema_migrations (
 	version INTEGER PRIMARY KEY,

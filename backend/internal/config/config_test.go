@@ -98,6 +98,31 @@ func TestObservabilityDefaultsAreFailClosedAndBounded(t *testing.T) {
 	}
 }
 
+func TestModelProbeConfigurationIsOptInAndBounded(t *testing.T) {
+	t.Setenv("JWT_SECRET_KEY", "test-secret")
+	t.Setenv("MODEL_PROBE_ENABLED", "true")
+	t.Setenv("MODEL_PROBE_API_KEY", "dedicated-probe-key")
+	t.Setenv("MODEL_PROBE_MODELS", "gpt-test,text-embedding-test,gpt-test")
+	t.Setenv("MODEL_PROBE_CAPABILITY_MAP", "gpt-test=responses,text-embedding-test=embeddings,broken")
+	t.Setenv("MODEL_PROBE_INTERVAL_SECONDS", "5")
+	t.Setenv("MODEL_PROBE_TIMEOUT_SECONDS", "999")
+	t.Setenv("MODEL_PROBE_MAX_CONCURRENCY", "99")
+	t.Setenv("MODEL_PROBE_DAILY_REQUEST_BUDGET", "0")
+
+	loaded := Load()
+	if !loaded.ModelProbeEnabled || loaded.ModelProbeAPIKey != "dedicated-probe-key" {
+		t.Fatalf("model probe opt-in configuration was not loaded: %+v", loaded)
+	}
+	if len(loaded.ModelProbeModels) != 2 || loaded.ModelProbeCapabilityMap["gpt-test"] != "responses" {
+		t.Fatalf("model probe allowlist/mapping = %#v / %#v", loaded.ModelProbeModels, loaded.ModelProbeCapabilityMap)
+	}
+	if loaded.ModelProbeInterval != 5*time.Minute || loaded.ModelProbeTimeout != 20*time.Second ||
+		loaded.ModelProbeMaxConcurrency != 2 || loaded.ModelProbeDailyRequestBudget != 500 {
+		t.Fatalf("model probe bounds were not restored: interval=%s timeout=%s concurrency=%d budget=%d",
+			loaded.ModelProbeInterval, loaded.ModelProbeTimeout, loaded.ModelProbeMaxConcurrency, loaded.ModelProbeDailyRequestBudget)
+	}
+}
+
 func TestNormalizeMySQLURLDSNPreservesCredentialsAndOptions(t *testing.T) {
 	raw := "mysql://user:p%40ss@[2001:db8::1]:3307/prod%2Ddb?parseTime=true&tls=preferred&timeout=5s&loc=Asia%2FShanghai"
 	normalized := normalizeMySQLURLDSN(raw)

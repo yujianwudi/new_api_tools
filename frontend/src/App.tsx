@@ -11,7 +11,7 @@ const Analytics = lazy(() => import('./components/Analytics').then(m => ({ defau
 const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })))
 const RealtimeRanking = lazy(() => import('./components/RealtimeRanking').then(m => ({ default: m.RealtimeRanking })))
 const IPAnalysis = lazy(() => import('./components/IPAnalysis').then(m => ({ default: m.IPAnalysis })))
-const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').then(m => ({ default: m.ModelStatusMonitor })))
+const ModelStatusConsole = lazy(() => import('./components/ModelStatusConsole'))
 const Tokens = lazy(() => import('./components/Tokens').then(m => ({ default: m.Tokens })))
 const ControlPlaneStatus = lazy(() => import('./components/ControlPlaneStatus').then(m => ({ default: m.ControlPlaneStatus })))
 
@@ -190,7 +190,7 @@ function App() {
       case 'analytics':
         return <Analytics />
       case 'model-status':
-        return <ModelStatusMonitor />
+        return <ModelStatusConsole />
       case 'users':
         return <UserManagement />
       case 'tokens':

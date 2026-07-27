@@ -2322,7 +2322,7 @@ func (s *AutoGroupService) GetLogs(page, pageSize int, action string, userID *in
 }
 
 // RevertUser reverts a user's group assignment
-func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
+func (s *AutoGroupService) RevertUser(logID int64) map[string]interface{} {
 	if err := ensureNewAPIDirectMutationSafe(); err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -2363,7 +2363,7 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		var entry map[string]interface{}
 		if json.Unmarshal([]byte(logStr), &entry) == nil {
 			entryID, valid := parseAutoGroupLogID(entry["id"])
-			if valid && entryID == int64(logID) {
+			if valid && entryID == logID {
 				targetLog = entry
 				matchCount++
 			}
@@ -2405,7 +2405,7 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 	if requiresCommitMarker {
-		committed, markerErr := store.IsCommitted(ctx, int64(logID))
+		committed, markerErr := store.IsCommitted(ctx, logID)
 		if markerErr != nil {
 			return map[string]interface{}{
 				"success": false,

@@ -24,6 +24,7 @@ var viewerReadOnlyPOST = map[string]struct{}{
 	"/api/ip/geo/batch":                 {},
 	"/api/model-status/status/multiple": {},
 	"/api/model-status/status/batch":    {},
+	"/api/model-status/probes/summary":  {},
 }
 
 func ParseRole(value string) Role {

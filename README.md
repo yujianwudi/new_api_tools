@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.5.2-2563EB?style=for-the-badge" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.6.0-2563EB?style=for-the-badge" />
   <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" />
   <img alt="Docker" src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
   <img alt="Port" src="https://img.shields.io/badge/default_port-1145-0EA5E9?style=for-the-badge" />
 </p>
 
-# NewAPI Tools v0.5.2
+# NewAPI Tools v0.6.0
 
 NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的**独立、旁路、可审计的 API 中转站经营与可靠性控制台**。
 
@@ -20,7 +20,7 @@ NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-
 - 渠道和用户发生了什么，证据能否追溯；
 - 高风险操作是否经过授权、说明理由并留下完整结果。
 
-> v0.5.2 在既有可靠性闭环上增加第一版发票证据台账与“已开票金额”统计；它不是税控系统，也不会在缺少来源分配、退款/拒付台账和对账证据时推导“剩余可开票金额”。
+> v0.6.0 把模型监测从“只有真实流量日志”升级为“被动流量证据 + 受控主动探测”。主动探测默认关闭，只使用专用低权限令牌、精确模型白名单、每日请求预算和能力适配器，不会把无数据或过期数据冒充成健康。
 
 ## 架构边界
 
@@ -31,11 +31,12 @@ flowchart LR
     Backend -->|"只读查询"| MainDB["NewAPI 主库"]
     Backend -->|"只读查询"| LogDB["NewAPI 日志库"]
     Backend -->|"版本探测 + 受控写入"| AdminAPI["NewAPI Admin API"]
+    Backend -->|"白名单 + 预算受控主动探测"| InferenceAPI["NewAPI 模型 API"]
     Backend -->|"唯一自有写库"| ToolStore["Tool Store / SQLite"]
     Backend --> Metrics["健康检查与 Prometheus 指标"]
 ```
 
-| 边界 | v0.5.2 行为 |
+| 边界 | v0.6.0 行为 |
 |---|---|
 | 代理流量 | 不在 NewAPI 请求链路中，不代理或修改模型请求 |
 | NewAPI schema | 不创建、不迁移、不修改 NewAPI 表结构 |
@@ -43,8 +44,9 @@ flowchart LR
 | NewAPI 数据写入 | 只走经过版本能力探测的 Admin API 适配器 |
 | 工具私有数据 | 只写入独立 SQLite Tool Store |
 | 未知上游版本 | 默认只读，拒绝未经验证的写操作 |
+| 主动探测 | 默认关闭；仅调用精确白名单模型，并受能力适配、并发、超时、Token 与每日请求预算约束 |
 
-## v0.5.2 能力
+## v0.6.0 能力
 
 | 模块 | 能力与安全边界 |
 |---|---|
@@ -57,10 +59,23 @@ flowchart LR
 | 可观测性 | Prometheus 兼容指标覆盖请求、延迟、依赖、控制面操作与构建身份 |
 | 搜索与时间线 | 跨 NewAPI 主库、日志库与 Tool Store 搜索；统一用户时间线使用稳定游标并可分源降级 |
 | 渠道质量 | 按 1h、24h、7d 窗口汇总成功率、quota、延迟、最后请求和置信度 |
+| 模型可靠性 | 融合真实流量与主动探测，分别展示状态、数据新鲜度、首字延迟、总延迟、错误原因和诊断历史 |
 | 请求追踪 | 全局生成/接收 `X-Request-ID`，写入日志、审计记录并向 NewAPI 传播 |
 | 发行完整性 | 多架构镜像、OCI revision 校验、tag/digest 固定与失败前保留旧服务 |
 
 渠道质量最多采样 50,000 条日志，按 channel 汇总 NewAPI `type=2/5` 记录，`use_time` 以秒统计平均值和 p95。该报告只提供证据与置信度，不会自动封禁渠道、切流或推断利润。
+
+## 模型可靠性与主动探测
+
+`/model-status` 默认以紧凑表格展示异常模型，把真实流量健康度与主动探测健康度分开，点击模型后通过右侧诊断抽屉查看时间槽、错误原因、首字延迟、总耗时和最近探测历史。综合状态遵守以下规则：
+
+- 任一新鲜数据源确认失败时显示异常，另一个数据源成功不能覆盖真实故障；
+- 真实流量或探测数据过期时显示 `stale`/“需要关注”，不会显示绿色；
+- 只有两个数据源都健康时才显示“双源健康”；
+- 只有一个数据源提供健康证据时显示“单源观测”；
+- 没有流量、未配置探测或能力不支持时显示“证据不足”或“未适配”。
+
+主动探测通过 `MODEL_PROBE_*` 环境变量配置。聊天、Responses、Embedding 和 Rerank 使用各自的端点与语义断言；图片、音频等高成本或尚未适配能力默认跳过。探测结果只保存协议/语义结果、有限错误分类、延迟和响应 SHA-256，不保存原始响应或 API Key。
 
 ## 发票证据与已开票统计
 
@@ -80,7 +95,7 @@ v0.5.2 的发票模块是控制台自己的证据台账，不是 NewAPI 余额�
 
 ## NewAPI 版本与写入限制
 
-v0.5.2 的已验证契约基线是 **NewAPI `v1.0.0-rc.21`**。
+v0.6.0 的已验证控制面契约基线是 **NewAPI `v1.0.0-rc.21`**。
 
 | NewAPI 版本 | 控制面策略 |
 |---|---|
@@ -112,6 +127,7 @@ Tool Store 默认位于 `DATA_DIR/control-plane.db`，也可以用 `TOOL_STORE_P
 | Price Snapshots | 保存带来源与生效时间的价格证据 |
 | Reconciliation Runs | 保存对账运行状态、范围与摘要 |
 | Invoice Documents / Events | 保存发票证据、币种金额和只追加的创建/导入/作废事件 |
+| Model Probe Runs / Attempts / Rollups | 保存主动探测任务、脱敏明细和小时聚合；按保留策略清理运行遥测 |
 
 Tool Store 是控制台自己的证据库，不会向 NewAPI 创建 sidecar 表。
 
@@ -241,13 +257,13 @@ curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   "https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh" \
   --output "$install_script"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1
-NEWAPI_TOOLS_REF=v0.5.2 \
+NEWAPI_TOOLS_REF=v0.6.0 \
 NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
 NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \
 bash "$install_script"
 ```
 
-安装器 commit 与 SHA-256 已固定在本仓库文档中。执行前仍必须从 v0.5.2 发行页复制并替换 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`；任一占位符未替换时不要执行。
+安装器 commit 与 SHA-256 已固定在本仓库文档中。执行前仍必须从 v0.6.0 发行页复制并替换 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`；任一占位符未替换时不要执行。
 
 安装器会：
 
@@ -263,10 +279,10 @@ bash "$install_script"
 
 ### 手动部署
 
-v0.5.2 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
+v0.6.0 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
 
 ```bash
-git clone --branch v0.5.2 --depth 1 https://github.com/yujianwudi/new_api_tools.git
+git clone --branch v0.6.0 --depth 1 https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 # 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下两个真实值：
@@ -318,7 +334,7 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 升级前备份配置和 Tool Store。下面的 Compose 示例从运行中容器解析实际的 `TOOL_STORE_PATH`（未显式配置时按 `DATA_DIR/control-plane.db` 解析），然后先停止服务再复制 SQLite；不要在服务运行时直接 `cp` 数据库文件：
 
 ```bash
-backup_dir="backups/v0.5.2-$(date +%Y%m%d%H%M%S)"
+backup_dir="backups/v0.6.0-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$backup_dir"
 cp -- .env "$backup_dir/.env"
 
@@ -351,7 +367,7 @@ curl -fsS http://127.0.0.1:1145/readyz
 docker compose logs --tail=200 newapi-tools
 ```
 
-依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.5.2.md`](./RELEASE_0.5.2.md)。
+依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)。
 
 ## 回滚
 
@@ -388,6 +404,8 @@ CI 还会执行 `govulncheck`、部署脚本测试、Compose 校验、多架构�
 ## 项目资料
 
 - 路线图：[`docs/ROADMAP.md`](./docs/ROADMAP.md)
+- v0.6.0 发行说明：[`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)
+- v0.6 模型监测任务书：[`docs/V0.6_MODEL_MONITORING_TASK_BOOK.md`](./docs/V0.6_MODEL_MONITORING_TASK_BOOK.md)
 - v0.5.2 发行说明：[`RELEASE_0.5.2.md`](./RELEASE_0.5.2.md)
 - v0.5.1 发行说明：[`RELEASE_0.5.1.md`](./RELEASE_0.5.1.md)
 - v0.5.0 发行说明：[`RELEASE_0.5.0.md`](./RELEASE_0.5.0.md)

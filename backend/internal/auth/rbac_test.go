@@ -37,6 +37,7 @@ func TestRBACViewerCanReadButCannotMutate(t *testing.T) {
 	router.POST("/api/items", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	router.POST("/api/tokens/search", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	router.POST("/api/model-status/status/batch", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	router.POST("/api/model-status/probes/summary", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	router.POST("/api/models/status/batch", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	for _, test := range []struct {
@@ -47,6 +48,7 @@ func TestRBACViewerCanReadButCannotMutate(t *testing.T) {
 		{http.MethodGet, "/api/items", http.StatusNoContent},
 		{http.MethodPost, "/api/tokens/search", http.StatusNoContent},
 		{http.MethodPost, "/api/model-status/status/batch", http.StatusNoContent},
+		{http.MethodPost, "/api/model-status/probes/summary", http.StatusNoContent},
 		{http.MethodPost, "/api/models/status/batch", http.StatusForbidden},
 		{http.MethodPost, "/api/items", http.StatusForbidden},
 	} {

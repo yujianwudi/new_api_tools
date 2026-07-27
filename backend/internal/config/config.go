@@ -70,6 +70,22 @@ type Config struct {
 	PublicModelMaxBodyBytes      int64 `json:"public_model_max_body_bytes"`
 	PublicModelRequestsPerMinute int   `json:"public_model_requests_per_minute"`
 
+	// Active model probes are deliberately opt-in and use a dedicated model
+	// token. The allowlist and request budget prevent a catalog sync from
+	// turning into an unbounded billable workload.
+	ModelProbeEnabled            bool              `json:"model_probe_enabled"`
+	ModelProbeAPIKey             string            `json:"-"`
+	ModelProbeModels             []string          `json:"model_probe_models"`
+	ModelProbeCapabilityMap      map[string]string `json:"model_probe_capability_map"`
+	ModelProbeInterval           time.Duration     `json:"model_probe_interval"`
+	ModelProbeTimeout            time.Duration     `json:"model_probe_timeout"`
+	ModelProbeStaleAfter         time.Duration     `json:"model_probe_stale_after"`
+	ModelProbeMaxConcurrency     int               `json:"model_probe_max_concurrency"`
+	ModelProbeMaxModelsPerRun    int               `json:"model_probe_max_models_per_run"`
+	ModelProbeDailyRequestBudget int               `json:"model_probe_daily_request_budget"`
+	ModelProbeMaxOutputTokens    int               `json:"model_probe_max_output_tokens"`
+	ModelProbeRetention          time.Duration     `json:"model_probe_retention"`
+
 	// Financial safety limits for audited redemption creation, expressed in
 	// NewAPI quota units (500,000 units currently represent US$1).
 	RedemptionMaxQuotaPerCode int64 `json:"redemption_max_quota_per_code"`
@@ -139,6 +155,22 @@ func Load() *Config {
 		PublicModelMaxBatch:          getEnvInt("PUBLIC_MODEL_MAX_BATCH", 50),
 		PublicModelMaxBodyBytes:      int64(getEnvInt("PUBLIC_MODEL_MAX_BODY_BYTES", 16*1024)),
 		PublicModelRequestsPerMinute: getEnvInt("PUBLIC_MODEL_REQUESTS_PER_MINUTE", 30),
+
+		// Active probes are disabled until an operator explicitly supplies a
+		// dedicated token and an allowlist. The prompt and payload are fixed in
+		// code so the control plane never becomes an arbitrary request runner.
+		ModelProbeEnabled:            getEnvBool("MODEL_PROBE_ENABLED", false),
+		ModelProbeAPIKey:             getEnvStr("MODEL_PROBE_API_KEY", ""),
+		ModelProbeModels:             getEnvCSV("MODEL_PROBE_MODELS"),
+		ModelProbeCapabilityMap:      getEnvMapping("MODEL_PROBE_CAPABILITY_MAP"),
+		ModelProbeInterval:           time.Duration(getEnvInt("MODEL_PROBE_INTERVAL_SECONDS", 300)) * time.Second,
+		ModelProbeTimeout:            time.Duration(getEnvInt("MODEL_PROBE_TIMEOUT_SECONDS", 20)) * time.Second,
+		ModelProbeStaleAfter:         time.Duration(getEnvInt("MODEL_PROBE_STALE_SECONDS", 900)) * time.Second,
+		ModelProbeMaxConcurrency:     getEnvInt("MODEL_PROBE_MAX_CONCURRENCY", 2),
+		ModelProbeMaxModelsPerRun:    getEnvInt("MODEL_PROBE_MAX_MODELS_PER_RUN", 20),
+		ModelProbeDailyRequestBudget: getEnvInt("MODEL_PROBE_DAILY_REQUEST_BUDGET", 500),
+		ModelProbeMaxOutputTokens:    getEnvInt("MODEL_PROBE_MAX_OUTPUT_TOKENS", 4),
+		ModelProbeRetention:          time.Duration(getEnvInt("MODEL_PROBE_RETENTION_DAYS", 30)) * 24 * time.Hour,
 
 		// Redemption financial guardrails default to US$100 per code and
 		// US$1,000 per operation in NewAPI's current quota units.
@@ -226,6 +258,33 @@ func Load() *Config {
 	}
 	if cfg.PublicModelRequestsPerMinute < 1 || cfg.PublicModelRequestsPerMinute > 600 {
 		cfg.PublicModelRequestsPerMinute = 30
+	}
+	if cfg.ModelProbeInterval < time.Minute || cfg.ModelProbeInterval > 24*time.Hour {
+		cfg.ModelProbeInterval = 5 * time.Minute
+	}
+	if cfg.ModelProbeTimeout < 3*time.Second || cfg.ModelProbeTimeout > 2*time.Minute {
+		cfg.ModelProbeTimeout = 20 * time.Second
+	}
+	if cfg.ModelProbeStaleAfter < cfg.ModelProbeInterval || cfg.ModelProbeStaleAfter > 7*24*time.Hour {
+		cfg.ModelProbeStaleAfter = maxDuration(15*time.Minute, 2*cfg.ModelProbeInterval)
+	}
+	if cfg.ModelProbeMaxConcurrency < 1 || cfg.ModelProbeMaxConcurrency > 10 {
+		cfg.ModelProbeMaxConcurrency = 2
+	}
+	if cfg.ModelProbeMaxModelsPerRun < 1 || cfg.ModelProbeMaxModelsPerRun > 100 {
+		cfg.ModelProbeMaxModelsPerRun = 20
+	}
+	if cfg.ModelProbeDailyRequestBudget < 1 || cfg.ModelProbeDailyRequestBudget > 100000 {
+		cfg.ModelProbeDailyRequestBudget = 500
+	}
+	if cfg.ModelProbeMaxOutputTokens < 1 || cfg.ModelProbeMaxOutputTokens > 32 {
+		cfg.ModelProbeMaxOutputTokens = 4
+	}
+	if cfg.ModelProbeRetention < 24*time.Hour || cfg.ModelProbeRetention > 365*24*time.Hour {
+		cfg.ModelProbeRetention = 30 * 24 * time.Hour
+	}
+	if len(cfg.ModelProbeModels) > cfg.ModelProbeMaxModelsPerRun {
+		cfg.ModelProbeModels = cfg.ModelProbeModels[:cfg.ModelProbeMaxModelsPerRun]
 	}
 	if cfg.RedemptionMaxQuotaPerCode <= 0 {
 		cfg.RedemptionMaxQuotaPerCode = defaultRedemptionMaxQuotaPerCode
@@ -487,6 +546,33 @@ func getEnvCSV(key string) []string {
 		result = append(result, part)
 	}
 	return result
+}
+
+// getEnvMapping parses comma-separated key=value pairs. Invalid entries are
+// ignored and later validation treats an unknown capability as unsupported.
+func getEnvMapping(key string) map[string]string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return map[string]string{}
+	}
+	result := make(map[string]string)
+	for _, item := range strings.Split(value, ",") {
+		name, capability, ok := strings.Cut(item, "=")
+		name = strings.TrimSpace(name)
+		capability = strings.ToLower(strings.TrimSpace(capability))
+		if !ok || name == "" || capability == "" {
+			continue
+		}
+		result[name] = capability
+	}
+	return result
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 // getEnvStrMulti tries multiple env var keys in order, returns first found or default
