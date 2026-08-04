@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import {
@@ -75,11 +75,15 @@ import {
 
 interface ActivityStats {
   total_users: number
-  active_users: number
-  inactive_users: number
-  very_inactive_users: number
+  active_users: number | null
+  inactive_users: number | null
+  very_inactive_users: number | null
   never_requested: number
+  source_state?: 'fresh' | 'partial' | 'unavailable'
+  as_of?: number
 }
+
+type StatsDataState = 'loading' | 'partial' | 'fresh' | 'unavailable'
 
 // 分组信息
 interface GroupInfo {
@@ -118,6 +122,63 @@ interface UserInfo {
   source?: string
 }
 
+type QueryDataState = 'loading' | 'fresh' | 'stale' | 'unavailable' | 'empty'
+const INVITED_USERS_PAGE_SIZE = 10
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/
+
+class InvitedSnapshotContractError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvitedSnapshotContractError'
+  }
+}
+
+interface InvitedUserInfo {
+  user_id: number
+  username: string
+  display_name?: string | null
+  email?: string
+  status: number
+  quota?: number
+  used_quota?: number
+  request_count: number
+  group: string
+  role?: number
+}
+
+interface InvitedUsersData {
+  inviter: {
+    user_id: number
+    username: string
+    display_name?: string | null
+    aff_code?: string
+    aff_count: number
+    aff_quota?: number
+    aff_history?: number
+  }
+  items: InvitedUserInfo[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  as_of: number
+  query_fingerprint: string
+  stats: {
+    total_invited: number
+    requested_count: number
+    banned_count: number
+    total_used_quota?: number
+    total_requests: number
+  }
+}
+
+interface InvitedUsersQueryIdentity {
+  userId: number
+  pageSize: number
+  asOf: number
+  queryFingerprint: string
+}
+
 interface DeleteUserMutationPayload extends Record<string, unknown> {
   userId: number
   username: string
@@ -135,8 +196,18 @@ export function UserManagement() {
 
   const [activeTab, setActiveTab] = useState<'list' | 'affiliate'>('list')
   const [stats, setStats] = useState<ActivityStats | null>(null)
+  const [statsState, setStatsState] = useState<StatsDataState>('loading')
   const [users, setUsers] = useState<UserInfo[]>([])
   const [loading, setLoading] = useState(true)
+  const [userQueryState, setUserQueryState] = useState<QueryDataState>('loading')
+  const [userQueryError, setUserQueryError] = useState<string | null>(null)
+  const [displayedQuery, setDisplayedQuery] = useState('全部用户')
+  const usersRef = useRef<UserInfo[]>([])
+  const usersRequestRef = useRef<{ sequence: number; key: string; controller: AbortController | null }>({
+    sequence: 0,
+    key: '',
+    controller: null,
+  })
   const [page, setPage] = useState(1)
   const [pageSize] = useState(20)
   const [total, setTotal] = useState(0)
@@ -214,14 +285,18 @@ export function UserManagement() {
   const [selectedUser, setSelectedUser] = useState<{ id: number; username: string } | null>(null)
 
   // 邀请用户列表状态
-  const [invitedUsers, setInvitedUsers] = useState<{
-    inviter: { user_id: number; username: string; display_name: string; aff_code: string; aff_count: number; aff_quota: number; aff_history: number } | null
-    items: Array<{ user_id: number; username: string; display_name: string; email: string; status: number; quota: number; used_quota: number; request_count: number; group: string; role: number }>
-    total: number
-    stats: { total_invited: number; active_count: number; banned_count: number; total_used_quota: number; total_requests: number }
-  } | null>(null)
+  const [invitedUsers, setInvitedUsers] = useState<InvitedUsersData | null>(null)
   const [invitedLoading, setInvitedLoading] = useState(false)
+  const [invitedState, setInvitedState] = useState<QueryDataState>('loading')
+  const [invitedError, setInvitedError] = useState<string | null>(null)
   const [invitedPage, setInvitedPage] = useState(1)
+  const invitedRequestRef = useRef<{ sequence: number; key: string; controller: AbortController | null }>({
+    sequence: 0,
+    key: '',
+    controller: null,
+  })
+  const invitedUsersRef = useRef<InvitedUsersData | null>(null)
+  const invitedIdentityRef = useRef<InvitedUsersQueryIdentity | null>(null)
 
   // 批量分组管理状态
   const [groups, setGroups] = useState<GroupInfo[]>([])
@@ -233,6 +308,7 @@ export function UserManagement() {
   const [linuxDoLookupLoading, setLinuxDoLookupLoading] = useState<string | null>(null)
 
   const allSelectedOnPage = users.length > 0 && users.every((u) => selectedUserIds.has(u.id))
+  const listInteractionDisabled = loading || userQueryState === 'stale' || userQueryState === 'unavailable'
 
   const toggleSelectAllOnPage = () => {
     setSelectedUserIds((prev) => {
@@ -281,21 +357,40 @@ export function UserManagement() {
 
   const hardDeleteAvailable = canSafelyHardDelete(newAPICapabilities)
 
+  const activityStatValue = (value: number | null | undefined, availableInPartial = false): number | string => {
+    if (typeof value !== 'number') return 'N/A'
+    if (statsState === 'fresh' || (statsState === 'partial' && availableInPartial)) return value
+    return 'N/A'
+  }
+  const activityStatHint = (freshLabel: string, availableInPartial = false): string => {
+    if (statsState === 'fresh') return freshLabel
+    if (statsState === 'partial') return availableInPartial ? '快速统计；完整活跃度加载中' : '等待完整日志证据'
+    if (statsState === 'unavailable') return '统计来源不可用'
+    return '正在加载'
+  }
+
   const fetchStats = useCallback(async (quick = false) => {
     try {
       const params = quick ? '?quick=true' : ''
       const response = await fetch(`${apiUrl}/api/users/stats${params}`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) {
-        setStats(data.data)
-        // 如果是快速模式且活跃度数据为0，异步加载完整数据
-        if (quick && data.data.active_users === 0 && data.data.inactive_users === 0 && data.data.very_inactive_users === 0) {
-          // 延迟加载完整统计，不阻塞用户列表
-          setTimeout(() => fetchStats(false), 100)
-        }
+      if (!response.ok || !data.success || !data.data) {
+        throw new Error(data.error?.message || '用户活跃度统计不可用')
       }
+      setStats(data.data)
+      if (quick) {
+        setStatsState('partial')
+        // 快速响应只包含总数与“从未请求”；无论这些值是否为 0，
+        // 都必须继续获取完整证据，不能把未计算字段当成可信零。
+        setTimeout(() => { void fetchStats(false) }, 100)
+      } else {
+        setStatsState(data.data.source_state === 'fresh' ? 'fresh' : 'unavailable')
+      }
+      return true
     } catch (error) {
       console.error('Failed to fetch stats:', error)
+      setStatsState('unavailable')
+      return false
     }
   }, [apiUrl, getAuthHeaders])
 
@@ -317,8 +412,13 @@ export function UserManagement() {
     try {
       const response = await fetch(`${apiUrl}/api/auto-group/groups`, { headers: getAuthHeaders() })
       const data = await response.json()
-      if (data.success) {
-        setGroups(data.data.items)
+      if (response.ok && data.success) {
+        const normalized = new Map<string, number>()
+        for (const item of (data.data?.items || []) as GroupInfo[]) {
+          const name = item.group_name?.trim() || 'default'
+          normalized.set(name, (normalized.get(name) || 0) + Number(item.user_count || 0))
+        }
+        setGroups(Array.from(normalized, ([group_name, user_count]) => ({ group_name, user_count })))
       }
     } catch (error) {
       console.error('Failed to fetch groups:', error)
@@ -377,7 +477,18 @@ export function UserManagement() {
   }
 
   const fetchUsers = useCallback(async () => {
+    usersRequestRef.current.controller?.abort()
+    const controller = new AbortController()
+    const sequence = usersRequestRef.current.sequence + 1
     setLoading(true)
+    setUserQueryState('loading')
+    setUserQueryError(null)
+    const queryDescription = [
+      search ? `搜索“${search}”` : '',
+      activityFilter !== 'all' ? `活跃度:${activityFilter}` : '',
+      groupFilter ? `分组:${groupFilter}` : '',
+      sourceFilter ? `来源:${SOURCE_LABELS[sourceFilter]?.label || sourceFilter}` : '',
+    ].filter(Boolean).join(' · ') || '全部用户'
     try {
       const params = new URLSearchParams({
         page: page.toString(),
@@ -388,18 +499,44 @@ export function UserManagement() {
       if (groupFilter) params.append('group', groupFilter)
       if (sourceFilter) params.append('source', sourceFilter)
 
-      const response = await fetch(`${apiUrl}/api/users?${params}`, { headers: getAuthHeaders() })
+      const requestKey = params.toString()
+      usersRequestRef.current = { sequence, key: requestKey, controller }
+      const response = await fetch(`${apiUrl}/api/users?${params}`, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
       const data = await response.json()
-      if (data.success) {
-        setUsers(data.data.items)
-        setTotal(data.data.total)
-        setTotalPages(data.data.total_pages)
+      const isLatest = usersRequestRef.current.sequence === sequence
+        && usersRequestRef.current.key === requestKey
+        && !controller.signal.aborted
+      if (!isLatest) return false
+      if (!response.ok || !data.success) {
+        throw new Error(data?.error?.message || `用户查询失败（HTTP ${response.status}）`)
       }
+      if (Number(data.data?.page) !== page || Number(data.data?.page_size) !== pageSize) {
+        throw new Error('用户列表响应与当前分页条件不一致')
+      }
+      const nextUsers = Array.isArray(data.data?.items) ? data.data.items : []
+      usersRef.current = nextUsers
+      setUsers(nextUsers)
+      setTotal(data.data.total)
+      setTotalPages(data.data.total_pages)
+      setDisplayedQuery(queryDescription)
+      setUserQueryState(nextUsers.length > 0 ? 'fresh' : 'empty')
+      return true
     } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return false
+      if (usersRequestRef.current.sequence !== sequence) return false
       console.error('Failed to fetch users:', error)
-      showToast('error', '加载用户列表失败')
+      const message = error instanceof Error ? error.message : '加载用户列表失败'
+      setUserQueryError(message)
+      setUserQueryState(usersRef.current.length > 0 ? 'stale' : 'unavailable')
+      showToast('error', message)
+      return false
     } finally {
-      setLoading(false)
+      if (usersRequestRef.current.sequence === sequence && !controller.signal.aborted) {
+        setLoading(false)
+      }
     }
   }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, showToast])
 
@@ -531,9 +668,9 @@ export function UserManagement() {
           setStats(prev => prev ? {
             ...prev,
             total_users: prev.total_users - 1,
-            active_users: pending.payload.activityLevel === 'active' ? prev.active_users - 1 : prev.active_users,
-            inactive_users: pending.payload.activityLevel === 'inactive' ? prev.inactive_users - 1 : prev.inactive_users,
-            very_inactive_users: pending.payload.activityLevel === 'very_inactive' ? prev.very_inactive_users - 1 : prev.very_inactive_users,
+            active_users: pending.payload.activityLevel === 'active' && prev.active_users !== null ? Math.max(0, prev.active_users - 1) : prev.active_users,
+            inactive_users: pending.payload.activityLevel === 'inactive' && prev.inactive_users !== null ? Math.max(0, prev.inactive_users - 1) : prev.inactive_users,
+            very_inactive_users: pending.payload.activityLevel === 'very_inactive' && prev.very_inactive_users !== null ? Math.max(0, prev.very_inactive_users - 1) : prev.very_inactive_users,
             never_requested: pending.payload.activityLevel === 'never' ? prev.never_requested - 1 : prev.never_requested,
           } : null)
         }
@@ -687,51 +824,176 @@ export function UserManagement() {
   }, [loadNewAPICapabilities])
 
   useEffect(() => {
-    fetchUsers()
+    void fetchUsers()
+    return () => usersRequestRef.current.controller?.abort()
   }, [fetchUsers])
+
+  useEffect(() => {
+    usersRef.current = users
+  }, [users])
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await Promise.all([fetchUsers(), fetchStats(), loadNewAPICapabilities()])
+    const [usersOK, statsOK] = await Promise.all([fetchUsers(), fetchStats(), loadNewAPICapabilities()])
     setRefreshing(false)
-    showToast('success', '数据已刷新')
+    if (usersOK && statsOK) showToast('success', '数据已刷新')
+    else showToast('error', '刷新未完整成功，失败数据已明确标记')
   }
 
   // 打开用户分析弹窗
   const openUserAnalysis = (userId: number, username: string) => {
+    if (listInteractionDisabled) return
+    invitedRequestRef.current.controller?.abort()
+    invitedRequestRef.current.sequence += 1
     setSelectedUser({ id: userId, username })
     setAnalysisDialogOpen(true)
+    invitedUsersRef.current = null
+    invitedIdentityRef.current = null
     setInvitedUsers(null)
+    setInvitedState('loading')
+    setInvitedError(null)
     setInvitedPage(1)
+  }
+
+  const handleAnalysisOpenChange = (open: boolean) => {
+    if (!open) {
+      invitedRequestRef.current.controller?.abort()
+      invitedRequestRef.current.sequence += 1
+      invitedUsersRef.current = null
+      invitedIdentityRef.current = null
+      setInvitedUsers(null)
+      setInvitedState('loading')
+      setInvitedError(null)
+    }
+    setAnalysisDialogOpen(open)
   }
 
   // 获取邀请用户列表
   const fetchInvitedUsers = useCallback(async () => {
     if (!selectedUser || !analysisDialogOpen) return
-    setInvitedLoading(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/users/${selectedUser.id}/invited?page=${invitedPage}&page_size=10`, { headers: getAuthHeaders() })
-      const res = await response.json()
-      if (res.success) {
-        setInvitedUsers(res.data)
-      }
-    } catch (e) {
-      console.error('Failed to fetch invited users:', e)
-    } finally {
+    const expectedIdentity = invitedIdentityRef.current
+    if (invitedPage !== 1 && (!expectedIdentity || expectedIdentity.userId !== selectedUser.id || expectedIdentity.pageSize !== INVITED_USERS_PAGE_SIZE)) {
+      invitedUsersRef.current = null
+      invitedIdentityRef.current = null
+      setInvitedUsers(null)
+      setInvitedError('邀请分页缺少第一页快照身份，请关闭后重新打开详情')
+      setInvitedState('unavailable')
       setInvitedLoading(false)
+      return
+    }
+    invitedRequestRef.current.controller?.abort()
+    const controller = new AbortController()
+    const sequence = invitedRequestRef.current.sequence + 1
+    const params = new URLSearchParams({
+      page: String(invitedPage),
+      page_size: String(INVITED_USERS_PAGE_SIZE),
+    })
+    if (expectedIdentity) {
+      params.set('as_of', String(expectedIdentity.asOf))
+      params.set('query_fingerprint', expectedIdentity.queryFingerprint)
+    }
+    const requestKey = `${selectedUser.id}:${params.toString()}`
+    invitedRequestRef.current = { sequence, key: requestKey, controller }
+    setInvitedLoading(true)
+    setInvitedState('loading')
+    setInvitedError(null)
+    try {
+      const response = await fetch(`${apiUrl}/api/users/${selectedUser.id}/invited?${params.toString()}`, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
+      const res = await response.json()
+      const isLatest = invitedRequestRef.current.sequence === sequence
+        && invitedRequestRef.current.key === requestKey
+        && !controller.signal.aborted
+      if (!isLatest) return
+      if (!response.ok || !res.success) {
+        if (response.status === 409) {
+          throw new InvitedSnapshotContractError(res?.error?.message || '邀请用户快照已变化，请重新打开详情')
+        }
+        throw new Error(res?.error?.message || `邀请详情查询失败（HTTP ${response.status}）`)
+      }
+      const data = res.data as InvitedUsersData
+      const total = data?.total
+      const totalPages = data?.total_pages
+      const expectedTotalPages = Number.isSafeInteger(total) && total >= 0
+        ? (total === 0 ? 0 : Math.ceil(total / INVITED_USERS_PAGE_SIZE))
+        : -1
+      const expectedItemCount = Number.isSafeInteger(total) && total >= 0
+        ? Math.max(0, Math.min(INVITED_USERS_PAGE_SIZE, total - (invitedPage - 1) * INVITED_USERS_PAGE_SIZE))
+        : -1
+      const responseIdentityValid = Number.isSafeInteger(data?.as_of)
+        && data.as_of > 0
+        && typeof data?.query_fingerprint === 'string'
+        && SHA256_HEX_PATTERN.test(data.query_fingerprint)
+      const paginationValid = Number.isSafeInteger(data?.page)
+        && data.page === invitedPage
+        && Number.isSafeInteger(data?.page_size)
+        && data.page_size === INVITED_USERS_PAGE_SIZE
+        && Number.isSafeInteger(totalPages)
+        && totalPages === expectedTotalPages
+        && (invitedPage === 1 || invitedPage <= totalPages)
+        && Array.isArray(data?.items)
+        && data.items.length === expectedItemCount
+        && data.items.every(item => Number.isSafeInteger(item?.user_id) && item.user_id > 0)
+      const populationValid = Number.isSafeInteger(data?.inviter?.user_id)
+        && data.inviter.user_id === selectedUser.id
+        && Number.isSafeInteger(data?.stats?.total_invited)
+        && data.stats.total_invited === total
+      const expectedIdentityMatches = !expectedIdentity || (
+        expectedIdentity.userId === selectedUser.id
+        && expectedIdentity.pageSize === data.page_size
+        && expectedIdentity.asOf === data.as_of
+        && expectedIdentity.queryFingerprint === data.query_fingerprint
+      )
+      if (!responseIdentityValid || !paginationValid || !populationValid || !expectedIdentityMatches) {
+        throw new InvitedSnapshotContractError('邀请详情响应与第一页快照身份或分页契约不一致')
+      }
+      invitedIdentityRef.current = expectedIdentity || {
+        userId: selectedUser.id,
+        pageSize: data.page_size,
+        asOf: data.as_of,
+        queryFingerprint: data.query_fingerprint,
+      }
+      invitedUsersRef.current = data
+      setInvitedUsers(data)
+      setInvitedState(data.items.length > 0 ? 'fresh' : 'empty')
+    } catch (e) {
+      if (controller.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return
+      if (invitedRequestRef.current.sequence !== sequence || invitedRequestRef.current.key !== requestKey) return
+      console.error('Failed to fetch invited users:', e)
+      const message = e instanceof Error ? e.message : '邀请详情暂时不可用'
+      setInvitedError(message)
+      if (e instanceof InvitedSnapshotContractError) {
+        invitedUsersRef.current = null
+        invitedIdentityRef.current = null
+        setInvitedUsers(null)
+        setInvitedState('unavailable')
+      } else if (invitedUsersRef.current?.page === invitedPage) {
+        setInvitedState('stale')
+      } else {
+        invitedUsersRef.current = null
+        setInvitedUsers(null)
+        setInvitedState('unavailable')
+      }
+    } finally {
+      if (invitedRequestRef.current.sequence === sequence && !controller.signal.aborted) {
+        setInvitedLoading(false)
+      }
     }
   }, [apiUrl, getAuthHeaders, selectedUser, analysisDialogOpen, invitedPage])
 
   useEffect(() => {
     if (analysisDialogOpen && selectedUser) {
-      fetchInvitedUsers()
+      void fetchInvitedUsers()
     }
+    return () => invitedRequestRef.current.controller?.abort()
   }, [analysisDialogOpen, selectedUser, invitedPage, fetchInvitedUsers])
 
   const formatQuota = (quota: number) => `$${(quota / 500000).toFixed(2)}`
 
   // 格式化最后请求时间
-  // 快速模式下 last_request_time 为 null，根据 request_count 判断
+  // `null` means no billable-log timestamp was available; never invent a date.
   const formatLastRequest = (user: UserInfo) => {
     if (user.last_request_time) {
       return new Date(user.last_request_time * 1000).toLocaleString('zh-CN', {
@@ -742,9 +1004,8 @@ export function UserManagement() {
         minute: '2-digit',
       })
     }
-    // 快速模式：无精确时间
     if (user.request_count > 0) {
-      return <span className="text-muted-foreground">有请求记录</span>
+      return <span className="text-muted-foreground">无时间证据</span>
     }
     return <span className="text-muted-foreground">从未</span>
   }
@@ -810,7 +1071,7 @@ export function UserManagement() {
   )
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-500">
+    <div className="min-w-0 max-w-full space-y-6 animate-in fade-in duration-500 motion-reduce:animate-none">
       {/* Header */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
@@ -818,7 +1079,7 @@ export function UserManagement() {
           <p className="text-muted-foreground mt-1">查看和管理所有用户及其状态</p>
         </div>
         <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing || loading} className="h-9">
-          <RefreshCw className={cn("h-4 w-4 mr-2", refreshing && "animate-spin")} />
+          <RefreshCw aria-hidden="true" className={cn("h-4 w-4 mr-2", refreshing && "animate-spin motion-reduce:animate-none")} />
           刷新
         </Button>
       </div>
@@ -854,20 +1115,30 @@ export function UserManagement() {
           </TabsTrigger>
           <TabsTrigger value="affiliate" className="gap-2">
             <ShieldCheck className="h-4 w-4" />
-            邀请返利统计
+            邀请充值分析
           </TabsTrigger>
         </TabsList>
 
         {/* forceMount + data-state hide：保留列表 tab 的状态/筛选/分页，
-            切到邀请返利统计再切回不会触发重新拉数据。 */}
+            切到邀请充值分析再切回不会触发重新拉数据。 */}
         <TabsContent value="list" forceMount className="data-[state=inactive]:hidden mt-6 space-y-6">
 
       {/* Activity Stats Cards */}
+      {statsState === 'partial' && (
+        <div role="status" aria-live="polite" className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
+          快速统计仅包含用户总数与“从未请求”；其余活跃度正在读取日志证据，不会暂时显示为 0。
+        </div>
+      )}
+      {statsState === 'unavailable' && (
+        <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          活跃度统计来源不可用；未计算或旧值不会显示为可信数字。
+        </div>
+      )}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard
           title="活跃用户"
-          value={stats?.active_users || 0}
-          subValue={stats?.active_users === 0 && stats?.inactive_users === 0 && stats?.very_inactive_users === 0 && (stats?.never_requested || 0) > 0 ? "计算中..." : "7天内有请求"}
+          value={activityStatValue(stats?.active_users)}
+          subValue={activityStatHint("7天内有请求")}
           icon={UserCheck}
           color="green"
           onClick={() => { setActivityFilter('active'); setPage(1) }}
@@ -875,8 +1146,8 @@ export function UserManagement() {
         />
         <StatCard
           title="不活跃用户"
-          value={stats?.inactive_users || 0}
-          subValue={stats?.active_users === 0 && stats?.inactive_users === 0 && stats?.very_inactive_users === 0 && (stats?.never_requested || 0) > 0 ? "计算中..." : "7-30天内有请求"}
+          value={activityStatValue(stats?.inactive_users)}
+          subValue={activityStatHint("7-30天内有请求")}
           icon={Clock}
           color="yellow"
           onClick={() => { setActivityFilter('inactive'); setPage(1) }}
@@ -884,8 +1155,8 @@ export function UserManagement() {
         />
         <StatCard
           title="非常不活跃"
-          value={stats?.very_inactive_users || 0}
-          subValue={stats?.active_users === 0 && stats?.inactive_users === 0 && stats?.very_inactive_users === 0 && (stats?.never_requested || 0) > 0 ? "计算中..." : "超过30天无请求"}
+          value={activityStatValue(stats?.very_inactive_users)}
+          subValue={activityStatHint("超过30天无请求")}
           icon={UserX}
           color="red"
           onClick={() => { setActivityFilter('very_inactive'); setPage(1) }}
@@ -893,8 +1164,8 @@ export function UserManagement() {
         />
         <StatCard
           title="从未请求"
-          value={stats?.never_requested || 0}
-          subValue="注册后未使用"
+          value={activityStatValue(stats?.never_requested, true)}
+          subValue={activityStatHint("注册后未使用", true)}
           icon={Users}
           color="gray"
           onClick={() => { setActivityFilter('never'); setPage(1) }}
@@ -1014,19 +1285,19 @@ export function UserManagement() {
               用户列表
               <span className="ml-2 text-sm font-normal text-muted-foreground">共 {total} 个</span>
             </div>
-            {activityFilter !== 'all' && (
-              <Button variant="ghost" size="sm" onClick={() => { setActivityFilter('all'); setPage(1) }} className="h-8 text-xs">
-                清除筛选: {activityFilter === 'active' ? '活跃' : activityFilter === 'inactive' ? '不活跃' : activityFilter === 'very_inactive' ? '非常不活跃' : '从未请求'}
-              </Button>
-            )}
+            <span className="text-xs font-normal text-muted-foreground">
+              {loading ? '正在刷新…' : userQueryState === 'stale' ? '旧数据' : userQueryState === 'unavailable' ? '不可用' : '已更新'}
+            </span>
           </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col sm:flex-row gap-4 mb-4">
             <div className="flex-1 flex gap-2">
               <div className="relative flex-1 max-w-sm">
-                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <label className="sr-only" htmlFor="user-management-search">搜索用户</label>
+                <Search aria-hidden="true" className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                 <Input
+                  id="user-management-search"
                   placeholder="搜索用户名/邮箱/LinuxDoID/邀请码..."
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
@@ -1037,7 +1308,7 @@ export function UserManagement() {
               <Button onClick={handleSearch}>搜索</Button>
             </div>
             <div className="w-full sm:w-40">
-              <Select value={activityFilter} onChange={(e) => { setActivityFilter(e.target.value); setPage(1) }}>
+              <Select aria-label="按活跃度筛选用户" value={activityFilter} onChange={(e) => { setActivityFilter(e.target.value); setPage(1) }}>
                 <option value="all">所有状态</option>
                 <option value="active">活跃用户</option>
                 <option value="inactive">不活跃用户</option>
@@ -1046,17 +1317,17 @@ export function UserManagement() {
               </Select>
             </div>
             <div className="w-full sm:w-36">
-              <Select value={groupFilter} onChange={(e) => { setGroupFilter(e.target.value); setPage(1) }}>
+              <Select aria-label="按分组筛选用户" value={groupFilter} onChange={(e) => { setGroupFilter(e.target.value); setPage(1) }}>
                 <option value="">所有分组</option>
                 {groups.map((g) => (
                   <option key={g.group_name} value={g.group_name}>
-                    {g.group_name}
+                    {g.group_name === 'default' ? 'default（未分组）' : g.group_name}
                   </option>
                 ))}
               </Select>
             </div>
             <div className="w-full sm:w-36">
-              <Select value={sourceFilter} onChange={(e) => { setSourceFilter(e.target.value); setPage(1) }}>
+              <Select aria-label="按注册来源筛选用户" value={sourceFilter} onChange={(e) => { setSourceFilter(e.target.value); setPage(1) }}>
                 <option value="">所有来源</option>
                 {Object.entries(SOURCE_LABELS).map(([key, info]) => (
                   <option key={key} value={key}>{info.label}</option>
@@ -1064,6 +1335,58 @@ export function UserManagement() {
               </Select>
             </div>
           </div>
+
+          {(search || activityFilter !== 'all' || groupFilter || sourceFilter) && (
+            <div className="mb-4 flex flex-wrap items-center gap-2" aria-label="已应用的用户筛选">
+              <span className="text-xs text-muted-foreground">已应用：</span>
+              {search && (
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => { setSearch(''); setSearchInput(''); setPage(1) }}>
+                  搜索：{search} ×
+                </Button>
+              )}
+              {activityFilter !== 'all' && (
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => { setActivityFilter('all'); setPage(1) }}>
+                  活跃度：{activityFilter} ×
+                </Button>
+              )}
+              {groupFilter && (
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => { setGroupFilter(''); setPage(1) }}>
+                  分组：{groupFilter} ×
+                </Button>
+              )}
+              {sourceFilter && (
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => { setSourceFilter(''); setPage(1) }}>
+                  来源：{SOURCE_LABELS[sourceFilter]?.label || sourceFilter} ×
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => {
+                setSearch('')
+                setSearchInput('')
+                setActivityFilter('all')
+                setGroupFilter('')
+                setSourceFilter('')
+                setPage(1)
+              }}>
+                清除全部
+              </Button>
+            </div>
+          )}
+
+          {loading && users.length > 0 && (
+            <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+              正在加载新条件；当前旧行已锁定，不能打开详情或执行操作。
+            </div>
+          )}
+          {userQueryState === 'stale' && (
+            <div role="status" className="mb-4 rounded-md border border-orange-300 bg-orange-50 px-3 py-2 text-xs text-orange-800 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-200">
+              新查询不可用。下方仅保留“{displayedQuery}”的旧数据，已禁止操作。{userQueryError ? ` ${userQueryError}` : ''}
+            </div>
+          )}
+          {userQueryState === 'unavailable' && (
+            <div role="alert" className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-3 text-sm text-destructive">
+              用户列表当前不可用；这不是空结果。{userQueryError ? ` ${userQueryError}` : ''}
+            </div>
+          )}
 
           {/* Batch Move */}
           {users.length > 0 && (
@@ -1077,6 +1400,7 @@ export function UserManagement() {
                   size="sm"
                   className="h-8"
                   onClick={toggleSelectAllOnPage}
+                  disabled={listInteractionDisabled}
                 >
                   {allSelectedOnPage ? '取消全选本页' : '全选本页'}
                 </Button>
@@ -1101,10 +1425,10 @@ export function UserManagement() {
           {/* Users Table */}
           {loading && !users.length ? (
             <div className="flex justify-center py-12">
-              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              <Loader2 aria-hidden="true" className="h-8 w-8 animate-spin text-primary motion-reduce:animate-none" />
             </div>
           ) : users.length > 0 ? (
-            <div className="rounded-md border">
+            <div className="max-w-full overflow-x-auto rounded-md border">
               <Table>
                 <TableHeader className="bg-muted/50">
                   <TableRow>
@@ -1115,6 +1439,7 @@ export function UserManagement() {
                         aria-label="全选本页用户"
                         checked={allSelectedOnPage}
                         onChange={toggleSelectAllOnPage}
+                        disabled={listInteractionDisabled}
                         className="h-4 w-4 rounded border-input text-primary focus-visible:ring-2 focus-visible:ring-ring"
                       />
                     </TableHead>
@@ -1133,7 +1458,7 @@ export function UserManagement() {
                 </TableHeader>
                 <TableBody>
                   {users.map((user) => (
-                    <TableRow key={user.id} className="hover:bg-muted/50 transition-colors group">
+                    <TableRow key={user.id} className="hover:bg-muted/50 transition-colors motion-reduce:transition-none group">
                       <TableCell className="w-10">
                         <input
                           type="checkbox"
@@ -1141,31 +1466,38 @@ export function UserManagement() {
                           aria-label={`选择用户 ${user.username}`}
                           checked={selectedUserIds.has(user.id)}
                           onChange={() => toggleSelectUser(user.id)}
+                          disabled={listInteractionDisabled}
                           className="h-4 w-4 rounded border-input text-primary focus-visible:ring-2 focus-visible:ring-ring"
                         />
                       </TableCell>
                       <TableCell className="font-mono text-xs text-muted-foreground tabular-nums">{user.id}</TableCell>
                       <TableCell>
-                        <div
-                          className="flex items-center gap-3 px-3 py-2 rounded-xl bg-muted/30 hover:bg-primary/5 transition-all cursor-pointer border border-transparent hover:border-primary/20 w-max min-w-[180px]"
+                        <button
+                          type="button"
+                          className={cn(
+                            "flex items-center gap-3 px-3 py-2 rounded-xl bg-muted/30 transition-all motion-reduce:transition-none border border-transparent w-max min-w-[180px] text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                            listInteractionDisabled ? "cursor-not-allowed opacity-60" : "hover:bg-primary/5 hover:border-primary/20",
+                          )}
                           onClick={() => openUserAnalysis(user.id, user.username)}
+                          disabled={listInteractionDisabled}
+                          aria-label={`打开用户 ${user.username} 详情`}
                           title="查看用户分析"
                         >
-                          <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20 text-sm text-primary font-bold shrink-0">
+                          <span className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20 text-sm text-primary font-bold shrink-0">
                             {user.username[0]?.toUpperCase()}
-                          </div>
-                          <div className="flex flex-col min-w-0">
+                          </span>
+                          <span className="flex flex-col min-w-0">
                             <span className="font-bold text-sm tracking-tight">{user.username}</span>
-                            <div className="flex items-center gap-1.5 mt-0.5">
+                            <span className="flex items-center gap-1.5 mt-0.5">
                               {user.display_name && (
                                 <span className="text-[10px] text-muted-foreground">{user.display_name}</span>
                               )}
-                              <Badge variant="outline" className="px-1.5 py-0 h-4 text-[9px] font-medium leading-none shrink-0 border-muted-foreground/20">
+                              <span className="inline-flex h-4 shrink-0 items-center whitespace-nowrap rounded-full border border-muted-foreground/20 px-1.5 py-0 text-[9px] font-medium leading-none text-foreground">
                                 {user.group || 'default'}
-                              </Badge>
-                            </div>
-                          </div>
-                        </div>
+                              </span>
+                            </span>
+                          </span>
+                        </button>
                       </TableCell>
                       <TableCell className="hidden sm:table-cell">
                         {getRoleBadge(user.role)}
@@ -1194,7 +1526,7 @@ export function UserManagement() {
                               } catch { showToast('error', '查询 Linux.do 用户名失败') }
                               finally { setLinuxDoLookupLoading(null) }
                             }}
-                            disabled={linuxDoLookupLoading === user.linux_do_id}
+                            disabled={listInteractionDisabled || linuxDoLookupLoading === user.linux_do_id}
                             className="text-xs font-mono text-blue-500 hover:text-blue-600 hover:underline disabled:opacity-50 cursor-pointer"
                             title="点击查看 Linux.do 用户主页"
                           >
@@ -1216,25 +1548,30 @@ export function UserManagement() {
                       <TableCell className="hidden md:table-cell text-xs whitespace-nowrap tabular-nums text-muted-foreground">{formatLastRequest(user)}</TableCell>
                       <TableCell>{getActivityBadge(user.activity_level)}</TableCell>
                       <TableCell>
-                        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <div className="flex items-center gap-0.5 opacity-100 transition-opacity motion-reduce:transition-none sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100">
                           <Button
+                            type="button"
                             variant="ghost"
                             size="sm"
                             className="text-blue-500 hover:text-blue-600 hover:bg-blue-500/10 h-7 w-7 p-0"
                             onClick={() => openUserAnalysis(user.id, user.username)}
+                            disabled={listInteractionDisabled}
+                            aria-label={`查看用户 ${user.username} 的分析`}
                             title="用户分析"
                           >
-                            <Eye className="h-3.5 w-3.5" />
+                            <Eye aria-hidden="true" className="h-3.5 w-3.5" />
                           </Button>
                           <Button
+                            type="button"
                             variant="ghost"
                             size="sm"
                             className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 h-7 w-7 p-0"
                             onClick={() => deleteUser(user.id, user.username)}
-                            disabled={deleting}
+                            disabled={deleting || listInteractionDisabled}
+                            aria-label={`删除用户 ${user.username}`}
                             title="删除用户"
                           >
-                            <Trash2 className="h-3.5 w-3.5" />
+                            <Trash2 aria-hidden="true" className="h-3.5 w-3.5" />
                           </Button>
                         </div>
                       </TableCell>
@@ -1246,7 +1583,11 @@ export function UserManagement() {
           ) : (
             <div className="py-20 text-center text-muted-foreground bg-muted/10 rounded-lg border border-dashed">
               <Users className="mx-auto h-10 w-10 mb-3 opacity-20" />
-              <p>{search || activityFilter !== 'all' ? '没有找到符合条件的用户' : '暂无用户数据'}</p>
+              <p>{userQueryState === 'unavailable'
+                ? '用户列表不可用，请稍后重试'
+                : userQueryState === 'empty'
+                  ? (search || activityFilter !== 'all' || groupFilter || sourceFilter ? '当前条件结果为空' : '暂无用户数据')
+                  : '暂无可显示的用户数据'}</p>
             </div>
           )}
 
@@ -1261,7 +1602,7 @@ export function UserManagement() {
                   variant="outline"
                   size="sm"
                   onClick={() => setPage(p => Math.max(1, p - 1))}
-                  disabled={page === 1}
+                  disabled={page === 1 || loading}
                 >
                   <ChevronLeft className="h-4 w-4 mr-1" />
                   上一页
@@ -1270,7 +1611,7 @@ export function UserManagement() {
                   variant="outline"
                   size="sm"
                   onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                  disabled={page === totalPages}
+                  disabled={page === totalPages || loading}
                 >
                   下一页
                   <ChevronRight className="h-4 w-4 ml-1" />
@@ -1477,7 +1818,7 @@ export function UserManagement() {
       {selectedUser && (
         <UserAnalysisDialog
           open={analysisDialogOpen}
-          onOpenChange={setAnalysisDialogOpen}
+          onOpenChange={handleAnalysisOpenChange}
           userId={selectedUser.id}
           username={selectedUser.username}
           source="user_management"
@@ -1501,7 +1842,16 @@ export function UserManagement() {
                 )}
               </h4>
 
-              {invitedLoading ? (
+              {invitedState === 'stale' && (
+                <div role="status" className="rounded-md border border-orange-300 bg-orange-50 px-3 py-2 text-xs text-orange-800 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-200">
+                  邀请详情刷新失败；下方为旧数据，已禁止翻页。{invitedError ? ` ${invitedError}` : ''}
+                </div>
+              )}
+              {invitedState === 'unavailable' ? (
+                <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-3 text-xs text-destructive">
+                  邀请详情当前不可用；这不是“无邀请记录”。{invitedError ? ` ${invitedError}` : ''}
+                </div>
+              ) : invitedLoading ? (
                 <div className="flex items-center justify-center py-6">
                   <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
                 </div>
@@ -1514,8 +1864,8 @@ export function UserManagement() {
                       <div className="text-xs text-muted-foreground">邀请总数</div>
                     </div>
                     <div className="rounded-lg border bg-green-50 dark:bg-green-900/20 p-2 text-center">
-                      <div className="text-sm font-bold text-green-600">{invitedUsers.stats.active_count}</div>
-                      <div className="text-xs text-muted-foreground">活跃用户</div>
+                      <div className="text-sm font-bold text-green-600">{invitedUsers.stats.requested_count}</div>
+                      <div className="text-xs text-muted-foreground">有过请求</div>
                     </div>
                     <div className={cn(
                       "rounded-lg border p-2 text-center",
@@ -1525,7 +1875,7 @@ export function UserManagement() {
                       <div className="text-xs text-muted-foreground">已封禁</div>
                     </div>
                     <div className="rounded-lg border bg-muted/30 p-2 text-center">
-                      <div className="text-sm font-bold">{(invitedUsers.stats.total_used_quota / 500000).toFixed(2)}</div>
+                      <div className="text-sm font-bold">{invitedUsers.stats.total_used_quota === undefined ? '—' : (invitedUsers.stats.total_used_quota / 500000).toFixed(2)}</div>
                       <div className="text-xs text-muted-foreground">总消耗 $</div>
                     </div>
                   </div>
@@ -1558,7 +1908,7 @@ export function UserManagement() {
                               )}
                             </TableCell>
                             <TableCell className="py-1.5 text-xs text-right tabular-nums">{u.request_count.toLocaleString()}</TableCell>
-                            <TableCell className="py-1.5 text-xs text-right tabular-nums font-mono">{(u.used_quota / 500000).toFixed(2)}</TableCell>
+                            <TableCell className="py-1.5 text-xs text-right tabular-nums font-mono">{u.used_quota === undefined ? '—' : (u.used_quota / 500000).toFixed(2)}</TableCell>
                           </TableRow>
                         ))}
                       </TableBody>
@@ -1573,22 +1923,26 @@ export function UserManagement() {
                       </span>
                       <div className="flex gap-1">
                         <Button
+                          type="button"
                           variant="outline"
                           size="sm"
                           className="h-7 px-2 text-xs"
                           onClick={() => setInvitedPage(p => Math.max(1, p - 1))}
-                          disabled={invitedPage === 1}
+                          disabled={invitedPage === 1 || invitedLoading || invitedState === 'stale'}
+                          aria-label="邀请用户上一页"
                         >
-                          <ChevronLeft className="h-3 w-3" />
+                          <ChevronLeft aria-hidden="true" className="h-3 w-3" />
                         </Button>
                         <Button
+                          type="button"
                           variant="outline"
                           size="sm"
                           className="h-7 px-2 text-xs"
                           onClick={() => setInvitedPage(p => p + 1)}
-                          disabled={invitedPage >= Math.ceil(invitedUsers.total / 10)}
+                          disabled={invitedPage >= Math.ceil(invitedUsers.total / 10) || invitedLoading || invitedState === 'stale'}
+                          aria-label="邀请用户下一页"
                         >
-                          <ChevronRight className="h-3 w-3" />
+                          <ChevronRight aria-hidden="true" className="h-3 w-3" />
                         </Button>
                       </div>
                     </div>

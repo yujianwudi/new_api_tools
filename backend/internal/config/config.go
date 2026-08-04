@@ -113,6 +113,40 @@ type Config struct {
 	LinuxDoProxyURL string `json:"linuxdo_proxy_url"`
 }
 
+// ValidateSecurity rejects credential reuse across trust boundaries. A secret
+// that authenticates a low-privilege API key must never also unlock the admin
+// login, sign JWTs, call NewAPI's admin API, or fund active model probes.
+// Error messages intentionally contain only configuration names, never values.
+func (c *Config) ValidateSecurity() error {
+	if c == nil {
+		return fmt.Errorf("configuration is required")
+	}
+	secrets := []struct {
+		name  string
+		value string
+	}{
+		{name: "API_KEY", value: c.APIKey},
+		{name: "ADMIN_PASSWORD", value: c.AdminPassword},
+		{name: "JWT_SECRET_KEY", value: c.JWTSecretKey},
+		{name: "NEWAPI_ADMIN_ACCESS_TOKEN", value: c.NewAPIAdminAccessToken},
+		{name: "MODEL_PROBE_API_KEY", value: c.ModelProbeAPIKey},
+		{name: "OBSERVABILITY_TOKEN", value: c.ObservabilityToken},
+	}
+	for index := range secrets {
+		secrets[index].value = strings.TrimSpace(secrets[index].value)
+		if secrets[index].value == "" {
+			continue
+		}
+		for other := index + 1; other < len(secrets); other++ {
+			candidate := strings.TrimSpace(secrets[other].value)
+			if candidate != "" && secrets[index].value == candidate {
+				return fmt.Errorf("credential reuse is forbidden between %s and %s", secrets[index].name, secrets[other].name)
+			}
+		}
+	}
+	return nil
+}
+
 // Global config instance
 var cfg *Config
 

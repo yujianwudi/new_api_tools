@@ -490,7 +490,7 @@ func TestBatchDeleteSnapshotIsInvalidatedByNewActivity(t *testing.T) {
 	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES (1, 2, ?)`, time.Now().Unix())
 
 	_, err = svc.BatchDeleteInactiveUsers(ActivityNever, false, false, toString(preview["snapshot_id"]))
-	if err == nil || !strings.Contains(err.Error(), "became active") {
+	if !errors.Is(err, ErrSnapshotInvalidated) || !strings.Contains(err.Error(), "billable-log evidence changed") {
 		t.Fatalf("expected newly active user to invalidate snapshot, got %v", err)
 	}
 	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
@@ -518,8 +518,10 @@ func TestBatchDeleteExcludesAdministrators(t *testing.T) {
 
 func TestBatchDeleteSnapshotIsInvalidatedByRequestCountChange(t *testing.T) {
 	db, svc := installUserManagementSafetyDB(t)
+	now := time.Now().Unix()
 	db.MustExec(`INSERT INTO users (id, username, request_count) VALUES (1, 'candidate', 5)`)
-	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES (99, 2, ?)`, time.Now().Unix())
+	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES
+		(1, 2, ?), (99, 2, ?)`, now-InactiveThreshold-3600, now)
 
 	preview, err := svc.BatchDeleteInactiveUsers(ActivityVeryInactive, true, false, "")
 	if err != nil {
@@ -533,6 +535,81 @@ func TestBatchDeleteSnapshotIsInvalidatedByRequestCountChange(t *testing.T) {
 	}
 	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
 		t.Fatal("request-count change did not protect the user")
+	}
+}
+
+func TestBatchDeleteVeryInactiveExcludesRequestedUserWithoutBillableHistory(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	now := time.Now().Unix()
+	db.MustExec(`INSERT INTO users (id, username, request_count) VALUES
+		(1, 'missing-history', 5), (2, 'old-evidence', 5)`)
+	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES
+		(2, 2, ?), (99, 2, ?)`, now-InactiveThreshold-3600, now)
+
+	preview, err := svc.BatchDeleteInactiveUsers(ActivityVeryInactive, true, true, "")
+	if err != nil {
+		t.Fatalf("preview hard delete: %v", err)
+	}
+	if got := toInt64(preview["affected_count"]); got != 1 {
+		t.Fatalf("preview count = %d, want only the user with explicit old evidence", got)
+	}
+	if snapshotID := toString(preview["snapshot_id"]); snapshotID == "" {
+		t.Fatal("eligible old-evidence user did not produce a snapshot")
+	}
+
+	result, err := svc.BatchDeleteInactiveUsers(
+		ActivityVeryInactive, false, true, toString(preview["snapshot_id"]))
+	if err != nil {
+		t.Fatalf("execute hard delete: %v", err)
+	}
+	if got := toInt64(result["affected_count"]); got != 1 {
+		t.Fatalf("hard-delete affected count = %d, want 1", got)
+	}
+	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1"); got != 1 {
+		t.Fatal("request_count>0 user without billable history was permanently deleted")
+	}
+	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 2"); got != 0 {
+		t.Fatal("user with bound old evidence was not hard deleted")
+	}
+}
+
+func TestBatchDeleteLockedEvidenceRecheckRejectsDrift(t *testing.T) {
+	db, svc := installUserManagementSafetyDB(t)
+	asOf := time.Now().Unix()
+	oldRequest := asOf - InactiveThreshold - 3600
+	db.MustExec(`INSERT INTO users (id, username, request_count) VALUES (1, 'candidate', 5)`)
+	db.MustExec(`INSERT INTO logs (user_id, type, created_at) VALUES
+		(1, 2, ?), (1, 2, ?), (99, 2, ?)`, oldRequest, asOf, asOf)
+	cutoff, err := batchDeleteActivityCutoff(ActivityVeryInactive, asOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := batchDeleteSnapshot{
+		IDs:               []int64{1},
+		RequestCounts:     []int64{5},
+		LastRequestTimes:  []int64{oldRequest},
+		BillableLogCounts: []int64{1},
+		ActivityLevel:     ActivityVeryInactive,
+		ActivityAsOf:      asOf,
+		ActivityCutoff:    cutoff,
+		CreatedAt:         asOf,
+	}
+	tx, err := db.BeginTxx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin locked evidence test: %v", err)
+	}
+	current, err := svc.candidateBillableEvidenceLocked(t.Context(), tx, snapshot.IDs, 0)
+	if err != nil {
+		t.Fatalf("locked evidence query: %v", err)
+	}
+	if err := validateBatchDeleteEvidenceUnchanged(snapshot, current, asOf); !errors.Is(err, ErrSnapshotInvalidated) {
+		t.Fatalf("locked evidence drift error = %v, want ErrSnapshotInvalidated", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback locked evidence test: %v", err)
+	}
+	if got := queryInt64(t, db, "SELECT COUNT(*) FROM users WHERE id = 1 AND deleted_at IS NULL"); got != 1 {
+		t.Fatal("locked evidence drift changed the user")
 	}
 }
 

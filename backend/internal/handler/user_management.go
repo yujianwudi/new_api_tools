@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
@@ -69,6 +70,25 @@ func classifyDestructiveOperationError(err error) (int, string, string, bool) {
 	return 0, "", "", false
 }
 
+func respondUserReadError(c *gin.Context, operation string, err error) {
+	switch {
+	case errors.Is(err, service.ErrInvalidActivityFilter):
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_ACTIVITY_FILTER", "Unsupported activity filter", ""))
+	case errors.Is(err, service.ErrInvalidSourceFilter):
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_SOURCE_FILTER", "Unsupported source filter", ""))
+	case errors.Is(err, service.ErrInvalidGroupFilter):
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_GROUP_FILTER", "Invalid group filter", ""))
+	case errors.Is(err, service.ErrUnsupportedSourceFilter):
+		c.JSON(http.StatusUnprocessableEntity, models.ErrorResp("SOURCE_FILTER_UNAVAILABLE", "The selected source is unavailable for this database schema", ""))
+	case errors.Is(err, service.ErrActivityLogUnavailable),
+		errors.Is(err, service.ErrActivityFilterScaleExceeded),
+		errors.Is(err, service.ErrOAuthCapabilitiesUnavailable):
+		respondHandlerError(c, http.StatusServiceUnavailable, "USER_QUERY_UNAVAILABLE", "User filtering evidence is temporarily unavailable", operation, err)
+	default:
+		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, operation, err)
+	}
+}
+
 func RegisterUserManagementRoutes(r *gin.RouterGroup, mutationHandler *MutationHandler) {
 	if mutationHandler == nil {
 		panic("user management routes require the audited NewAPI mutation handler")
@@ -77,11 +97,11 @@ func RegisterUserManagementRoutes(r *gin.RouterGroup, mutationHandler *MutationH
 	{
 		g.GET("/activity-stats", GetActivityStats)
 		g.GET("/stats", GetActivityStats)
-		g.GET("/banned", GetBannedUsers)
-		g.GET("", GetUsers)
+		g.GET("/banned", auth.RequireRole(auth.RoleOperator), GetBannedUsers)
+		g.GET("", auth.RequireRole(auth.RoleOperator), GetUsers)
 		g.DELETE("/:user_id", mutationHandler.DeleteUser)
 		g.POST("/batch-delete", mutationHandler.BatchDeleteInactiveUsers)
-		g.GET("/soft-deleted/count", GetSoftDeletedCount)
+		g.GET("/soft-deleted/count", auth.RequireRole(auth.RoleOperator), GetSoftDeletedCount)
 		g.POST("/soft-deleted/purge", mutationHandler.PurgeSoftDeletedUsers)
 		g.POST("/:user_id/ban", mutationHandler.BanUser)
 		g.POST("/:user_id/unban", mutationHandler.UnbanUser)
@@ -97,7 +117,7 @@ func GetActivityStats(c *gin.Context) {
 
 	stats, err := svc.GetActivityStats(quick)
 	if err != nil {
-		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user activity statistics query", err)
+		respondUserReadError(c, "user activity statistics query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": stats})
@@ -121,7 +141,7 @@ func GetBannedUsers(c *gin.Context) {
 // GET /api/users
 func GetUsers(c *gin.Context) {
 	page := parsePage(c)
-	pageSize := parsePageSize(c, 20, 200)
+	pageSize := parsePageSize(c, 20, 100)
 
 	params := service.ListUsersParams{
 		Page:           page,
@@ -137,7 +157,7 @@ func GetUsers(c *gin.Context) {
 	svc := service.NewUserManagementService()
 	result, err := svc.GetUsers(params)
 	if err != nil {
-		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "user list query", err)
+		respondUserReadError(c, "user list query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
@@ -411,14 +431,41 @@ func GetInvitedUsers(c *gin.Context) {
 		return
 	}
 
-	page := parsePage(c)
-	pageSize := parsePageSize(c, 20, 200)
+	page, pageErr := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, pageSizeErr := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageErr != nil || pageSizeErr != nil || page < 1 || pageSize < 1 || pageSize > 100 {
+		c.JSON(http.StatusConflict, models.ErrorResp("INVITED_SNAPSHOT_MISMATCH", "Invitation snapshot pagination contract is invalid", ""))
+		return
+	}
+
+	asOfRaw := c.Query("as_of")
+	fingerprint := c.Query("query_fingerprint")
+	var identity *service.InvitedUsersSnapshotIdentity
+	if asOfRaw != "" || fingerprint != "" {
+		asOf, parseErr := strconv.ParseInt(asOfRaw, 10, 64)
+		if parseErr != nil || fingerprint == "" {
+			c.JSON(http.StatusConflict, models.ErrorResp("INVITED_SNAPSHOT_MISMATCH", "Invitation snapshot identity is invalid", ""))
+			return
+		}
+		identity = &service.InvitedUsersSnapshotIdentity{AsOf: asOf, QueryFingerprint: fingerprint}
+	}
 
 	svc := service.NewUserManagementService()
-	data, err := svc.GetInvitedUsers(userID, page, pageSize)
+	data, err := svc.GetInvitedUsers(userID, page, pageSize, identity)
 	if err != nil {
+		if errors.Is(err, service.ErrInviterNotFound) {
+			c.JSON(http.StatusNotFound, models.ErrorResp("INVITER_NOT_FOUND", "Inviter not found", ""))
+			return
+		}
+		if errors.Is(err, service.ErrInvitedUsersSnapshotMismatch) {
+			c.JSON(http.StatusConflict, models.ErrorResp("INVITED_SNAPSHOT_MISMATCH", "Invitation snapshot changed; restart from page one", ""))
+			return
+		}
 		respondInternalError(c, "QUERY_ERROR", genericUnavailableMessage, "invited user list query", err)
 		return
+	}
+	if auth.ContextRole(c) == auth.RoleViewer {
+		data = data.RedactForViewer()
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }

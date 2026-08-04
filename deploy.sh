@@ -23,10 +23,14 @@ COMPOSE_HOST_FILE="${SCRIPT_DIR}/docker-compose.host.yml"
 COMPOSE_LOGDB_FILE="${SCRIPT_DIR}/docker-compose.logdb.yml"
 SOURCE_SQL_DSN=""
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
+NEWAPI_TOOLS_SIGNING_REPOSITORY="yujianwudi/new_api_tools"
+NEWAPI_TOOLS_COSIGN_IMAGE="ghcr.io/sigstore/cosign/cosign:v3.1.2@sha256:d91bc4e7e95e8d2f549c747a72dc174f90579e410a1695f57f686674f84ce849"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
+REQUESTED_NEWAPI_TOOLS_RELEASE_TAG="${NEWAPI_TOOLS_RELEASE_TAG:-}"
 NEWAPI_TOOLS_IMAGE_DERIVED=false
 NEWAPI_TOOLS_EXPECTED_REVISION=""
+NEWAPI_TOOLS_RELEASE_TAG=""
 DEPLOY_ROLLBACK_ENV_AVAILABLE=false
 DEPLOY_ROLLBACK_ENV_CONTENT=""
 DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
@@ -50,6 +54,12 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
+
+TOOLSTORE_TXN_LIBRARY_SOURCE="${SCRIPT_DIR}/scripts/toolstore_transaction.sh"
+[[ -f "$TOOLSTORE_TXN_LIBRARY_SOURCE" && ! -L "$TOOLSTORE_TXN_LIBRARY_SOURCE" ]] ||
+  die "缺少安全的 Tool Store 事务库：${TOOLSTORE_TXN_LIBRARY_SOURCE}"
+# shellcheck source=scripts/toolstore_transaction.sh
+source "$TOOLSTORE_TXN_LIBRARY_SOURCE"
 
 # Keep the lock beside the project directory instead of inside it. This gives
 # first installs a stable lock before the target exists and prevents purge from
@@ -194,6 +204,42 @@ env_content_value() {
     value="${value:1:${#value}-2}"
   fi
   printf '%s\n' "$value"
+}
+
+validate_deploy_credential_separation_content() {
+  local content="$1" index prior value
+  local -a names=(
+    ADMIN_PASSWORD
+    API_KEY
+    JWT_SECRET
+    NEWAPI_ADMIN_ACCESS_TOKEN
+    MODEL_PROBE_API_KEY
+    OBSERVABILITY_TOKEN
+  )
+  local -a values=()
+
+  for index in "${!names[@]}"; do
+    value="$(env_content_value "$content" "${names[index]}")"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    values[index]="$value"
+    [[ -n "$value" ]] || continue
+    for ((prior = 0; prior < index; prior++)); do
+      if [[ -n "${values[prior]:-}" && "$value" == "${values[prior]}" ]]; then
+        log_error "凭据变量 ${names[prior]} 与 ${names[index]} 不得复用同一非空值"
+        return 1
+      fi
+    done
+  done
+}
+
+validate_deploy_credential_separation_file() {
+  local env_file="$1"
+  [[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] || {
+    log_error "凭据预检要求安全且可读的常规 .env 文件"
+    return 1
+  }
+  validate_deploy_credential_separation_content "$(<"$env_file")"
 }
 
 atomic_write_deploy_dotenv() {
@@ -364,6 +410,144 @@ image_repository_without_tag() {
   printf '%s\n' "$image"
 }
 
+run_deploy_cosign() {
+  local runner="${NEWAPI_TOOLS_COSIGN_RUNNER:-}"
+  if [[ -n "$runner" ]]; then
+    "$runner" "$@"
+    return
+  fi
+  local policy_file="${NEWAPI_TOOLS_COSIGN_POLICY_FILE:-}"
+  local -a policy_mount=()
+  if [[ -n "$policy_file" ]]; then
+    [[ "$policy_file" == /* && -f "$policy_file" && ! -L "$policy_file" ]] || return 1
+    policy_mount=(--volume "${policy_file}:/tmp/newapi-tools-provenance-policy.cue:ro")
+  fi
+  docker run --rm \
+    --read-only \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges:true \
+    --user=65532:65532 \
+    --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m \
+    --env=HOME=/tmp \
+    --env=XDG_CACHE_HOME=/tmp \
+    "${policy_mount[@]}" \
+    "$NEWAPI_TOOLS_COSIGN_IMAGE" "$@"
+}
+
+verify_deploy_release_signature() {
+  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
+  local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_names=(
+    'Build and Push Docker Image'
+    'Recover Release Image From Existing Tag'
+  )
+  local -a workflow_triggers=(push workflow_dispatch)
+
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  is_immutable_newapi_tools_image "$image" || return 1
+  [[ "$(image_repository_without_tag "$image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
+  expected_ref="refs/tags/${tag}"
+
+  for index in "${!workflow_files[@]}"; do
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
+    if run_deploy_cosign verify \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
+      --certificate-github-workflow-ref "$expected_ref" \
+      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-name "${workflow_names[index]}" \
+      --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
+      -a "git_sha=${git_sha}" \
+      -a "tag=${tag}" \
+      "$image" >/dev/null; then
+      return 0
+    fi
+  done
+  log_error "发行镜像签名未匹配允许的 build.yml 或 release-recovery.yml 标签工作流身份"
+  return 1
+}
+
+verify_deploy_release_provenance() {
+  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
+  local repository manifest_digest policy_file policy_argument
+  local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_names=(
+    'Build and Push Docker Image'
+    'Recover Release Image From Existing Tag'
+  )
+  local -a workflow_triggers=(push workflow_dispatch)
+
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  is_immutable_newapi_tools_image "$image" || return 1
+  repository="$(image_repository_without_tag "$image")"
+  [[ "$repository" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
+  manifest_digest="${image##*@}"
+  expected_ref="refs/tags/${tag}"
+
+  for index in "${!workflow_files[@]}"; do
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
+    policy_file="$(mktemp)" || return 1
+    cat >"$policy_file" <<EOF
+package newapi_tools_release
+
+"_type": "https://in-toto.io/Statement/v1"
+predicateType: "https://slsa.dev/provenance/v1"
+subject: [{
+  name: "${repository}"
+  digest: sha256: "${manifest_digest#sha256:}"
+}]
+predicate: {
+  buildDefinition: {
+    buildType: "${identity}"
+    externalParameters: {
+      repository: "https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}"
+      ref: "${expected_ref}"
+      revision: "${git_sha}"
+      tag: "${tag}"
+      manifest_digest: "${manifest_digest}"
+      platform_digests: {
+        "linux/amd64": =~"^sha256:[0-9a-f]{64}$"
+        "linux/arm64": =~"^sha256:[0-9a-f]{64}$"
+      }
+    }
+    resolvedDependencies: [{
+      uri: "git+https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}@${expected_ref}"
+      digest: gitCommit: "${git_sha}"
+    }]
+  }
+  runDetails: builder: id: "${identity}"
+}
+EOF
+    chmod 0444 "$policy_file" || { rm -f -- "$policy_file"; return 1; }
+    policy_argument="$policy_file"
+    if [[ -z "${NEWAPI_TOOLS_COSIGN_RUNNER:-}" ]]; then
+      policy_argument='/tmp/newapi-tools-provenance-policy.cue'
+    fi
+    if NEWAPI_TOOLS_COSIGN_POLICY_FILE="$policy_file" run_deploy_cosign verify-attestation \
+      --type slsaprovenance1 \
+      --policy "$policy_argument" \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
+      --certificate-github-workflow-ref "$expected_ref" \
+      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-name "${workflow_names[index]}" \
+      --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
+      -a "git_sha=${git_sha}" \
+      -a "tag=${tag}" \
+      "$image" >/dev/null; then
+      rm -f -- "$policy_file"
+      return 0
+    fi
+    rm -f -- "$policy_file"
+  done
+  log_error "发行镜像缺少与 subject、平台 digest、tag 和 commit 绑定的受信 SLSA provenance"
+  return 1
+}
+
 resolve_deploy_image_digest() {
   local image="$1" expected_revision="${2:-}" repository actual_revision
   local -a matching_digests=()
@@ -442,16 +626,43 @@ pin_deploy_image_after_pull() {
     log_error "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
     return 1
   fi
+  if [[ -n "$NEWAPI_TOOLS_RELEASE_TAG" ]] &&
+    { ! verify_deploy_release_signature \
+        "$resolved" "$NEWAPI_TOOLS_RELEASE_TAG" "$NEWAPI_TOOLS_EXPECTED_REVISION" ||
+      ! verify_deploy_release_provenance \
+        "$resolved" "$NEWAPI_TOOLS_RELEASE_TAG" "$NEWAPI_TOOLS_EXPECTED_REVISION"; }; then
+    log_error "候选发行镜像的 Sigstore 身份、标签、commit、注解或 subject digest 验证失败；现有服务保持不变"
+    return 1
+  fi
   NEWAPI_TOOLS_IMAGE="$resolved"
   export NEWAPI_TOOLS_IMAGE
   log_success "候选部署镜像已验证并固定为 ${resolved}"
 }
 
 resolve_deploy_image() {
-  local image="$REQUESTED_NEWAPI_TOOLS_IMAGE"
+  local image="$REQUESTED_NEWAPI_TOOLS_IMAGE" git_commit="" resolved_exact_tag=""
 
   NEWAPI_TOOLS_IMAGE_DERIVED=false
   NEWAPI_TOOLS_EXPECTED_REVISION=""
+  NEWAPI_TOOLS_RELEASE_TAG=""
+
+  if [[ -n "$REQUESTED_NEWAPI_TOOLS_RELEASE_TAG" ]]; then
+    [[ "$REQUESTED_NEWAPI_TOOLS_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+      die "NEWAPI_TOOLS_RELEASE_TAG 必须使用严格的 vMAJOR.MINOR.PATCH 格式"
+    [[ -n "$image" ]] ||
+      die "显式发行标签必须同时提供不可变 NEWAPI_TOOLS_IMAGE 和 NEWAPI_TOOLS_EXPECTED_REVISION"
+  fi
+
+  if command -v git >/dev/null 2>&1 &&
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_commit="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)" ||
+      die "无法解析当前 Git commit"
+    resolved_exact_tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+    if [[ "$resolved_exact_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+      [[ ! "$resolved_exact_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      die "当前发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式"
+    fi
+  fi
 
   if [[ -n "$image" ]]; then
     [[ "$REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION" =~ ^[0-9a-fA-F]{40}$ ]] ||
@@ -461,27 +672,33 @@ resolve_deploy_image() {
     is_immutable_newapi_tools_image "$image" ||
       die "显式部署镜像必须使用发行页核验过的 repo@sha256:<digest>"
     NEWAPI_TOOLS_EXPECTED_REVISION="${REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION,,}"
+    if [[ -n "$REQUESTED_NEWAPI_TOOLS_RELEASE_TAG" ]]; then
+      if [[ "$resolved_exact_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+            "$resolved_exact_tag" != "$REQUESTED_NEWAPI_TOOLS_RELEASE_TAG" ]]; then
+        die "显式发行标签与当前 checkout 的精确发行标签不一致"
+      fi
+      NEWAPI_TOOLS_RELEASE_TAG="$REQUESTED_NEWAPI_TOOLS_RELEASE_TAG"
+    elif [[ "$resolved_exact_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      [[ "${git_commit,,}" == "$NEWAPI_TOOLS_EXPECTED_REVISION" ]] ||
+        die "当前发行标签 commit 与 NEWAPI_TOOLS_EXPECTED_REVISION 不一致"
+      NEWAPI_TOOLS_RELEASE_TAG="$resolved_exact_tag"
+    fi
   fi
 
-  if [[ -z "$image" ]] && command -v git >/dev/null 2>&1 &&
-    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    local commit tag
-    commit="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)" ||
-      die "无法解析当前 Git commit"
+  if [[ -z "$image" && -n "$git_commit" ]]; then
     NEWAPI_TOOLS_IMAGE_DERIVED=true
-    NEWAPI_TOOLS_EXPECTED_REVISION="$commit"
-    tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
-    if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-      die "发行 tag ${tag} 必须显式提供发行页中的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
+    NEWAPI_TOOLS_EXPECTED_REVISION="$git_commit"
+    if [[ "$resolved_exact_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      die "发行 tag ${resolved_exact_tag} 必须显式提供发行页中的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
     fi
-    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${git_commit:0:7}"
   fi
 
   [[ -n "$image" ]] ||
     die "无法从 Git 推导开发镜像；发行部署必须显式提供不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
   validate_newapi_tools_image "$image"
   NEWAPI_TOOLS_IMAGE="$image"
-  export NEWAPI_TOOLS_IMAGE
+  export NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_RELEASE_TAG
   log_info "部署镜像: ${NEWAPI_TOOLS_IMAGE}"
 }
 
@@ -1657,6 +1874,8 @@ JWT_EXPIRE_HOURS=24
 REDIS_PASSWORD=''
 EOF
 )"
+  validate_deploy_credential_separation_content "$env_content" ||
+    die "凭据预检失败；完整部署配置未发布"
   atomic_write_deploy_dotenv "$ENV_FILE" "$env_content" ||
     die "无法原子持久化完整部署配置；旧配置保持不变"
   DEPLOY_ENV_GENERATED_THIS_RUN=true
@@ -1820,9 +2039,9 @@ is_legacy_db_ready_response() {
 }
 
 verify_deploy_application_health() {
-  local mode="$1" ready_body="" legacy_body=""
-  ready_body="$(docker exec newapi-tools curl --silent --show-error \
-    http://localhost:8080/readyz 2>/dev/null || true)"
+  local mode="$1" container="${2:-newapi-tools}" port="${3:-8080}" ready_body="" legacy_body=""
+  ready_body="$(docker exec "$container" curl --silent --show-error \
+    "http://localhost:${port}/readyz" 2>/dev/null || true)"
   if is_v05_ready_response "$ready_body"; then
     return 0
   fi
@@ -1834,12 +2053,13 @@ verify_deploy_application_health() {
   if printf '%s' "$ready_body" | grep -Eq '^[[:space:]]*\{'; then
     return 1
   fi
-  legacy_body="$(docker exec newapi-tools curl --fail --silent --show-error \
-    http://localhost:8080/api/health/db 2>/dev/null || true)"
+  legacy_body="$(docker exec "$container" curl --fail --silent --show-error \
+    "http://localhost:${port}/api/health/db" 2>/dev/null || true)"
   is_legacy_db_ready_response "$legacy_body"
 }
 
 connect_deploy_runtime_networks() {
+  local tools_container="${1:-newapi-tools}"
   # 将容器连接到 NewAPI 网络（用于访问数据库）。基础 Compose 已声明主要
   # 网络；这里恢复 bridge / 日志库场景下的运行时附加网络。
   if [[ "$USE_HOST_MODE" == "true" ]]; then
@@ -1847,13 +2067,13 @@ connect_deploy_runtime_networks() {
   elif [[ "$USE_BRIDGE_MODE" == "true" ]]; then
     local bridge_network="${ORIGINAL_NETWORK:-bridge}"
     ensure_container_on_network "$NEWAPI_CONTAINER" "$NEWAPI_NETWORK" "NewAPI Tool API 网络"
-    ensure_container_on_network "newapi-tools" "$bridge_network" "NewAPI 原始 bridge 网络"
+    ensure_container_on_network "$tools_container" "$bridge_network" "NewAPI 原始 bridge 网络"
   elif [[ -n "$NEWAPI_NETWORK" ]]; then
-    ensure_container_on_network "newapi-tools" "$NEWAPI_NETWORK" "NewAPI 网络"
+    ensure_container_on_network "$tools_container" "$NEWAPI_NETWORK" "NewAPI 网络"
   fi
 
   if [[ -n "${LOG_NETWORK:-}" ]]; then
-    ensure_container_on_network "newapi-tools" "$LOG_NETWORK" "日志库网络"
+    ensure_container_on_network "$tools_container" "$LOG_NETWORK" "日志库网络"
   fi
 }
 
@@ -1866,6 +2086,56 @@ start_deploy_services_and_wait() {
   run_deploy_compose "$ENV_FILE" "$image_override" \
     up -d --wait --wait-timeout 180 || return 1
   verify_deploy_application_health "$health_mode"
+}
+
+deploy_isolated_candidate_name() {
+  local container request_id compose_project candidate_image project
+  toolstore_txn_candidate_identity "$SCRIPT_DIR" container request_id compose_project candidate_image project || return 1
+  printf '%s\n' "$container"
+}
+
+stop_deploy_isolated_candidate() {
+  toolstore_txn_remove_candidate_container "$SCRIPT_DIR"
+}
+
+start_deploy_isolated_candidate_and_wait() {
+  local image_override="$1" container request_id compose_project candidate_image project created_ref container_id deadline
+  toolstore_txn_candidate_identity "$SCRIPT_DIR" container request_id compose_project candidate_image project || return 1
+  [[ "$image_override" == "$candidate_image" ]] || return 1
+  ! docker inspect "$container" >/dev/null 2>&1 || return 1
+  created_ref="$(run_deploy_compose "$ENV_FILE" "$image_override" \
+    run --no-deps -d --name "$container" \
+    --label "io.newapi-tools.candidate.purpose=toolstore-migration-candidate" \
+    --label "io.newapi-tools.candidate.request-id=${request_id}" \
+    --label "io.newapi-tools.candidate.compose-project=${compose_project}" \
+    --label "io.newapi-tools.candidate.project-dir=${project}" \
+    --label "io.newapi-tools.candidate.image=${candidate_image}" \
+    -e SERVER_HOST=127.0.0.1 -e SERVER_PORT=8000 -e MODEL_PROBE_ENABLED=false \
+    --entrypoint /app/server newapi-tools)" || return 1
+  created_ref="${created_ref##*$'\n'}"
+  created_ref="${created_ref%$'\r'}"
+  [[ "$created_ref" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+  container_id="$(docker inspect --format '{{.Id}}' "$created_ref" 2>/dev/null)" || return 1
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if ! toolstore_txn_record_candidate_container_id "$SCRIPT_DIR" "$container_id"; then
+    docker rm -f "$container_id" >/dev/null 2>&1 || return 1
+    ! docker inspect "$container_id" >/dev/null 2>&1 || return 1
+    return 1
+  fi
+  if ! toolstore_txn_candidate_container_matches "$SCRIPT_DIR" "$container_id"; then
+    toolstore_txn_remove_created_candidate_by_id "$SCRIPT_DIR" "$container_id" || return 1
+    return 1
+  fi
+  connect_deploy_runtime_networks "$container_id" || return 1
+  deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    [[ "$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)" == "true" ]] || return 1
+    if verify_deploy_application_health candidate "$container_id" 8000; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
 }
 
 restore_deploy_previous_configuration() {
@@ -1895,6 +2165,7 @@ restore_deploy_previous_configuration() {
 
 rollback_deploy_to_previous() {
   local rollback_content="$1" rollback_image="$2" cleanup_candidate="${3:-true}"
+  local txn_content="" txn_state=""
   restore_deploy_previous_configuration "$rollback_content" "$rollback_image" || return 1
 
   if [[ "$cleanup_candidate" == "true" ]]; then
@@ -1902,7 +2173,87 @@ rollback_deploy_to_previous() {
       log_error "清理失败或部分启动的候选服务时发生错误；仍将尝试重建旧服务"
     fi
   fi
-  start_deploy_services_and_wait rollback "$rollback_image"
+  if toolstore_txn_has_active "$SCRIPT_DIR"; then
+    stop_deploy_isolated_candidate || return 1
+    txn_content="$(toolstore_txn_load_record "$SCRIPT_DIR")" || return 1
+    txn_state="$(toolstore_txn_env_value "$txn_content" STATE)"
+    toolstore_txn_unstage_data "$SCRIPT_DIR" || return 1
+    if [[ "$txn_state" != "preparing" && "$txn_state" != "preflight" ]]; then
+      toolstore_txn_restore_database "$SCRIPT_DIR" || {
+        log_error "Tool Store 原子恢复失败；旧镜像不会在可能不兼容的 schema 上启动，回滚证据已保留"
+        return 1
+      }
+    fi
+  fi
+  start_deploy_services_and_wait rollback "$rollback_image" || return 1
+  if toolstore_txn_has_active "$SCRIPT_DIR"; then
+    if [[ "$txn_state" == "preparing" || "$txn_state" == "preflight" ]]; then
+      toolstore_txn_retire_preflight "$SCRIPT_DIR" || return 1
+    else
+      toolstore_txn_mark_rolled_back "$SCRIPT_DIR" || return 1
+    fi
+  fi
+}
+
+# Recover the database/config/image transaction before any new interactive
+# configuration is generated. This is the crash-entry point for a host reboot
+# after a candidate migrated the Tool Store or a safe reinstall staged data.
+recover_active_deploy_toolstore_transaction() {
+  local content state rollback_image candidate_image
+  toolstore_txn_has_active "$SCRIPT_DIR" || return 0
+  content="$(toolstore_txn_load_record "$SCRIPT_DIR")" || return 1
+  state="$(toolstore_txn_env_value "$content" STATE)"
+  if [[ "$state" == "authoritative" &&
+    "${TOOLSTORE_TXN_CONTINUE_REQUEST:-}" == "$(toolstore_txn_env_value "$content" REQUEST_ID)" ]]; then
+    toolstore_txn_verify_backup "$SCRIPT_DIR" >/dev/null || return 1
+    return 0
+  fi
+  stop_deploy_isolated_candidate || return 1
+  if [[ "$state" == "committed" ]]; then
+    candidate_image="$(toolstore_txn_env_value "$content" CANDIDATE_IMAGE)"
+    persist_deploy_image_env "$ENV_FILE" "$candidate_image" || return 1
+    if [[ -e "$(deploy_rollback_snapshot_path)" || -L "$(deploy_rollback_snapshot_path)" ]]; then
+      DEPLOY_ROLLBACK_ENV_CONTENT="$(load_deploy_rollback_snapshot)" || return 1
+      DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+      remove_deploy_rollback_snapshot || return 1
+      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+      DEPLOY_ROLLBACK_ENV_CONTENT=""
+    fi
+    NEWAPI_TOOLS_IMAGE="$candidate_image"
+    export NEWAPI_TOOLS_IMAGE
+    configure_deploy_context_from_env "$ENV_FILE" || return 1
+    start_deploy_services_and_wait candidate "$candidate_image" || return 1
+    toolstore_txn_finish_committed "$SCRIPT_DIR" || return 1
+    return 0
+  fi
+  if [[ "$state" == "rolled_back" ]]; then
+    toolstore_txn_restore_files "$SCRIPT_DIR" || return 1
+    rollback_image="$(toolstore_txn_env_value "$content" OLD_IMAGE)"
+    configure_deploy_context_from_env "$ENV_FILE" || return 1
+    start_deploy_services_and_wait rollback "$rollback_image" || return 1
+    toolstore_txn_retire_rolled_back "$SCRIPT_DIR" || return 1
+    log_success "已验证上次回滚后的旧服务，并保留回滚证据；下一候选将创建全新备份"
+    return 0
+  fi
+  log_warn "检测到未完成的 Tool Store 事务 $(toolstore_txn_env_value "$content" REQUEST_ID)，先恢复旧数据库与旧镜像"
+  toolstore_txn_restore_files "$SCRIPT_DIR" || return 1
+  toolstore_txn_unstage_data "$SCRIPT_DIR" || return 1
+  content="$(toolstore_txn_load_record "$SCRIPT_DIR")" || return 1
+  rollback_image="$(toolstore_txn_env_value "$content" OLD_IMAGE)"
+  configure_deploy_context_from_env "$ENV_FILE" || return 1
+  if [[ "$state" == "preparing" || "$state" == "preflight" ]]; then
+    start_deploy_services_and_wait rollback "$rollback_image" || return 1
+    toolstore_txn_retire_preflight "$SCRIPT_DIR" || return 1
+    return 0
+  fi
+  if ! run_deploy_compose "$ENV_FILE" "$rollback_image" down; then
+    log_warn "清理中断事务容器返回失败；仍尝试在数据库恢复后重建旧服务"
+  fi
+  toolstore_txn_restore_database "$SCRIPT_DIR" || return 1
+  start_deploy_services_and_wait rollback "$rollback_image" || return 1
+  toolstore_txn_mark_rolled_back "$SCRIPT_DIR" || return 1
+  toolstore_txn_retire_rolled_back "$SCRIPT_DIR" || return 1
+  log_success "已恢复并验证中断事务前的 Tool Store、旧配置和旧镜像"
 }
 
 recover_preexisting_deploy_rollback_snapshot() {
@@ -1941,6 +2292,9 @@ recover_preexisting_deploy_rollback_snapshot() {
 #######################################
 start_services() {
   log_info "启动服务..."
+
+  validate_deploy_credential_separation_file "$ENV_FILE" ||
+    die "凭据预检失败；候选服务未拉取、停止或启动"
 
   [[ "$DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING" != "true" ]] ||
     die "检测到尚未恢复的中断部署快照；拒绝在当前可能是候选版本的容器上继续"
@@ -2104,6 +2458,28 @@ start_services() {
   fi
   local candidate_image="$NEWAPI_TOOLS_IMAGE"
 
+  if [[ "$had_rollback_deployment" == "true" ]]; then
+    local toolstore_config_source="$ENV_FILE" toolstore_host_path
+    if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      toolstore_config_source="$(deploy_rollback_snapshot_path)"
+    fi
+    if ! toolstore_host_path="$(toolstore_txn_resolve_db_path "$toolstore_config_source" "$SCRIPT_DIR")"; then
+      die "旧部署的 TOOL_STORE_PATH 为空、越界或穿越 symlink；拒绝停止旧服务"
+    fi
+    if [[ -e "$toolstore_host_path" || -L "$toolstore_host_path" ]]; then
+      [[ -f "$toolstore_host_path" && ! -L "$toolstore_host_path" ]] ||
+        die "旧部署的 Tool Store 不是安全的常规文件；拒绝停止旧服务"
+      if ! toolstore_txn_prepare "$toolstore_config_source" "$SCRIPT_DIR" \
+        "$rollback_image" "$candidate_image" "$candidate_image"; then
+        restore_deploy_previous_configuration "$rollback_env_content" "$rollback_image" ||
+          log_error "高危：Tool Store 备份失败后无法恢复完整旧配置"
+        die "候选切换前无法创建并二次验证 Tool Store Online Backup；旧服务保持运行，未清理任何目录"
+      fi
+    else
+      log_warn "旧部署没有 Tool Store 文件，按 pre-Tool-Store 兼容升级处理；候选仍必须通过内容健康检查"
+    fi
+  fi
+
   # 检查是否有旧容器
   if [[ "$had_existing_service" == "true" ]]; then
     log_warn "发现已存在的服务容器，正在停止..."
@@ -2117,24 +2493,55 @@ start_services() {
   fi
 
   local candidate_healthy=false
-  if (start_deploy_services_and_wait candidate "$candidate_image"); then
+  if toolstore_txn_has_active "$SCRIPT_DIR"; then
+    if ! toolstore_txn_authoritative_backup "$SCRIPT_DIR" ||
+      ! toolstore_txn_mark_candidate "$SCRIPT_DIR"; then
+      recover_active_deploy_toolstore_transaction ||
+        die "旧服务已停止，但无法建立权威 Tool Store 回滚锚点且自动恢复失败"
+      die "候选版本尚未启动；权威 Tool Store 备份失败后已恢复旧服务"
+    fi
+    if (start_deploy_isolated_candidate_and_wait "$candidate_image"); then
+      candidate_healthy=true
+    else
+      stop_deploy_isolated_candidate ||
+        die "隔离候选停止身份或容器 ID 无法验证；禁止恢复数据库或启动旧服务"
+      log_error "隔离候选未在 180 秒内达到健康状态或运行时网络恢复失败"
+    fi
+  elif (start_deploy_services_and_wait candidate "$candidate_image"); then
     candidate_healthy=true
   else
     log_error "候选服务未在 180 秒内达到健康状态或运行时网络恢复失败"
   fi
 
   if [[ "$candidate_healthy" == "true" ]]; then
+    if toolstore_txn_has_active "$SCRIPT_DIR"; then
+      if ! stop_deploy_isolated_candidate || ! toolstore_txn_verify_candidate "$SCRIPT_DIR"; then
+        candidate_healthy=false
+        log_error "隔离候选停止或 Tool Store schema/关键表验证失败，将执行数据库与镜像回滚"
+      fi
+    fi
+  fi
+
+  if [[ "$candidate_healthy" == "true" ]]; then
     if (persist_deploy_image_env "$ENV_FILE" "$candidate_image"); then
       NEWAPI_TOOLS_IMAGE="$candidate_image"
       export NEWAPI_TOOLS_IMAGE
-      if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" != "true" ]] ||
-        (remove_deploy_rollback_snapshot); then
+      if toolstore_txn_has_active "$SCRIPT_DIR" &&
+        ! toolstore_txn_verify_candidate "$SCRIPT_DIR"; then
+        candidate_healthy=false
+        log_error "候选服务健康，但 Tool Store schema/核心表计数验证失败，将执行数据库与镜像回滚"
+      elif toolstore_txn_has_active "$SCRIPT_DIR" &&
+        ! toolstore_txn_commit "$SCRIPT_DIR"; then
+        candidate_healthy=false
+        log_error "候选服务已健康，但 Tool Store 回滚事务无法提交，将执行回滚"
+      elif [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]] &&
+        ! (remove_deploy_rollback_snapshot); then
+        candidate_healthy=false
+        log_error "候选镜像已提交，但无法清除旧配置回滚快照"
+      else
         DEPLOY_ROLLBACK_ENV_AVAILABLE=false
         DEPLOY_ROLLBACK_ENV_CONTENT=""
         log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
-      else
-        candidate_healthy=false
-        log_error "候选服务已健康且镜像已提交，但无法清除旧配置回滚快照，将执行回滚"
       fi
     else
       candidate_healthy=false
@@ -2142,7 +2549,34 @@ start_services() {
     fi
   fi
 
+  if toolstore_txn_has_active "$SCRIPT_DIR"; then
+    local committed_content committed_state
+    committed_content="$(toolstore_txn_load_record "$SCRIPT_DIR")" ||
+      die "无法读取候选晋升事务状态；拒绝猜测是否可回滚"
+    committed_state="$(toolstore_txn_env_value "$committed_content" STATE)"
+    if [[ "$committed_state" == "committed" ]]; then
+      if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+        (remove_deploy_rollback_snapshot) ||
+          die "Tool Store 已提交；旧配置快照清理失败，事务证据已保留供重试，禁止回滚旧 schema"
+      fi
+      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+      DEPLOY_ROLLBACK_ENV_CONTENT=""
+      if start_deploy_services_and_wait candidate "$candidate_image"; then
+        toolstore_txn_finish_committed "$SCRIPT_DIR" ||
+          die "正式候选已健康，但无法完成 Tool Store 提交证据清理"
+        candidate_healthy=true
+        log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
+      else
+        die "Tool Store 已提交且不能安全回滚；正式候选启动失败，事务证据已保留供下次继续晋升"
+      fi
+    fi
+  fi
+
   if [[ "$candidate_healthy" != "true" ]]; then
+    if toolstore_txn_has_active "$SCRIPT_DIR"; then
+      stop_deploy_isolated_candidate ||
+        die "无法证明隔离候选已停止；禁止恢复数据库或启动旧服务"
+    fi
     if [[ "$had_rollback_deployment" != "true" ]]; then
       if ! run_deploy_compose "$ENV_FILE" "$candidate_image" down --remove-orphans; then
         log_error "清理首次安装候选 Compose 项目失败；将强制移除已知的可重启容器"
@@ -2415,6 +2849,7 @@ main() {
   need_cmd flock
   need_cmd id
   need_cmd sha256sum
+  need_cmd realpath
   need_cmd stat
   need_cmd sync
   detect_docker_compose
@@ -2439,6 +2874,11 @@ main() {
       # 正常部署流程
       acquire_deploy_state_lock "$SCRIPT_DIR"
       resolve_deploy_image
+      local resolved_candidate_image="$NEWAPI_TOOLS_IMAGE"
+      recover_active_deploy_toolstore_transaction ||
+        die "未完成的 Tool Store 事务无法安全恢复；拒绝生成或启动新候选配置"
+      NEWAPI_TOOLS_IMAGE="$resolved_candidate_image"
+      export NEWAPI_TOOLS_IMAGE
       echo ""
       echo -e "${BLUE}========================================${NC}"
       echo -e "${BLUE}  NewAPI Middleware Tool 部署脚本${NC}"
@@ -2452,6 +2892,10 @@ main() {
       local existing_container_names
       existing_container_names="$(list_deploy_container_names)" ||
         die "无法可靠枚举现有 Docker 容器；拒绝覆盖可能正在使用的 .env"
+      if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+        validate_deploy_credential_separation_file "$ENV_FILE" ||
+          die "凭据预检失败；拒绝更新现有部署"
+      fi
       capture_deploy_rollback_env "$existing_container_names"
       recover_preexisting_deploy_rollback_snapshot ||
         die "检测到中断部署，但无法恢复持久化的旧服务；拒绝继续"

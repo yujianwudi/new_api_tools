@@ -7,41 +7,8 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'index.html'
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'docker-compose*.yml'
-      - '.env.example'
-      - 'deploy.sh'
-      - 'install.sh'
-      - 'setup-log-db.sh'
-      - 'tests/**'
-      - 'README.md'
-      - 'RELEASE_*.md'
-      - '.github/dependabot.yml'
-      - '.github/workflows/**'
-      - '!**/.gitignore'
   pull_request:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'index.html'
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'docker-compose*.yml'
-      - '.env.example'
-      - 'deploy.sh'
-      - 'install.sh'
-      - 'setup-log-db.sh'
-      - 'tests/**'
-      - 'README.md'
-      - 'RELEASE_*.md'
-      - '.github/dependabot.yml'
-      - '.github/workflows/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -55,7 +22,7 @@ jobs:
   quality:
     name: Test and security gates
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     outputs:
       release_tag_oid: ${{ steps.release_identity.outputs.tag_oid }}
       release_tag_commit: ${{ steps.release_identity.outputs.tag_commit }}
@@ -143,6 +110,9 @@ jobs:
         run: |
           bash -n deploy.sh install.sh setup-log-db.sh
           bash tests/deploy_dsn_test.sh
+          bash tests/toolstore_transaction_test.sh
+          bash tests/install_clone_recovery_test.sh
+          bash tests/release_performance_gate_test.sh
           bash tests/setup_log_db_safety_test.sh
           bash tests/supply_chain_pins_test.sh
           docker compose config --quiet
@@ -156,9 +126,22 @@ jobs:
           go-version-file: backend/go.mod
           cache: false
 
+      - name: Drill real Tool Store v9 migration and rollback
+        run: bash tests/toolstore_sqlite_rollback_drill.sh
+
       - name: Run Go tests
         working-directory: backend
         run: go test ./...
+
+      - name: Run all release performance acceptance gates
+        if: github.ref_type == 'tag'
+        working-directory: backend
+        env:
+          AFFILIATE_PERF: '1'
+        run: |
+          go test ./internal/service -run '^TestAffiliateStatsPerformanceAcceptance$' -count=1 -v -timeout 10m
+          go test -tags=performance -run '^TestModelStatusPerformanceSLO$' -count=1 -v ./internal/handler
+          go test -tags=performance -run '^TestUserManagementPerformanceSLO$' -count=1 -v ./internal/service
 
       - name: Run Go race detector
         working-directory: backend
@@ -195,6 +178,10 @@ jobs:
       - name: Test frontend invoice reliability guards
         run: node tests/frontend_invoice_reliability_test.mjs
 
+      - name: Run frontend component and state tests
+        working-directory: frontend
+        run: npm test
+
       - name: Lint frontend
         working-directory: frontend
         run: npm run lint
@@ -207,9 +194,13 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Audit production dependencies
+      - name: Audit all dependencies for high severity vulnerabilities
         working-directory: frontend
-        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Audit production dependencies for moderate severity vulnerabilities
+        working-directory: frontend
+        run: npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org
 
   build:
     needs: quality
@@ -255,7 +246,7 @@ jobs:
         id: build_identity
         shell: bash
         run: |
-          version="0.6.0-dev"
+          version="0.6.1-dev"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
           fi
@@ -306,6 +297,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      id-token: write
       packages: write
 
     steps:
@@ -442,3 +434,140 @@ jobs:
             ($platforms | index("linux/amd64")) != null and
             ($platforms | index("linux/arm64")) != null
           '
+
+      - name: Install Cosign
+        if: github.ref_type == 'tag'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.2
+
+      - name: Sign, attest, and verify immutable release manifest
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+          manifest_digest="$(docker buildx imagetools inspect "$image" |
+            awk '$1 == "Digest:" { print $2; found++ } END { if (found != 1) exit 1 }')"
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "release manifest digest is invalid: $manifest_digest" >&2
+            exit 1
+          }
+          subject="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${manifest_digest}"
+          certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/build.yml@${GITHUB_REF}"
+          signed=false
+          for attempt in 1 2 3; do
+            if cosign sign --yes \
+              -a "git_sha=${GITHUB_SHA}" \
+              -a "tag=${GITHUB_REF_NAME}" \
+              "$subject"; then
+              signed=true
+              break
+            fi
+            echo "Cosign signing attempt ${attempt}/3 failed" >&2
+            sleep 5
+          done
+          [[ "$signed" == true ]] || {
+            echo "release manifest signing failed after three attempts" >&2
+            exit 1
+          }
+          cosign verify \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-name "Build and Push Docker Image" \
+            --certificate-github-workflow-trigger "push" \
+            -a "git_sha=${GITHUB_SHA}" \
+            -a "tag=${GITHUB_REF_NAME}" \
+            "$subject" >/dev/null
+
+          manifest_json="$(docker buildx imagetools inspect --raw "$subject")"
+          amd64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest] | if length == 1 then .[0] else error("amd64 digest cardinality") end' <<< "$manifest_json")"
+          arm64_digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest] | if length == 1 then .[0] else error("arm64 digest cardinality") end' <<< "$manifest_json")"
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ && "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          predicate_file="$(mktemp)"
+          policy_file="$(mktemp)"
+          trap 'rm -f -- "$predicate_file" "$policy_file"' EXIT
+          jq -n \
+            --arg build_type "$certificate_identity" \
+            --arg repository "https://github.com/${GITHUB_REPOSITORY}" \
+            --arg ref "$GITHUB_REF" \
+            --arg revision "$GITHUB_SHA" \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg manifest_digest "$manifest_digest" \
+            --arg amd64_digest "$amd64_digest" \
+            --arg arm64_digest "$arm64_digest" \
+            --arg dependency "git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF}" \
+            --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            '{
+              buildDefinition: {
+                buildType: $build_type,
+                externalParameters: {
+                  repository: $repository, ref: $ref, revision: $revision, tag: $tag,
+                  manifest_digest: $manifest_digest,
+                  platform_digests: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}
+                },
+                internalParameters: {},
+                resolvedDependencies: [{uri: $dependency, digest: {gitCommit: $revision}}]
+              },
+              runDetails: {builder: {id: $build_type}, metadata: {invocationId: $invocation}}
+            }' > "$predicate_file"
+
+          attested=false
+          for attempt in 1 2 3; do
+            if cosign attest --yes \
+              --type slsaprovenance1 \
+              --predicate "$predicate_file" \
+              -a "git_sha=${GITHUB_SHA}" \
+              -a "tag=${GITHUB_REF_NAME}" \
+              "$subject"; then
+              attested=true
+              break
+            fi
+            echo "Cosign provenance attestation attempt ${attempt}/3 failed" >&2
+            sleep 5
+          done
+          [[ "$attested" == true ]] || {
+            echo "release provenance attestation failed after three attempts" >&2
+            exit 1
+          }
+
+          cat > "$policy_file" <<EOF
+          package newapi_tools_release
+          "_type": "https://in-toto.io/Statement/v1"
+          predicateType: "https://slsa.dev/provenance/v1"
+          subject: [{name: "${REGISTRY}/${IMAGE_NAME}", digest: sha256: "${manifest_digest#sha256:}"}]
+          predicate: {
+            buildDefinition: {
+              buildType: "${certificate_identity}"
+              externalParameters: {
+                repository: "https://github.com/${GITHUB_REPOSITORY}"
+                ref: "${GITHUB_REF}"
+                revision: "${GITHUB_SHA}"
+                tag: "${GITHUB_REF_NAME}"
+                manifest_digest: "${manifest_digest}"
+                platform_digests: {"linux/amd64": "${amd64_digest}", "linux/arm64": "${arm64_digest}"}
+              }
+              resolvedDependencies: [{
+                uri: "git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF}"
+                digest: gitCommit: "${GITHUB_SHA}"
+              }]
+            }
+            runDetails: builder: id: "${certificate_identity}"
+          }
+          EOF
+          cosign verify-attestation \
+            --type slsaprovenance1 \
+            --policy "$policy_file" \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-name "Build and Push Docker Image" \
+            --certificate-github-workflow-trigger "push" \
+            -a "git_sha=${GITHUB_SHA}" \
+            -a "tag=${GITHUB_REF_NAME}" \
+            "$subject" >/dev/null

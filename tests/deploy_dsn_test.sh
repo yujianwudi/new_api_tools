@@ -472,6 +472,272 @@ assert_rejected \
   'release tag checkout without explicit digest and revision fails closed' \
   resolve_deploy_identity_fixture tag-checkout
 
+fake_cosign_runner() {
+  local command="${1:-}"
+  [[ "$command" == 'verify' || "$command" == 'verify-attestation' ]] || return 1
+  shift
+  local identity='' issuer='' repository='' workflow_ref='' workflow_sha=''
+  local workflow_name='' workflow_trigger='' annotation_sha='' annotation_tag='' subject=''
+  local predicate_type='' policy_file=''
+  while (( $# > 0 )); do
+    case "$1" in
+      --type) predicate_type="${2:-}"; shift 2 ;;
+      --policy) policy_file="${2:-}"; shift 2 ;;
+      --certificate-identity) identity="${2:-}"; shift 2 ;;
+      --certificate-oidc-issuer) issuer="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-repository) repository="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-ref) workflow_ref="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-sha) workflow_sha="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-name) workflow_name="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-trigger) workflow_trigger="${2:-}"; shift 2 ;;
+      -a)
+        case "${2:-}" in
+          git_sha=*) annotation_sha="${2#git_sha=}" ;;
+          tag=*) annotation_tag="${2#tag=}" ;;
+          *) return 1 ;;
+        esac
+        shift 2
+        ;;
+      --*) return 1 ;;
+      *)
+        [[ -z "$subject" ]] || return 1
+        subject="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ "$identity" == "$FAKE_COSIGN_IDENTITY" &&
+     "$issuer" == "$FAKE_COSIGN_ISSUER" &&
+     "$repository" == "$FAKE_COSIGN_REPOSITORY" &&
+     "$workflow_ref" == "$FAKE_COSIGN_REF" &&
+     "$workflow_sha" == "$FAKE_COSIGN_SHA" &&
+     "$workflow_name" == "$FAKE_COSIGN_NAME" &&
+     "$workflow_trigger" == "$FAKE_COSIGN_TRIGGER" &&
+     "$annotation_sha" == "$FAKE_COSIGN_ANNOTATION_SHA" &&
+     "$annotation_tag" == "$FAKE_COSIGN_ANNOTATION_TAG" &&
+     "$subject" == "$FAKE_COSIGN_SUBJECT" ]] || return 1
+
+  [[ "$command" == 'verify-attestation' ]] || return 0
+  [[ "$predicate_type" == 'slsaprovenance1' && -f "$policy_file" && ! -L "$policy_file" ]] || return 1
+  grep -Fq '"_type": "https://in-toto.io/Statement/v1"' "$policy_file" &&
+    grep -Fq 'predicateType: "https://slsa.dev/provenance/v1"' "$policy_file" &&
+    grep -Fq "name: \"${FAKE_PROVENANCE_SUBJECT_NAME}\"" "$policy_file" &&
+    grep -Fq "digest: sha256: \"${FAKE_PROVENANCE_SUBJECT_DIGEST}\"" "$policy_file" &&
+    grep -Fq "buildType: \"${FAKE_PROVENANCE_BUILD_TYPE}\"" "$policy_file" &&
+    grep -Fq "repository: \"${FAKE_PROVENANCE_REPOSITORY}\"" "$policy_file" &&
+    grep -Fq "ref: \"${FAKE_PROVENANCE_REF}\"" "$policy_file" &&
+    grep -Fq "revision: \"${FAKE_PROVENANCE_REVISION}\"" "$policy_file" &&
+    grep -Fq "tag: \"${FAKE_PROVENANCE_TAG}\"" "$policy_file" &&
+    grep -Fq "manifest_digest: \"${FAKE_PROVENANCE_MANIFEST_DIGEST}\"" "$policy_file" &&
+    grep -Fq "uri: \"${FAKE_PROVENANCE_DEPENDENCY}\"" "$policy_file" &&
+    grep -Fq "digest: gitCommit: \"${FAKE_PROVENANCE_REVISION}\"" "$policy_file" &&
+    grep -Fq '"linux/amd64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
+    grep -Fq '"linux/arm64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
+    [[ "$FAKE_PROVENANCE_AMD64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
+       "$FAKE_PROVENANCE_ARM64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+verify_release_signature_fixture() (
+  local verifier="$1" workflow_kind="$2" mutation="${3:-none}"
+  local release_tag='v0.6.1' workflow_file workflow_name workflow_trigger
+  case "$workflow_kind" in
+    build)
+      workflow_file='build.yml'
+      workflow_name='Build and Push Docker Image'
+      workflow_trigger='push'
+      ;;
+    recovery)
+      workflow_file='release-recovery.yml'
+      workflow_name='Recover Release Image From Existing Tag'
+      workflow_trigger='workflow_dispatch'
+      ;;
+    *) return 1 ;;
+  esac
+
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
+  FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
+  FAKE_COSIGN_REF="refs/tags/${release_tag}"
+  FAKE_COSIGN_SHA="$test_commit"
+  FAKE_COSIGN_NAME="$workflow_name"
+  FAKE_COSIGN_TRIGGER="$workflow_trigger"
+  FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
+  FAKE_COSIGN_ANNOTATION_TAG="$release_tag"
+  FAKE_COSIGN_SUBJECT="$resolved_test_image"
+
+  case "$mutation" in
+    none) ;;
+    identity) FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/forged.yml@refs/tags/${release_tag}" ;;
+    issuer) FAKE_COSIGN_ISSUER='https://issuer.example.invalid' ;;
+    repository) FAKE_COSIGN_REPOSITORY='attacker/new_api_tools' ;;
+    ref) FAKE_COSIGN_REF='refs/heads/main' ;;
+    sha) FAKE_COSIGN_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
+    name) FAKE_COSIGN_NAME='Forged Workflow' ;;
+    trigger) FAKE_COSIGN_TRIGGER='pull_request' ;;
+    annotation-sha) FAKE_COSIGN_ANNOTATION_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
+    annotation-tag) FAKE_COSIGN_ANNOTATION_TAG='v9.9.9' ;;
+    digest) FAKE_COSIGN_SUBJECT='ghcr.io/yujianwudi/new_api_tools@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    *) return 1 ;;
+  esac
+
+  NEWAPI_TOOLS_COSIGN_RUNNER=fake_cosign_runner
+  "$verifier" "$resolved_test_image" "$release_tag" "$test_commit"
+)
+
+verify_release_provenance_fixture() (
+  local verifier="$1" workflow_kind="$2" mutation="${3:-none}"
+  local release_tag='v0.6.1' workflow_file workflow_name workflow_trigger
+  case "$workflow_kind" in
+    build)
+      workflow_file='build.yml'
+      workflow_name='Build and Push Docker Image'
+      workflow_trigger='push'
+      ;;
+    recovery)
+      workflow_file='release-recovery.yml'
+      workflow_name='Recover Release Image From Existing Tag'
+      workflow_trigger='workflow_dispatch'
+      ;;
+    *) return 1 ;;
+  esac
+
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
+  FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
+  FAKE_COSIGN_REF="refs/tags/${release_tag}"
+  FAKE_COSIGN_SHA="$test_commit"
+  FAKE_COSIGN_NAME="$workflow_name"
+  FAKE_COSIGN_TRIGGER="$workflow_trigger"
+  FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
+  FAKE_COSIGN_ANNOTATION_TAG="$release_tag"
+  FAKE_COSIGN_SUBJECT="$resolved_test_image"
+  FAKE_PROVENANCE_SUBJECT_NAME='ghcr.io/yujianwudi/new_api_tools'
+  FAKE_PROVENANCE_SUBJECT_DIGEST="${resolved_test_image##*@sha256:}"
+  FAKE_PROVENANCE_BUILD_TYPE="$FAKE_COSIGN_IDENTITY"
+  FAKE_PROVENANCE_REPOSITORY='https://github.com/yujianwudi/new_api_tools'
+  FAKE_PROVENANCE_REF="refs/tags/${release_tag}"
+  FAKE_PROVENANCE_REVISION="$test_commit"
+  FAKE_PROVENANCE_TAG="$release_tag"
+  FAKE_PROVENANCE_MANIFEST_DIGEST="${resolved_test_image##*@}"
+  FAKE_PROVENANCE_DEPENDENCY="git+https://github.com/yujianwudi/new_api_tools@refs/tags/${release_tag}"
+  FAKE_PROVENANCE_AMD64_DIGEST='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  FAKE_PROVENANCE_ARM64_DIGEST='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+  case "$mutation" in
+    none) ;;
+    subject-name) FAKE_PROVENANCE_SUBJECT_NAME='ghcr.io/attacker/new_api_tools' ;;
+    subject-digest) FAKE_PROVENANCE_SUBJECT_DIGEST='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    build-type) FAKE_PROVENANCE_BUILD_TYPE='https://github.com/attacker/workflows/build.yml@refs/tags/v0.6.1' ;;
+    repository) FAKE_PROVENANCE_REPOSITORY='https://github.com/attacker/new_api_tools' ;;
+    ref) FAKE_PROVENANCE_REF='refs/heads/main' ;;
+    revision) FAKE_PROVENANCE_REVISION='ffffffffffffffffffffffffffffffffffffffff' ;;
+    tag) FAKE_PROVENANCE_TAG='v9.9.9' ;;
+    manifest) FAKE_PROVENANCE_MANIFEST_DIGEST='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    dependency) FAKE_PROVENANCE_DEPENDENCY='git+https://github.com/attacker/new_api_tools@refs/heads/main' ;;
+    platform) FAKE_PROVENANCE_AMD64_DIGEST='not-a-digest' ;;
+    *) return 1 ;;
+  esac
+
+  NEWAPI_TOOLS_COSIGN_RUNNER=fake_cosign_runner
+  "$verifier" "$resolved_test_image" "$release_tag" "$test_commit"
+)
+
+for verifier in verify_install_release_signature verify_deploy_release_signature; do
+  assert_eq \
+    "${verifier} accepts the exact protected build workflow identity" \
+    '' \
+    verify_release_signature_fixture "$verifier" build
+  assert_eq \
+    "${verifier} accepts the exact protected recovery workflow identity" \
+    '' \
+    verify_release_signature_fixture "$verifier" recovery
+  for mutation in identity issuer repository ref sha name trigger annotation-sha annotation-tag digest; do
+    assert_rejected \
+      "${verifier} rejects forged release certificate field ${mutation}" \
+      verify_release_signature_fixture "$verifier" build "$mutation"
+  done
+done
+
+for verifier in verify_install_release_provenance verify_deploy_release_provenance; do
+  assert_eq \
+    "${verifier} accepts exact build provenance content" \
+    '' \
+    verify_release_provenance_fixture "$verifier" build
+  assert_eq \
+    "${verifier} accepts exact recovery provenance content" \
+    '' \
+    verify_release_provenance_fixture "$verifier" recovery
+  for mutation in subject-name subject-digest build-type repository ref revision tag manifest dependency platform; do
+    assert_rejected \
+      "${verifier} rejects forged provenance field ${mutation}" \
+      verify_release_provenance_fixture "$verifier" build "$mutation"
+  done
+done
+
+credential_separation_fixture() (
+  local mode="$1" first="${2:-}" second="${3:-}" content='' name value
+  local -a credential_names=(
+    ADMIN_PASSWORD API_KEY JWT_SECRET NEWAPI_ADMIN_ACCESS_TOKEN MODEL_PROBE_API_KEY OBSERVABILITY_TOKEN
+  )
+  for name in "${credential_names[@]}"; do
+    value="unique-${name}"
+    if [[ "$mode" == 'duplicate' && ( "$name" == "$first" || "$name" == "$second" ) ]]; then
+      value='duplicated-secret-that-must-never-be-logged'
+    fi
+    content+="${name}=${value}"$'\n'
+  done
+
+  if [[ "$mode" == 'distinct' ]]; then
+    validate_install_credential_separation_content "$content"
+    validate_deploy_credential_separation_content "$content"
+    printf 'accepted\n'
+    return
+  fi
+  if validate_install_credential_separation_content "$content" >/dev/null 2>&1; then
+    return 1
+  fi
+  if validate_deploy_credential_separation_content "$content" >/dev/null 2>&1; then
+    return 1
+  fi
+  printf 'rejected\n'
+)
+
+assert_eq \
+  'install and deploy accept six distinct credential values' \
+  'accepted' \
+  credential_separation_fixture distinct
+
+credential_names=(
+  ADMIN_PASSWORD API_KEY JWT_SECRET NEWAPI_ADMIN_ACCESS_TOKEN MODEL_PROBE_API_KEY OBSERVABILITY_TOKEN
+)
+for ((credential_left = 0; credential_left < ${#credential_names[@]}; credential_left++)); do
+  for ((credential_right = credential_left + 1; credential_right < ${#credential_names[@]}; credential_right++)); do
+    assert_eq \
+      "install and deploy reject reuse between ${credential_names[credential_left]} and ${credential_names[credential_right]}" \
+      'rejected' \
+      credential_separation_fixture duplicate \
+      "${credential_names[credential_left]}" "${credential_names[credential_right]}"
+  done
+done
+
+credential_error_redaction_result() (
+  local content output status secret='duplicated-secret-that-must-never-be-logged'
+  content="ADMIN_PASSWORD=${secret}"$'\n'"API_KEY=${secret}"$'\n'
+  set +e
+  output="$(validate_deploy_credential_separation_content "$content" 2>&1)"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || return 1
+  [[ "$output" == *ADMIN_PASSWORD* && "$output" == *API_KEY* ]] || return 1
+  [[ "$output" != *"$secret"* ]] || return 1
+  printf 'names-only\n'
+)
+
+assert_eq \
+  'credential reuse errors expose variable names but never secret values or hashes' \
+  'names-only' \
+  credential_error_redaction_result
+
 resolve_deploy_digest_candidates_fixture() (
   local mode="$1"
   docker() {
@@ -3198,7 +3464,8 @@ deploy_generate_env_atomic_result() (
   USE_HOST_MODE=false
   USE_BRIDGE_MODE=false
   DEPLOY_ENV_GENERATED_THIS_RUN=false
-  unset NEWAPI_BASEURL OBSERVABILITY_TOKEN
+  unset NEWAPI_BASEURL
+  OBSERVABILITY_TOKEN='observability-secret'
   log_info() { :; }
   log_success() { :; }
   log_error() { :; }

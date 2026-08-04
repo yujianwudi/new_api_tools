@@ -21,6 +21,7 @@ import (
 	"github.com/new-api-tools/backend/internal/modelprobe"
 	"github.com/new-api-tools/backend/internal/newapi"
 	"github.com/new-api-tools/backend/internal/observability"
+	"github.com/new-api-tools/backend/internal/service"
 	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
@@ -30,6 +31,9 @@ func main() {
 
 	// ========== 2. Initialize logger ==========
 	logger.Init(cfg.LogLevel, cfg.LogFile)
+	if err := cfg.ValidateSecurity(); err != nil {
+		logger.L.Fatal("安全配置校验失败: " + err.Error())
+	}
 	logger.L.Banner("🚀 NewAPI Middleware Tool - Go Backend")
 	logger.L.System(fmt.Sprintf("服务器地址: %s", cfg.ServerAddr()))
 	logger.L.System(fmt.Sprintf("数据库引擎: %s", cfg.DatabaseEngine))
@@ -75,14 +79,29 @@ func main() {
 	}
 
 	// ========== 5. Initialize Redis cache ==========
+	var legacyModelConfigReader service.LegacyModelStatusConfigReader
 	if cfg.RedisConnString != "" {
-		_, err := cache.Init(cfg.RedisConnString)
+		cacheManager, err := cache.Init(cfg.RedisConnString)
 		if err != nil {
 			logger.L.Warn("Redis 连接失败，将使用无缓存模式: " + err.Error())
+		} else {
+			legacyModelConfigReader = cacheManager
 		}
 	} else {
 		logger.L.Warn("REDIS_CONN_STRING 未配置，缓存功能不可用")
 	}
+	legacyImportCtx, cancelLegacyImport := context.WithTimeout(context.Background(), 15*time.Second)
+	_, importedLegacyModelConfig, err := service.ImportLegacyModelStatusConfig(
+		legacyImportCtx, toolStore, legacyModelConfigReader, cfg.RedisConnString != "",
+	)
+	cancelLegacyImport()
+	if err != nil {
+		logger.L.Fatal("模型状态 legacy Redis 配置迁移失败: " + err.Error())
+	}
+	if importedLegacyModelConfig {
+		logger.L.System("模型状态配置已完成一次性 Tool Store 导入")
+	}
+	service.ConfigureModelStatusConfigRuntime(toolStore, cache.Get(), cfg.RedisConnString != "")
 	defer cache.Close()
 
 	// ========== 6. Setup Gin router ==========

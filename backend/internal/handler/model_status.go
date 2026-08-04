@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,14 +12,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/config"
+	"github.com/new-api-tools/backend/internal/middleware"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
+	"github.com/new-api-tools/backend/internal/toolstore"
 )
 
 const (
 	maxTrackedPublicModelClients         = 10000
 	authenticatedModelStatusMaxBatch     = 200
+	authenticatedModelStatusMaxAll       = 1000
 	authenticatedModelStatusMaxBodyBytes = int64(1 << 20)
 )
 
@@ -88,6 +95,7 @@ func PublicModelStatusRateLimit() gin.HandlerFunc {
 // RegisterModelStatusRoutes registers /api/model-status endpoints (auth required)
 func RegisterModelStatusRoutes(r *gin.RouterGroup) {
 	g := r.Group("/model-status")
+	operator := auth.RequireRole(auth.RoleOperator)
 	{
 		g.GET("/time-windows", GetTimeWindows)
 		g.GET("/models", GetAvailableModels)
@@ -96,31 +104,32 @@ func RegisterModelStatusRoutes(r *gin.RouterGroup) {
 		g.POST("/status/batch", GetMultipleModelsStatusHandler)
 		g.GET("/status/all", GetAllModelsStatusHandler)
 		g.GET("/selected", GetSelectedModels)
-		g.PUT("/selected", SetSelectedModels)
+		g.PUT("/selected", operator, SetSelectedModels)
 		g.GET("/config/selected", GetSelectedModels)
-		g.POST("/config/selected", SetSelectedModels)
+		g.PUT("/config/selected", operator, SetSelectedModels)
+		g.POST("/config/selected", operator, SetSelectedModels)
 		g.GET("/config/time-window", GetTimeWindowConfig)
-		g.PUT("/config/time-window", SetTimeWindowConfig)
-		g.PUT("/config/window", SetTimeWindowConfig)
-		g.POST("/config/window", SetTimeWindowConfig)
+		g.PUT("/config/time-window", operator, SetTimeWindowConfig)
+		g.PUT("/config/window", operator, SetTimeWindowConfig)
+		g.POST("/config/window", operator, SetTimeWindowConfig)
 		g.GET("/config/theme", GetThemeConfig)
-		g.PUT("/config/theme", SetThemeConfig)
-		g.POST("/config/theme", SetThemeConfig)
+		g.PUT("/config/theme", operator, SetThemeConfig)
+		g.POST("/config/theme", operator, SetThemeConfig)
 		g.GET("/config/refresh-interval", GetRefreshIntervalConfig)
-		g.PUT("/config/refresh-interval", SetRefreshIntervalConfig)
-		g.PUT("/config/refresh", SetRefreshIntervalConfig)
-		g.POST("/config/refresh", SetRefreshIntervalConfig)
+		g.PUT("/config/refresh-interval", operator, SetRefreshIntervalConfig)
+		g.PUT("/config/refresh", operator, SetRefreshIntervalConfig)
+		g.POST("/config/refresh", operator, SetRefreshIntervalConfig)
 		g.GET("/config/sort-mode", GetSortModeConfig)
-		g.PUT("/config/sort-mode", SetSortModeConfig)
-		g.PUT("/config/sort", SetSortModeConfig)
-		g.POST("/config/sort", SetSortModeConfig)
-		g.PUT("/config/custom-order", SetCustomOrderConfig)
+		g.PUT("/config/sort-mode", operator, SetSortModeConfig)
+		g.PUT("/config/sort", operator, SetSortModeConfig)
+		g.POST("/config/sort", operator, SetSortModeConfig)
+		g.PUT("/config/custom-order", operator, SetCustomOrderConfig)
 		g.GET("/config/groups", GetCustomGroupsConfig)
-		g.PUT("/config/groups", SetCustomGroupsConfig)
-		g.POST("/config/groups", SetCustomGroupsConfig)
+		g.PUT("/config/groups", operator, SetCustomGroupsConfig)
+		g.POST("/config/groups", operator, SetCustomGroupsConfig)
 		g.GET("/config/site-title", GetSiteTitleConfig)
-		g.PUT("/config/site-title", SetSiteTitleConfig)
-		g.POST("/config/site-title", SetSiteTitleConfig)
+		g.PUT("/config/site-title", operator, SetSiteTitleConfig)
+		g.POST("/config/site-title", operator, SetSiteTitleConfig)
 		g.GET("/token-groups", GetTokenGroupsForModelStatus)
 	}
 
@@ -289,16 +298,38 @@ func GetAllModelsStatusHandler(c *gin.Context) {
 	}
 
 	svc := service.NewModelStatusService()
-	data, err := svc.GetAllModelsStatus(window)
+	catalog, err := svc.GetAvailableModelsWithState()
+	if err != nil {
+		modelStatusQueryError(c, "all model statuses query", err)
+		return
+	}
+	names := make([]string, 0, authenticatedModelStatusMaxAll)
+	totalModels := 0
+	for _, item := range catalog.Models {
+		name, ok := item["model_name"].(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			continue
+		}
+		totalModels++
+		if len(names) < authenticatedModelStatusMaxAll {
+			names = append(names, name)
+		}
+	}
+	data, err := svc.GetMultipleModelsStatus(names, window)
 	if err != nil {
 		modelStatusQueryError(c, "all model statuses query", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"success":     true,
-		"data":        data,
-		"time_window": window,
-		"cache_ttl":   60,
+		"success":      true,
+		"data":         data,
+		"time_window":  window,
+		"cache_ttl":    60,
+		"source_state": catalog.SourceState,
+		"total_models": totalModels,
+		"returned":     len(data),
+		"limit":        authenticatedModelStatusMaxAll,
+		"truncated":    totalModels > len(data),
 	})
 }
 
@@ -310,11 +341,12 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 	}
 
 	svc := service.NewModelStatusService()
-	available, err := svc.GetAvailableModels()
+	catalog, err := svc.GetAvailableModelsWithState()
 	if err != nil {
 		modelStatusQueryError(c, "public all models query", err)
 		return
 	}
+	available := catalog.Models
 	maxModels := config.Get().PublicModelMaxBatch
 	names := make([]string, 0, maxModels)
 	for _, item := range available {
@@ -333,11 +365,15 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"success":     true,
-		"data":        data,
-		"time_window": window,
-		"cache_ttl":   60,
-		"truncated":   len(available) > len(names),
+		"success":      true,
+		"data":         data,
+		"time_window":  window,
+		"cache_ttl":    60,
+		"source_state": catalog.SourceState,
+		"total_models": len(available),
+		"returned":     len(data),
+		"limit":        maxModels,
+		"truncated":    len(available) > len(names),
 	})
 }
 
@@ -380,6 +416,94 @@ func sanitizeSelectedModelNames(values []string) ([]string, string) {
 	return sanitizeModelNames(values, authenticatedModelStatusMaxBatch)
 }
 
+type modelConfigMutationMetadata struct {
+	Reason          string `json:"reason"`
+	ExpectedVersion *int64 `json:"expected_version"`
+}
+
+func decodeModelConfigJSON(c *gin.Context, destination any) bool {
+	if c.ContentType() != "application/json" {
+		c.JSON(http.StatusUnsupportedMediaType, models.ErrorResp(
+			"UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json", ""))
+		return false
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(service.MaxModelStatusConfigBytes+4096))
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_CONFIG_INVALID", "Invalid model configuration payload", ""))
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_CONFIG_INVALID", "Invalid model configuration payload", ""))
+		return false
+	}
+	return true
+}
+
+func modelConfigMutationAudit(c *gin.Context, key, reason string) (toolstore.OperationAuditInput, bool) {
+	actor, authMethod := controlPlaneMutationIdentity(c)
+	requestID := strings.TrimSpace(middleware.RequestID(c))
+	if requestID == "" {
+		requestID = strings.TrimSpace(c.GetString("request_id"))
+	}
+	if actor == "" || authMethod == "" || requestID == "" {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp(
+			"REQUEST_METADATA_UNAVAILABLE", "Trusted request metadata is unavailable", ""))
+		return toolstore.OperationAuditInput{}, false
+	}
+	idempotencyKey := requestID
+	if len(c.Request.Header.Values("Idempotency-Key")) > 0 {
+		var ok bool
+		idempotencyKey, ok = controlPlaneIdempotencyKey(c)
+		if !ok {
+			c.JSON(http.StatusBadRequest, models.ErrorResp(
+				"MODEL_CONFIG_INVALID", "Idempotency-Key is invalid", ""))
+			return toolstore.OperationAuditInput{}, false
+		}
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "update model status " + key
+	}
+	identity := controlPlaneIdentity{
+		Actor: actor, AuthMethod: authMethod, SourceIP: strings.TrimSpace(c.ClientIP()),
+		RequestID: requestID, IdempotencyKey: idempotencyKey,
+	}
+	return mutationAuditInput(identity, "model_status.config", reason), true
+}
+
+func validateExpectedModelConfigVersion(c *gin.Context, version *int64) bool {
+	if version != nil && *version <= 0 {
+		c.JSON(http.StatusBadRequest, models.ErrorResp(
+			"MODEL_CONFIG_INVALID", "expected_version must be positive", ""))
+		return false
+	}
+	return true
+}
+
+func writeModelConfigError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, service.ErrModelStatusConfigInvalid):
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_CONFIG_INVALID", "Invalid model configuration", ""))
+	case errors.Is(err, service.ErrModelStatusConfigConflict):
+		c.JSON(http.StatusConflict, models.ErrorResp("MODEL_CONFIG_CONFLICT", "Model configuration version changed; reload and retry", ""))
+	case errors.Is(err, service.ErrModelStatusConfigUnavailable):
+		c.JSON(http.StatusServiceUnavailable, models.ErrorResp("MODEL_CONFIG_UNAVAILABLE", "Model configuration could not be durably published", ""))
+	default:
+		c.JSON(http.StatusServiceUnavailable, models.ErrorResp("MODEL_CONFIG_UNAVAILABLE", "Model configuration is temporarily unavailable", ""))
+	}
+}
+
+func readModelConfig(c *gin.Context) (map[string]interface{}, bool) {
+	value, err := service.NewModelStatusService().GetConfig()
+	if err != nil {
+		writeModelConfigError(c, err)
+		return nil, false
+	}
+	return value, true
+}
+
 // GET /selected
 func GetSelectedModels(c *gin.Context) {
 	respondSelectedModels(c, authenticatedModelStatusMaxBatch)
@@ -390,8 +514,10 @@ func GetPublicSelectedModels(c *gin.Context) {
 }
 
 func respondSelectedModels(c *gin.Context, maxBatch int) {
-	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"data":             config["selected_models"],
@@ -402,6 +528,7 @@ func respondSelectedModels(c *gin.Context, maxBatch int) {
 		"custom_order":     config["custom_order"],
 		"custom_groups":    config["custom_groups"],
 		"site_title":       config["site_title"],
+		"version":          config["version"],
 		"max_batch":        maxBatch,
 	})
 }
@@ -409,10 +536,10 @@ func respondSelectedModels(c *gin.Context, maxBatch int) {
 // PUT /selected
 func SetSelectedModels(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		Models *[]string `json:"models"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
 		return
 	}
 	if req.Models == nil {
@@ -424,32 +551,47 @@ func SetSelectedModels(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", errMessage, ""))
 		return
 	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "selected_models", req.Reason)
+	if !ok {
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetSelectedModels(validatedModels)
+	snapshot, err := svc.SetSelectedModels(c.Request.Context(), validatedModels, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    validatedModels,
+		"data":    snapshot.Config.SelectedModels,
+		"version": snapshot.Version,
 		"message": "Selected models updated",
 	})
 }
 
 // GET /config/time-window
 func GetTimeWindowConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
 		"time_window": config["time_window"],
+		"version":     config["version"],
 	})
 }
 
 // PUT /config/time-window
 func SetTimeWindowConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		TimeWindow string `json:"time_window"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
 		return
 	}
 	// Validate
@@ -464,22 +606,37 @@ func SetTimeWindowConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid time window", ""))
 		return
 	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "time_window", req.Reason)
+	if !ok {
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetTimeWindow(req.TimeWindow)
+	snapshot, err := svc.SetTimeWindow(c.Request.Context(), req.TimeWindow, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
-		"time_window": req.TimeWindow,
+		"time_window": snapshot.Config.TimeWindow,
+		"version":     snapshot.Version,
 		"message":     "Time window updated",
 	})
 }
 
 // GET /config/theme
 func GetThemeConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"theme":            config["theme"],
+		"version":          config["version"],
 		"available_themes": service.AvailableThemes,
 	})
 }
@@ -487,10 +644,10 @@ func GetThemeConfig(c *gin.Context) {
 // PUT /config/theme
 func SetThemeConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		Theme string `json:"theme"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
 		return
 	}
 	// Map legacy theme names to valid ones
@@ -509,22 +666,37 @@ func SetThemeConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid theme", ""))
 		return
 	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "theme", req.Reason)
+	if !ok {
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetTheme(theme)
+	snapshot, err := svc.SetTheme(c.Request.Context(), theme, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"theme":   theme,
+		"theme":   snapshot.Config.Theme,
+		"version": snapshot.Version,
 		"message": "Theme updated",
 	})
 }
 
 // GET /config/refresh-interval
 func GetRefreshIntervalConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
 		"refresh_interval": config["refresh_interval"],
+		"version":          config["version"],
 		"available":        service.AvailableRefreshIntervals,
 	})
 }
@@ -532,10 +704,10 @@ func GetRefreshIntervalConfig(c *gin.Context) {
 // PUT /config/refresh-interval
 func SetRefreshIntervalConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		RefreshInterval int `json:"refresh_interval"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
 		return
 	}
 	valid := false
@@ -549,22 +721,37 @@ func SetRefreshIntervalConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid refresh interval", ""))
 		return
 	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "refresh_interval", req.Reason)
+	if !ok {
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetRefreshInterval(req.RefreshInterval)
+	snapshot, err := svc.SetRefreshInterval(c.Request.Context(), req.RefreshInterval, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":          true,
-		"refresh_interval": req.RefreshInterval,
+		"refresh_interval": snapshot.Config.RefreshInterval,
+		"version":          snapshot.Version,
 		"message":          "Refresh interval updated",
 	})
 }
 
 // GET /config/sort-mode
 func GetSortModeConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
-	config := svc.GetConfig()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
 		"sort_mode": config["sort_mode"],
+		"version":   config["version"],
 		"available": service.AvailableSortModes,
 	})
 }
@@ -572,10 +759,10 @@ func GetSortModeConfig(c *gin.Context) {
 // PUT /config/sort-mode
 func SetSortModeConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		SortMode string `json:"sort_mode"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
 		return
 	}
 	valid := false
@@ -589,11 +776,23 @@ func SetSortModeConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid sort mode", ""))
 		return
 	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "sort_mode", req.Reason)
+	if !ok {
+		return
+	}
 	svc := service.NewModelStatusService()
-	svc.SetSortMode(req.SortMode)
+	snapshot, err := svc.SetSortMode(c.Request.Context(), req.SortMode, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
-		"sort_mode": req.SortMode,
+		"sort_mode": snapshot.Config.SortMode,
+		"version":   snapshot.Version,
 		"message":   "Sort mode updated",
 	})
 }
@@ -601,17 +800,34 @@ func SetSortModeConfig(c *gin.Context) {
 // PUT /config/custom-order
 func SetCustomOrderConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		CustomOrder []string `json:"custom_order"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
+		return
+	}
+	validatedOrder, errMessage := sanitizeSelectedModelNames(req.CustomOrder)
+	if errMessage != "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_CONFIG_INVALID", errMessage, ""))
+		return
+	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "custom_order", req.Reason)
+	if !ok {
 		return
 	}
 	svc := service.NewModelStatusService()
-	svc.SetCustomOrder(req.CustomOrder)
+	snapshot, err := svc.SetCustomOrder(c.Request.Context(), validatedOrder, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":      true,
-		"custom_order": req.CustomOrder,
+		"custom_order": snapshot.Config.CustomOrder,
+		"version":      snapshot.Version,
 		"message":      "Custom order updated",
 	})
 }
@@ -619,34 +835,57 @@ func SetCustomOrderConfig(c *gin.Context) {
 // GET /config (embed)
 func GetEmbedConfig(c *gin.Context) {
 	svc := service.NewModelStatusService()
-	config := svc.GetEmbedConfig()
+	config, err := svc.GetEmbedConfig()
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": config})
 }
 
 // GET /config/groups
 func GetCustomGroupsConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
-	groups := svc.GetCustomGroups()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    groups,
+		"data":    config["custom_groups"],
+		"version": config["version"],
 	})
 }
 
 // PUT /config/groups
 func SetCustomGroupsConfig(c *gin.Context) {
 	var req struct {
-		Groups []map[string]interface{} `json:"groups"`
+		modelConfigMutationMetadata
+		Groups []service.ModelStatusCustomGroup `json:"groups"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
+		return
+	}
+	if err := service.ValidateModelStatusCustomGroups(req.Groups); err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "custom_groups", req.Reason)
+	if !ok {
 		return
 	}
 	svc := service.NewModelStatusService()
-	svc.SetCustomGroups(req.Groups)
+	snapshot, err := svc.SetCustomGroups(c.Request.Context(), req.Groups, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    req.Groups,
+		"data":    snapshot.Config.CustomGroups,
+		"version": snapshot.Version,
 		"message": "Custom groups updated",
 	})
 }
@@ -680,27 +919,43 @@ func GetPublicTokenGroupsForModelStatus(c *gin.Context) {
 
 // GET /config/site-title
 func GetSiteTitleConfig(c *gin.Context) {
-	svc := service.NewModelStatusService()
+	config, ok := readModelConfig(c)
+	if !ok {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":    true,
-		"site_title": svc.GetSiteTitle(),
+		"site_title": config["site_title"],
+		"version":    config["version"],
 	})
 }
 
 // PUT /config/site-title
 func SetSiteTitleConfig(c *gin.Context) {
 	var req struct {
+		modelConfigMutationMetadata
 		SiteTitle string `json:"site_title"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", ""))
+	if !decodeModelConfigJSON(c, &req) {
+		return
+	}
+	if !validateExpectedModelConfigVersion(c, req.ExpectedVersion) {
+		return
+	}
+	audit, ok := modelConfigMutationAudit(c, "site_title", req.Reason)
+	if !ok {
 		return
 	}
 	svc := service.NewModelStatusService()
-	svc.SetSiteTitle(req.SiteTitle)
+	snapshot, err := svc.SetSiteTitle(c.Request.Context(), req.SiteTitle, audit, req.ExpectedVersion)
+	if err != nil {
+		writeModelConfigError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":    true,
-		"site_title": req.SiteTitle,
+		"site_title": snapshot.Config.SiteTitle,
+		"version":    snapshot.Version,
 		"message":    "Site title updated",
 	})
 }

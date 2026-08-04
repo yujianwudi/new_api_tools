@@ -255,6 +255,53 @@ func (m *Manager) GetJSON(key string, dest interface{}) (bool, error) {
 	return true, json.Unmarshal(data, dest)
 }
 
+// GetRawJSONGroup reads a fixed group of legacy JSON values in one Redis
+// command. It intentionally bypasses L1 so startup migration observes one
+// authoritative Redis snapshot and can distinguish a missing key from a Redis
+// outage. The caller owns semantic validation of each raw document.
+func (m *Manager) GetRawJSONGroup(ctx context.Context, keys []string) (map[string]json.RawMessage, error) {
+	if m == nil || m.rdb == nil {
+		return nil, fmt.Errorf("redis is unavailable")
+	}
+	if len(keys) == 0 {
+		return map[string]json.RawMessage{}, nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			return nil, fmt.Errorf("legacy Redis key is empty")
+		}
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("legacy Redis key %q is duplicated", key)
+		}
+		seen[key] = struct{}{}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	values, err := m.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("read legacy Redis configuration group: %w", err)
+	}
+	result := make(map[string]json.RawMessage, len(keys))
+	for index, value := range values {
+		if value == nil {
+			continue
+		}
+		var raw []byte
+		switch typed := value.(type) {
+		case string:
+			raw = []byte(typed)
+		case []byte:
+			raw = append([]byte(nil), typed...)
+		default:
+			return nil, fmt.Errorf("legacy Redis key %q returned unsupported value type %T", keys[index], value)
+		}
+		result[keys[index]] = json.RawMessage(raw)
+	}
+	return result, nil
+}
+
 // GetString retrieves a string value from cache
 func (m *Manager) GetString(key string) (string, bool, error) {
 	if m.rdb == nil {

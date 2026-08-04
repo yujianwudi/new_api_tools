@@ -7,6 +7,12 @@ import {
   MODEL_STATUS_BATCH_MAX_CONCURRENCY,
   normalizeModelStatusMaxBatch,
 } from '../lib/modelStatusBatch'
+import {
+  effectiveEmbedRate,
+  effectiveEmbedStatus,
+  type ModelHealthStatus,
+  type ModelSourceState,
+} from './modelStatusTruth'
 import { Loader2, RefreshCw, Activity, Zap, Sun, Moon, Minimize2, Terminal, Leaf, Droplets, Command, LayoutGrid, Bot, MessageSquareQuote, Triangle, Sparkles, CreditCard, GitBranch, Gamepad2, Rocket, Brain, Layers, Tag, KeyRound, ChevronDown } from 'lucide-react'
 import {
   OpenAI, Gemini, DeepSeek, SiliconCloud, Groq, Ollama, Claude, Mistral,
@@ -19,7 +25,6 @@ import {
 // Types
 // ============================================================================
 
-type ModelHealthStatus = 'green' | 'yellow' | 'red' | 'unknown'
 
 interface SlotStatus {
   slot: number
@@ -37,8 +42,10 @@ interface ModelStatus {
   time_window: string
   total_requests: number
   success_count: number
-  success_rate: number
+  success_rate: number | null
 	current_status: ModelHealthStatus
+  source_state?: ModelSourceState
+  fetched_at?: string
   slot_data: SlotStatus[]
 }
 
@@ -917,6 +924,7 @@ export function ModelStatusEmbed({
   const [selectedModels, setSelectedModels] = useState<string[]>([])
   const [maxBatch, setMaxBatch] = useState(PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
+  const [statusWindow, setStatusWindow] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -941,6 +949,7 @@ export function ModelStatusEmbed({
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const styles = themeStyles[theme] || themeStyles.daylight
+  const displayedModelStatuses = statusWindow === timeWindow ? modelStatuses : []
 
   // Parse URL params for theme override
   useEffect(() => {
@@ -1067,6 +1076,7 @@ export function ModelStatusEmbed({
     if (fetchSet.length === 0) {
       statusRequestControllerRef.current = null
       setModelStatuses([])
+      setStatusWindow(timeWindow)
       setLoading(false)
       return
     }
@@ -1094,10 +1104,14 @@ export function ModelStatusEmbed({
       )
       if (requestId !== statusRequestIdRef.current) return
       setModelStatuses(chunkResults.flat())
+      setStatusWindow(timeWindow)
       setLastUpdate(new Date())
     } catch (error) {
       if (controller.signal.aborted || requestId !== statusRequestIdRef.current || isEmbedAbortError(error)) return
       controller.abort()
+      setModelStatuses([])
+      setStatusWindow(timeWindow)
+      setLastUpdate(null)
       console.error('Failed to fetch model statuses:', error)
     } finally {
       if (requestId === statusRequestIdRef.current) {
@@ -1197,7 +1211,7 @@ export function ModelStatusEmbed({
   }
 
   // Loading state
-  if (loading && modelStatuses.length === 0) {
+  if (loading && displayedModelStatuses.length === 0) {
     return (
       <div
         className={cn("min-h-screen flex items-center justify-center", styles.container)}
@@ -1265,14 +1279,16 @@ export function ModelStatusEmbed({
         </div>
 
         {/* Stats Overview Bar */}
-        {modelStatuses.length > 0 && theme !== 'minimal' && (() => {
-          const totalRequests = modelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
-          const rateModels = modelStatuses.filter(m => m.total_requests > 0 && m.current_status !== 'unknown')
-          const avgRate = rateModels.length > 0 ? +(rateModels.reduce((sum, m) => sum + m.success_rate, 0) / rateModels.length).toFixed(1) : null
-          const greenCount = modelStatuses.filter(m => m.current_status === 'green').length
-          const yellowCount = modelStatuses.filter(m => m.current_status === 'yellow').length
-          const redCount = modelStatuses.filter(m => m.current_status === 'red').length
-          const unknownCount = modelStatuses.filter(m => m.current_status === 'unknown').length
+        {displayedModelStatuses.length > 0 && theme !== 'minimal' && (() => {
+          const totalRequests = displayedModelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
+          const rateModels = displayedModelStatuses
+            .map(model => effectiveEmbedRate(model))
+            .filter((rate): rate is number => rate !== null)
+          const avgRate = rateModels.length > 0 ? +(rateModels.reduce((sum, rate) => sum + rate, 0) / rateModels.length).toFixed(1) : null
+          const greenCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'green').length
+          const yellowCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'yellow').length
+          const redCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'red').length
+          const unknownCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'unknown').length
           return (
             <div className={cn(
               "flex flex-wrap items-center gap-x-6 gap-y-2 mb-6 px-4 py-3 rounded-xl text-sm",
@@ -1331,9 +1347,9 @@ export function ModelStatusEmbed({
         })()}
 
         {/* Group Filter Tabs */}
-        {(customGroups.length > 0 || tokenGroups.length > 0) && modelStatuses.length > 0 && theme !== 'minimal' && (() => {
+        {(customGroups.length > 0 || tokenGroups.length > 0) && displayedModelStatuses.length > 0 && theme !== 'minimal' && (() => {
           // Count models per group
-          const activeModels = modelStatuses.filter(m => m.total_requests > 0)
+          const activeModels = displayedModelStatuses.filter(m => m.total_requests > 0 && effectiveEmbedStatus(m) !== 'unknown')
           const groupCountMap: Record<string, number> = { all: activeModels.length }
           customGroups.forEach(g => {
             groupCountMap[g.id] = activeModels.filter(m => embedModelMatchesGroup(m.model_name, g)).length
@@ -1424,11 +1440,11 @@ export function ModelStatusEmbed({
         })()}
 
         {/* Model Status Cards */}
-        {modelStatuses.length > 0 ? (
+        {displayedModelStatuses.length > 0 ? (
           <div className={cn(
             theme === 'minimal' ? 'divide-y divide-gray-100' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'
           )}>
-            {modelStatuses
+            {displayedModelStatuses
               .filter(model => {
                 if (groupFilter === 'all') return true
                 if (groupFilter.startsWith('token:')) {
@@ -1554,7 +1570,10 @@ interface EmbedModelCardProps {
 }
 
 function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCardProps) {
-  
+  const effectiveStatus = effectiveEmbedStatus(model)
+  const effectiveRate = effectiveEmbedRate(model)
+  const sourceFresh = model.source_state === 'fresh'
+
   const handleMouseEnter = (slot: SlotStatus, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect()
     onHover(slot, rect)
@@ -1596,19 +1615,19 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
           {!isMinimal && (
             <span className={cn(
               "px-2 py-0.5 text-xs rounded-full font-medium",
-              getBadgeColor(model.current_status, styles)
+              getBadgeColor(effectiveStatus, styles)
             )}>
-              {STATUS_LABELS[model.current_status]}
+              {STATUS_LABELS[effectiveStatus]}
             </span>
           )}
           {isMinimal && (
-            <span className={getBadgeColor(model.current_status, styles)}>
-              {model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : model.current_status === 'red' ? '○' : '·'}
+            <span className={getBadgeColor(effectiveStatus, styles)}>
+              {effectiveStatus === 'green' ? '●' : effectiveStatus === 'yellow' ? '◐' : effectiveStatus === 'red' ? '○' : '·'}
             </span>
           )}
         </div>
         <div className={styles.statsText}>
-          <span className={styles.statsValue}>{model.current_status === 'unknown' ? '—' : `${model.success_rate}%`}</span>
+          <span className={styles.statsValue}>{effectiveRate === null ? '—' : `${effectiveRate}%`}</span>
           {!isMinimal && ' 成功率'}
           <span className={isMinimal ? 'mx-1' : 'mx-2 opacity-30'}>·</span>
           <span>{model.total_requests.toLocaleString()}</span>
@@ -1626,11 +1645,12 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
             <div
               key={index}
               className={cn(
-                "flex-1 rounded-sm cursor-pointer transition-all duration-200",
-                slot.total_requests === 0 ? styles.statusEmpty : getStatusColor(slot.status, styles),
-                styles.statusHover
+                "flex-1 rounded-sm transition-all duration-200",
+                sourceFresh ? 'cursor-pointer' : 'cursor-default',
+                !sourceFresh || slot.total_requests === 0 ? styles.statusEmpty : getStatusColor(slot.status, styles),
+                sourceFresh && styles.statusHover
               )}
-              onMouseEnter={(e) => handleMouseEnter(slot, e)}
+              onMouseEnter={(e) => { if (sourceFresh) handleMouseEnter(slot, e) }}
               onMouseLeave={onLeave}
             />
           ))}

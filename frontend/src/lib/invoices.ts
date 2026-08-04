@@ -8,10 +8,41 @@ export interface InvoiceSummaryGroup {
   voided_blue_minor: MinorAmount
   voided_red_minor: MinorAmount
   voided_minor: MinorAmount
-  net_issued_minor: MinorAmount
+  net_issued_minor: MinorAmount | null
   voided_count: number
   effective_count: number
-  anomaly_count?: number
+  source_health?: string
+  unreconciled_count?: number
+  anomaly_count: number
+}
+
+export interface InvoiceSummarySourceHealth {
+  status?: string
+  unreconciled_count?: number
+  anomaly_count: number
+}
+
+function isSafeZeroCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value === 0
+}
+
+export function isTrustworthyInvoiceSummaryGroup(
+  group: InvoiceSummaryGroup,
+  overall: InvoiceSummarySourceHealth | null | undefined,
+): boolean {
+  return overall?.status === 'ok' && group.source_health === 'ok'
+    && isSafeZeroCount(overall.unreconciled_count)
+    && isSafeZeroCount(group.unreconciled_count)
+    && isSafeZeroCount(overall.anomaly_count)
+    && isSafeZeroCount(group.anomaly_count)
+}
+
+export function trustworthyNetIssuedMinor(
+  group: InvoiceSummaryGroup,
+  overall: InvoiceSummarySourceHealth | null | undefined,
+): MinorAmount | null {
+  if (!isTrustworthyInvoiceSummaryGroup(group, overall)) return null
+  return group.net_issued_minor ?? null
 }
 
 export interface InvoiceFilters {

@@ -5,15 +5,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	"github.com/new-api-tools/backend/internal/auth"
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/middleware"
+	"github.com/new-api-tools/backend/internal/service"
+	"github.com/new-api-tools/backend/internal/toolstore"
 	_ "modernc.org/sqlite"
 )
 
@@ -93,8 +98,22 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 	installEmptyHandlerDatabase(t)
 	cache.Get().ClearLocal()
 	t.Cleanup(func() { cache.Get().ClearLocal() })
+	store, err := toolstore.Init(filepath.Join(t.TempDir(), "toolstore.db"))
+	if err != nil {
+		t.Fatalf("initialize model config tool store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	restoreRuntime := service.ConfigureModelStatusConfigRuntime(store, cache.Get(), false)
+	t.Cleanup(restoreRuntime)
 
 	router := gin.New()
+	router.Use(middleware.RequestIDMiddleware())
+	router.Use(func(c *gin.Context) {
+		auth.SetRole(c, auth.RoleOperator)
+		c.Set("auth_method", "jwt")
+		c.Set("user_sub", "model-status-test-operator")
+		c.Next()
+	})
 	api := router.Group("/api")
 	RegisterModelStatusRoutes(api)
 	RegisterModelStatusEmbedRoutes(router)
@@ -131,7 +150,7 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 	}
 
 	recorder := requestJSON(
-		http.MethodPost,
+		http.MethodPut,
 		"/api/model-status/config/selected",
 		`{"models":[" gpt-4 ","gpt-4"," claude "]}`,
 	)
@@ -143,6 +162,14 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 	if !authConfig.Success || authConfig.MaxBatch != authenticatedModelStatusMaxBatch ||
 		len(authConfig.Data) != 2 || authConfig.Data[0] != "gpt-4" || authConfig.Data[1] != "claude" {
 		t.Fatalf("unexpected authenticated config response: %#v", authConfig)
+	}
+	recorder = requestJSON(
+		http.MethodPut,
+		"/api/model-status/config/theme",
+		`{"theme":"obsidian","expected_version":1}`,
+	)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "MODEL_CONFIG_CONFLICT") {
+		t.Fatalf("stale model config CAS did not return 409: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	for _, path := range []string{
 		"/api/embed/model-status/config/selected",
@@ -162,7 +189,7 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 	if err != nil {
 		t.Fatalf("marshal oversized selection: %v", err)
 	}
-	recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", string(payload))
+	recorder = requestJSON(http.MethodPut, "/api/model-status/config/selected", string(payload))
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "At most 200") {
 		t.Fatalf("oversized selected-model config was not rejected: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -170,7 +197,7 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 		t.Fatalf("rejected selection overwrote the last valid config: %#v", persisted)
 	}
 	for _, invalidPayload := range []string{`{}`, `{"models":null}`} {
-		recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", invalidPayload)
+		recorder = requestJSON(http.MethodPut, "/api/model-status/config/selected", invalidPayload)
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("missing/null models payload %s was accepted: status=%d body=%s", invalidPayload, recorder.Code, recorder.Body.String())
 		}
@@ -179,7 +206,7 @@ func TestSelectedModelConfigPublishesLimitsAndRejectsUnboundedValues(t *testing.
 		}
 	}
 
-	recorder = requestJSON(http.MethodPost, "/api/model-status/config/selected", `{"models":[]}`)
+	recorder = requestJSON(http.MethodPut, "/api/model-status/config/selected", `{"models":[]}`)
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"data":[]`) {
 		t.Fatalf("explicit empty selection was rejected or normalized to null: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
