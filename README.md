@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.6.0-2563EB?style=for-the-badge" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.6.1-2563EB?style=for-the-badge" />
   <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" />
   <img alt="Docker" src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
   <img alt="Port" src="https://img.shields.io/badge/default_port-1145-0EA5E9?style=for-the-badge" />
 </p>
 
-# NewAPI Tools v0.6.0
+# NewAPI Tools v0.6.1
 
 NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的**独立、旁路、可审计的 API 中转站经营与可靠性控制台**。
 
@@ -20,7 +20,7 @@ NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-
 - 渠道和用户发生了什么，证据能否追溯；
 - 高风险操作是否经过授权、说明理由并留下完整结果。
 
-> v0.6.0 把模型监测从“只有真实流量日志”升级为“被动流量证据 + 受控主动探测”。主动探测默认关闭，只使用专用低权限令牌、精确模型白名单、每日请求预算和能力适配器，不会把无数据或过期数据冒充成健康。
+> v0.6.1 在双源模型监测基础上修复用户条件筛选、邀请明细一致性与模型监测交互，并补齐 Tool Store 回滚、配置耐久性、供应链证明和真实性能门禁。主动探测默认关闭，不会把无数据、部分数据或过期数据冒充成健康。
 
 ## 架构边界
 
@@ -36,7 +36,7 @@ flowchart LR
     Backend --> Metrics["健康检查与 Prometheus 指标"]
 ```
 
-| 边界 | v0.6.0 行为 |
+| 边界 | v0.6.1 行为 |
 |---|---|
 | 代理流量 | 不在 NewAPI 请求链路中，不代理或修改模型请求 |
 | NewAPI schema | 不创建、不迁移、不修改 NewAPI 表结构 |
@@ -46,7 +46,7 @@ flowchart LR
 | 未知上游版本 | 默认只读，拒绝未经验证的写操作 |
 | 主动探测 | 默认关闭；仅调用精确白名单模型，并受能力适配、并发、超时、Token 与每日请求预算约束 |
 
-## v0.6.0 能力
+## v0.6.1 能力
 
 | 模块 | 能力与安全边界 |
 |---|---|
@@ -95,7 +95,7 @@ v0.5.2 的发票模块是控制台自己的证据台账，不是 NewAPI 余额�
 
 ## NewAPI 版本与写入限制
 
-v0.6.0 的已验证控制面契约基线是 **NewAPI `v1.0.0-rc.21`**。
+v0.6.1 的已验证控制面契约基线是 **NewAPI `v1.0.0-rc.21`**。
 
 | NewAPI 版本 | 控制面策略 |
 |---|---|
@@ -249,21 +249,22 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 ### 一键安装
 
 ```bash
-INSTALLER_COMMIT_SHA=4b0819645d17ba3c1873967ce86239dba3a73a7c
-INSTALL_SCRIPT_SHA256=b72f5e35ea33a9059b96b020f89d990d712cd168ff6338edae7c9359712e84eb
+# TEMPLATE ONLY - replace every REPLACE_WITH_* value from the v0.6.1 Release
+INSTALLER_COMMIT_SHA=f7f614193b1595dca7f581dfda6db18533fdb5e6
+INSTALL_SCRIPT_SHA256=d09949cceebaf9016b9d282c47041cdfeec60ff76d9a5471282775e1a961da1a
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   "https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh" \
   --output "$install_script"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1
-NEWAPI_TOOLS_REF=v0.6.0 \
-NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
-NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \
+NEWAPI_TOOLS_REF=v0.6.1 \
+NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:REPLACE_WITH_64_HEX_MANIFEST_DIGEST \
+NEWAPI_TOOLS_EXPECTED_REVISION=REPLACE_WITH_40_HEX_RELEASE_COMMIT \
 bash "$install_script"
 ```
 
-安装器 commit 与 SHA-256 已固定在本仓库文档中。执行前仍必须从 v0.6.0 发行页复制并替换 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`；任一占位符未替换时不要执行。
+执行前必须从 v0.6.1 发行页复制真实的安装器 commit、脚本 SHA-256、manifest digest 与 release commit，并替换全部 `REPLACE_WITH_*`；任一占位符未替换时不要执行。
 
 安装器会：
 
@@ -279,10 +280,10 @@ bash "$install_script"
 
 ### 手动部署
 
-v0.6.0 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
+v0.6.1 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
 
 ```bash
-git clone --branch v0.6.0 --depth 1 https://github.com/yujianwudi/new_api_tools.git
+git clone --branch v0.6.1 --depth 1 https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 # 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下两个真实值：
@@ -334,7 +335,7 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 升级前备份配置和 Tool Store。下面的 Compose 示例从运行中容器解析实际的 `TOOL_STORE_PATH`（未显式配置时按 `DATA_DIR/control-plane.db` 解析），然后先停止服务再复制 SQLite；不要在服务运行时直接 `cp` 数据库文件：
 
 ```bash
-backup_dir="backups/v0.6.0-$(date +%Y%m%d%H%M%S)"
+backup_dir="backups/v0.6.1-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$backup_dir"
 cp -- .env "$backup_dir/.env"
 
@@ -367,7 +368,7 @@ curl -fsS http://127.0.0.1:1145/readyz
 docker compose logs --tail=200 newapi-tools
 ```
 
-依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)。
+依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.6.1.md`](./RELEASE_0.6.1.md)。
 
 ## 回滚
 
@@ -394,16 +395,21 @@ go vet ./...
 
 cd ../frontend
 npm ci
+npm test
 npm run lint
+npx tsc --noEmit
 npm run build
-npm audit --omit=dev
+npm audit --audit-level=high --registry=https://registry.npmjs.org
+npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org
 ```
 
-CI 还会执行 `govulncheck`、部署脚本测试、Compose 校验、多架构构建和镜像身份检查。Docker 基础镜像与 Redis 使用多架构 manifest digest 固定；GeoIP 数据固定到提交 `a83d44508ee6831c2770b2c4be91f9850ec429d7`，并在构建和运行时校验 SHA-256 `168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf`。固定 GeoIP 快照无法下载或校验失败时，镜像构建失败关闭。发布镜像同时生成 SBOM 和 provenance。
+CI 还会执行 `govulncheck`、部署脚本测试、Compose 校验、10 万用户/30 天日志、邀请充值与 1000 模型性能门禁、多架构构建和镜像身份检查。Docker 基础镜像与 Redis 使用多架构 manifest digest 固定；GeoIP 数据固定到提交 `a83d44508ee6831c2770b2c4be91f9850ec429d7`，并在构建和运行时校验 SHA-256 `168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf`。固定 GeoIP 快照无法下载或校验失败时，镜像构建失败关闭。发布镜像同时生成 SBOM、Cosign 签名和受策略校验的 SLSA v1 provenance。
 
 ## 项目资料
 
 - 路线图：[`docs/ROADMAP.md`](./docs/ROADMAP.md)
+- v0.6.1 整改任务书与验收标准：[`docs/V0.6.1_REMEDIATION_TASK_BOOK.md`](./docs/V0.6.1_REMEDIATION_TASK_BOOK.md)
+- v0.6.1 发行说明：[`RELEASE_0.6.1.md`](./RELEASE_0.6.1.md)
 - v0.6.0 发行说明：[`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)
 - v0.6 模型监测任务书：[`docs/V0.6_MODEL_MONITORING_TASK_BOOK.md`](./docs/V0.6_MODEL_MONITORING_TASK_BOOK.md)
 - v0.5.2 发行说明：[`RELEASE_0.5.2.md`](./RELEASE_0.5.2.md)
