@@ -568,7 +568,10 @@ func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams)
 	if err != nil {
 		return nil, fmt.Errorf("query invite top-up analysis: %w", err)
 	}
-	items := make([]AffiliateStatsRow, 0, query.params.PageSize)
+	// Do not use the request-derived page size as a slice capacity. The SQL
+	// limit is validated above, while append keeps the allocation independent
+	// of untrusted input and bounded by the returned rows.
+	items := make([]AffiliateStatsRow, 0)
 	for rows.Next() {
 		var row AffiliateStatsRow
 		if err := rows.StructScan(&row); err != nil {
@@ -744,7 +747,9 @@ func ListAffiliateTopUpDetailsContext(ctx context.Context, inviterID int64, para
 	if err != nil {
 		return nil, fmt.Errorf("query invite top-up details: %w", err)
 	}
-	items := make([]AffiliateTopUpDetailRow, 0, query.params.PageSize)
+	// Keep allocation independent of the request-derived page size. The query
+	// limit is already validated and bounds the number of rows appended.
+	items := make([]AffiliateTopUpDetailRow, 0)
 	for rows.Next() {
 		var item AffiliateTopUpDetailRow
 		if err := rows.StructScan(&item); err != nil {
