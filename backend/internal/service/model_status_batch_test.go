@@ -352,7 +352,10 @@ func TestGetMultipleModelsStatusMatchesSingleModelSemanticsAndSharesFetchedAt(t 
 	insertModelStatusBatchLogs(t, fixture.db, []modelStatusBatchLogRow{
 		{model: names[0], createdAt: now.Add(-2 * time.Second).Unix(), logType: 2, completionTokens: 1},
 		{model: names[1], createdAt: now.Add(-3 * time.Second).Unix(), logType: 5, completionTokens: 0},
-		{model: names[2], createdAt: now.Add(-2 * time.Hour).Unix(), logType: 2, completionTokens: 1},
+		// Single and batch calls intentionally sample fetched_at independently.
+		// Keep the stale fixture away from an exact one-hour slot boundary so a
+		// one-second test transition cannot move it between adjacent slots.
+		{model: names[2], createdAt: now.Add(-2*time.Hour - 30*time.Minute).Unix(), logType: 2, completionTokens: 1},
 		{model: names[4], createdAt: now.Add(-4 * time.Second).Unix(), logType: 2, completionTokens: 0},
 	})
 
