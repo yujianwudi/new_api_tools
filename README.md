@@ -249,9 +249,9 @@ v0.6.1 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 ### 一键安装
 
 ```bash
-# TEMPLATE ONLY - replace every REPLACE_WITH_* value from the v0.6.1 Release
-INSTALLER_COMMIT_SHA=REPLACE_WITH_40_HEX_INSTALLER_COMMIT
-INSTALL_SCRIPT_SHA256=REPLACE_WITH_64_HEX_INSTALL_SCRIPT_SHA256
+# v0.6.1 installer is pinned to an immutable audited commit and blob hash.
+INSTALLER_COMMIT_SHA=2e46e6352f926c048fa996de51c53f2f40d9fbd0
+INSTALL_SCRIPT_SHA256=c23bae15c239a4ae2b11bcd1013d53d76eb20d4ca40ecdd163a381052d103462
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -264,7 +264,7 @@ NEWAPI_TOOLS_EXPECTED_REVISION=REPLACE_WITH_40_HEX_RELEASE_COMMIT \
 bash "$install_script"
 ```
 
-执行前必须从 v0.6.1 发行页复制真实的安装器 commit、脚本 SHA-256、manifest digest 与 release commit，并替换全部 `REPLACE_WITH_*`；任一占位符未替换时不要执行。
+安装器 commit 与脚本 SHA-256 已固定；执行前仍必须从 v0.6.1 发行页复制真实的 manifest digest 与 release commit，并替换剩余全部 `REPLACE_WITH_*`。任一占位符未替换时不要执行。
 
 安装器会：
 

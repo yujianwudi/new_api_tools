@@ -56,12 +56,12 @@
 
 ## 安装模板（替换全部占位符后才可执行）
 
-下面是发行身份模板，不是可直接执行的安装命令。`REPLACE_WITH_*` 故意不是合法 digest/commit；当前安装器会对未替换值失败关闭。
+下面是发行身份模板，不是可直接执行的安装命令。安装器 commit 与脚本 SHA-256 已固定到审计后的不可变对象；manifest digest 和 release commit 的 `REPLACE_WITH_*` 故意不是合法值，当前安装器会对未替换值失败关闭。
 
 ```bash
-# TEMPLATE ONLY - DO NOT RUN UNTIL EVERY REPLACE_WITH_* VALUE IS REPLACED
-INSTALLER_COMMIT_SHA=REPLACE_WITH_40_HEX_INSTALLER_COMMIT
-INSTALL_SCRIPT_SHA256=REPLACE_WITH_64_HEX_INSTALL_SCRIPT_SHA256
+# TEMPLATE ONLY - DO NOT RUN UNTIL EVERY REMAINING REPLACE_WITH_* VALUE IS REPLACED
+INSTALLER_COMMIT_SHA=2e46e6352f926c048fa996de51c53f2f40d9fbd0
+INSTALL_SCRIPT_SHA256=c23bae15c239a4ae2b11bcd1013d53d76eb20d4ca40ecdd163a381052d103462
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -74,7 +74,7 @@ NEWAPI_TOOLS_EXPECTED_REVISION=REPLACE_WITH_40_HEX_RELEASE_COMMIT \
 bash "$install_script"
 ```
 
-真实 commit、manifest digest 和 `install.sh` SHA-256 只在 tag 构建、签名和 provenance 全部验证后写入 GitHub Release。
+真实 release commit 与 manifest digest 只在 tag 构建、签名和 provenance 全部验证后写入 GitHub Release。固定安装器来自提交 `2e46e6352f926c048fa996de51c53f2f40d9fbd0`，其 Git blob 内容 SHA-256 为 `c23bae15c239a4ae2b11bcd1013d53d76eb20d4ca40ecdd163a381052d103462`。
 
 ## 回滚
 
@@ -91,24 +91,28 @@ bash "$install_script"
 
 候选代码的可重复门禁使用真实文件型 SQLite fixture、EXPLAIN、3 次预热和 20 次采样的 nearest-rank p95；阈值违约会使测试非零退出。
 
-| 路径 | fixture | 本地 windows/amd64 p95 | 门槛 |
+| 路径 | fixture | Linux/amd64 p95 | 门槛 |
 |---|---:|---:|---:|
-| 默认用户列表 | 100,000 users / 100,000 billable logs / 30 日 | 7.513 ms | 800 ms |
-| 7 日 active 筛选 | 同上 | 257.465 ms | 800 ms |
-| 邀请用户详情 | 99,999 invitees | 24.591 ms | 500 ms |
-| 邀请充值列表 + bundled summary | 100,000 users / 99,000 top-ups / 30 日 | 824.778 ms | 1.5 s |
-| 邀请充值详情 | 同上 | 64.256 ms | 500 ms |
-| 认证模型 `status/all` | 1,000 models，冷应用缓存 | 143.045 ms | 2 s |
-| 模型配置耐久提交 | 文件型 Tool Store | 1.504 ms | 500 ms |
+| 默认用户列表 | 100,000 users / 100,000 billable logs / 30 日 | 4.637 ms | 800 ms |
+| 7 日 active 筛选 | 同上 | 271.811 ms | 800 ms |
+| 邀请用户详情 | 99,999 invitees | 162.725 ms | 500 ms |
+| 邀请充值列表 | 100,000 users / 99,000 top-ups / 30 日 | 592.337 ms | 1.5 s |
+| 邀请充值 summary | 同上 | 192.136 ms | 1.5 s |
+| 邀请充值详情 | 同上 | 56.535 ms | 500 ms |
+| 20,000 行高偏斜邀请充值列表 | 单邀请人 20,000 条完整证据 | 345.017 ms | 1.5 s |
+| 20,000 行高偏斜邀请充值详情 | 同上 | 128.241 ms | 500 ms |
+| 认证模型 `status/all` | 1,000 models，冷应用缓存 | 115.936 ms | 2 s |
+| 模型配置耐久提交 | 文件型 Tool Store | 0.477 ms | 500 ms |
+| Redis 故障快速失败 | 文件型 Tool Store + Redis failure | 0.174 ms | 500 ms |
 
-这些数据用于发布回归，不替代 PostgreSQL/MySQL 和实际存储硬件上的容量测试。生产环境仍应持续观察同名 SLO，并在数据量或数据库方言变化时复测。
+以上数字来自提交 `2e46e6352f926c048fa996de51c53f2f40d9fbd0` 的推送前 Linux/amd64 候选运行，最终 PR/main SHA 的性能 workflow 必须重新确认。它们不替代 PostgreSQL/MySQL 和实际存储硬件上的容量测试。已跟踪的 CI 矩阵覆盖真实 SQLite、MySQL 8.4.6、PostgreSQL 16.4、特殊字符搜索、NULL、精确十进制 canonical hash 与 PostgreSQL 高精度 `NUMERIC` 漂移；本地 SQLite 单元与性能路径已通过，完整三引擎结果等待最终 PR/main SHA 的 GitHub CI services。生产环境仍应持续观察同名 SLO，并在数据量或数据库方言变化时复测。
 
 ## 发行门禁
 
 发布 commit 必须通过：
 
 - Go 全量、Linux race、vet、govulncheck；
-- 前端 Vitest/RTL/MSW、ESLint、TypeScript、生产构建和两级 npm audit；
+- 前端 67 项 Vitest/RTL/MSW、ESLint、TypeScript、生产构建和两级 npm audit；
 - 安装/升级/回滚、Tool Store 故障注入、日志库恢复和供应链 Shell 测试；
 - 10 万用户、30 天日志、邀请充值和 1000 模型性能工作流；
 - Actionlint、CodeQL、amd64/arm64 构建；
@@ -124,3 +128,4 @@ bash "$install_script"
 - 主动探测会产生真实上游请求；默认关闭，启用时必须使用低权限专用 key、白名单和预算。
 - SQLite 性能门禁不能代替生产 PostgreSQL/MySQL 容量测试。
 - Tool Store v12 不承诺由旧镜像直接读取；向下回滚必须恢复升级前数据库备份。
+- 390px、桌面宽度、深色模式、对比度、完整键盘路径与读屏的真实浏览器验收尚未执行；现有组件测试不能替代人工视觉与辅助技术验收，计划在取得 Playwright 许可或 CI 浏览器环境后于 v0.6.2 补齐。
