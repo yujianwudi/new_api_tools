@@ -441,8 +441,18 @@ func assertAffiliateParentQueryShape(
 	if !strings.Contains(strings.ToUpper(evidence.SQL), "LIMIT ?") {
 		t.Fatalf("SQLite evidence statement is missing the defensive LIMIT placeholder: %s", evidence.SQL)
 	}
-	if got := evidence.Args[len(evidence.Args)-1]; got != defaultAffiliateEvidenceRowCap+1 {
-		t.Fatalf("evidence LIMIT = %#v, want cap+1 = %d", got, defaultAffiliateEvidenceRowCap+1)
+	limitArg := evidence.Args[len(evidence.Args)-1]
+	var limit int64
+	switch value := limitArg.(type) {
+	case int:
+		limit = int64(value)
+	case int64:
+		limit = value
+	default:
+		t.Fatalf("evidence LIMIT type = %T, want int or int64", limitArg)
+	}
+	if limit != defaultAffiliateEvidenceRowCap+1 {
+		t.Fatalf("evidence LIMIT = %d, want cap+1 = %d", limit, defaultAffiliateEvidenceRowCap+1)
 	}
 	t.Logf("AFFILIATE_PERF query_count parent_total=%d heavy_aggregates=3 batch_evidence=1 batched_inviters=%d",
 		len(records), batchedInviters)
