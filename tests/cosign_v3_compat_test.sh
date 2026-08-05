@@ -21,6 +21,8 @@ extract_command_block() {
 for workflow in .github/workflows/build.yml .github/workflows/release-recovery.yml; do
   grep -Fq 'bash tests/cosign_v3_cli_smoke_test.sh' "$workflow" ||
     fail "$workflow does not execute the real pinned Cosign CLI surface gate"
+  grep -Fq 'bash tests/cue_policy_smoke_test.sh' "$workflow" ||
+    fail "$workflow does not evaluate CUE policy positive and negative fixtures"
   grep -Fq 'policy_file="$(mktemp --suffix=.cue)"' "$workflow" ||
     fail "$workflow does not give the CUE policy an explicit suffix"
   grep -Fq 'platform_digests: close({' "$workflow" ||
@@ -66,6 +68,8 @@ done
 recovery=.github/workflows/release-recovery.yml
 grep -Fq 'expected_manifest_digest:' "$recovery" ||
   fail 'recovery does not require the recorded immutable manifest digest'
+grep -Fq 'protected-main recovery is supported only for v0.6.2 and newer releases' "$recovery" ||
+  fail 'recovery does not reject legacy tags whose consumers cannot trust the main signer profile'
 grep -Fq '[[ "${GITHUB_REF}" == "refs/heads/main" ]]' "$recovery" ||
   fail 'recovery is not restricted to the protected main branch'
 grep -Fq 'RECOVERY_WORKFLOW_SHA: ${{ github.workflow_sha }}' "$recovery" ||

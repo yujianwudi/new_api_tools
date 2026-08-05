@@ -160,6 +160,9 @@ jobs:
           go-version-file: backend/go.mod
           cache: false
 
+      - name: Evaluate CUE provenance policy fixtures
+        run: bash tests/cue_policy_smoke_test.sh
+
       - name: Drill real Tool Store v9 migration and rollback
         run: bash tests/toolstore_sqlite_rollback_drill.sh
 

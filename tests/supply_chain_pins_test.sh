@@ -445,6 +445,8 @@ extract_command_block() {
 for workflow in .github/workflows/build.yml .github/workflows/release-recovery.yml; do
   grep -Fq 'bash tests/cosign_v3_cli_smoke_test.sh' "$workflow" ||
     fail "$workflow must execute the real pinned Cosign CLI surface gate"
+  grep -Fq 'bash tests/cue_policy_smoke_test.sh' "$workflow" ||
+    fail "$workflow must evaluate CUE policy positive and negative fixtures"
   grep -Fq 'cosign attest --yes' "$workflow" ||
     fail "$workflow must publish signed SLSA provenance for the immutable manifest"
   grep -Fq -- '--type slsaprovenance1' "$workflow" ||
@@ -479,6 +481,8 @@ for workflow in .github/workflows/build.yml .github/workflows/release-recovery.y
     fi
   done
 done
+grep -Fq 'cuelang.org/go/cmd/cue@v0.16.1' tests/cue_policy_smoke_test.sh ||
+  fail 'CUE policy smoke test must match the evaluator embedded in Cosign v3.1.2'
 for script in install.sh deploy.sh; do
   grep -Fq 'verify-attestation' "$script" ||
     fail "$script must verify signed release provenance before activation"
@@ -508,6 +512,9 @@ for script in install.sh deploy.sh; do
 done
 grep -Fq 'expected_manifest_digest:' .github/workflows/release-recovery.yml ||
   fail 'release recovery must require an operator-supplied immutable manifest digest'
+grep -Fq 'protected-main recovery is supported only for v0.6.2 and newer releases' \
+  .github/workflows/release-recovery.yml ||
+  fail 'release recovery must reject legacy tags whose consumers cannot trust the main signer profile'
 grep -Fq '[[ "${GITHUB_REF}" == "refs/heads/main" ]]' .github/workflows/release-recovery.yml ||
   fail 'release recovery must dispatch only from the protected main branch'
 grep -Fq 'RECOVERY_WORKFLOW_SHA: ${{ github.workflow_sha }}' .github/workflows/release-recovery.yml ||
