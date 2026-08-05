@@ -111,7 +111,7 @@ NewAPI-Tool 是 NewAPI 的**旁路运营与管理控制台**，不是新的 API 
 
 ## v0.6.1：生产安全整改
 
-`v0.6.1` 是对 v0.6.0 生产就绪审计的修复发行版，不扩大 NewAPI 数据面权限，也不把旁路控制台变成模型代理或财务真相源：
+`v0.6.1` 是对 v0.6.0 生产就绪审计的运行时修复基线，不扩大 NewAPI 数据面权限，也不把旁路控制台变成模型代理或财务真相源。该 tag 的 Cosign v3 attestation 未完成，因此未创建 GitHub Release，发行由 v0.6.2 接续：
 
 - 用户活动筛选、邀请分页和邀请充值详情统一快照与 SHA-256 证据身份；日志或币种证据不完整时显式返回 unavailable/partial/unreconciled。
 - Console 与 Embed 统一 fresh/stale/empty/unavailable 真值；过期或空数据不沿用旧成功率，Token Group 扩展范围的失败也明确显示不可用。
@@ -120,6 +120,20 @@ NewAPI-Tool 是 NewAPI 的**旁路运营与管理控制台**，不是新的 API 
 - 发票红冲增加原票归属与并发上限约束，历史异常保持 unreconciled；安装器、镜像和多架构产物以 commit、digest、OIDC 与 provenance 联合校验。
 
 本整改不表示 P1、P2 或 P3 整阶段完成。详细 Issue/PR、验收门禁和非目标见 [`V0.6.1_REMEDIATION_TASK_BOOK.md`](./V0.6.1_REMEDIATION_TASK_BOOK.md)。
+
+---
+
+## v0.6.2：供应链与恢复闭环
+
+`v0.6.2` 不扩大运行时功能范围，专门修复 v0.6.1 tag 构建暴露的发行死锁：
+
+- 按 Cosign v3.1.2 的真实命令契约分离 signature annotations 与 attestation predicate；
+- 让正常 tag build 与受保护 main recovery 使用不同且真实的 OIDC 身份；
+- 安装/部署从不可变 OCI index 精确绑定 amd64/arm64 子 digest；
+- recovery 只修复已存在且 digest 已知的 v0.6.2+ manifest，不重建镜像、不移动 exact/minor tag；
+- 把 tag object、peeled commit、workflow SHA、manifest digest 和 SLSA predicate 纳入写前/写后复核。
+
+详细任务、拒绝红线、测试矩阵与发行验收见 [`V0.6.2_SUPPLY_CHAIN_RECOVERY_TASK_BOOK.md`](./V0.6.2_SUPPLY_CHAIN_RECOVERY_TASK_BOOK.md)。
 
 ---
 
