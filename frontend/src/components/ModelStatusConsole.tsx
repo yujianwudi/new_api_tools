@@ -216,8 +216,8 @@ function combineHealth(traffic?: TrafficStatus, probe?: ProbeItem): { combined: 
   const probeHealth = probe?.probe_health ?? 'unavailable'
   const reasons: string[] = []
 
-  if (trafficHealth === 'unhealthy') reasons.push(`真实流量成功率 ${formatPercent(traffic?.success_rate)}`)
-  if (trafficHealth === 'degraded') reasons.push(`真实流量成功率下降至 ${formatPercent(traffic?.success_rate)}`)
+  if (trafficSource === 'fresh' && trafficHealth === 'unhealthy') reasons.push(`真实流量成功率 ${formatPercent(traffic?.success_rate)}`)
+  if (trafficSource === 'fresh' && trafficHealth === 'degraded') reasons.push(`真实流量成功率下降至 ${formatPercent(traffic?.success_rate)}`)
   if (trafficSource === 'stale') reasons.push('真实流量证据已过期')
   if (trafficSource === 'empty') reasons.push('当前窗口没有真实调用')
   if (trafficSource === 'unavailable') reasons.push('真实流量数据源不可用')
@@ -290,7 +290,6 @@ export function ModelStatusConsole() {
   const [error, setError] = useState('')
   const [timeWindow, setTimeWindow] = useState('24h')
   const activeWindowRef = useRef(timeWindow)
-  activeWindowRef.current = timeWindow
   const [search, setSearch] = useState('')
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
   const [statusFilter, setStatusFilter] = useState<'all' | CombinedHealth>('all')
@@ -305,6 +304,10 @@ export function ModelStatusConsole() {
   const refreshRequestId = useRef(0)
   const selectorTriggerRef = useRef<HTMLElement | null>(null)
   const detailTriggerRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    activeWindowRef.current = timeWindow
+  }, [timeWindow])
 
   const trafficStatuses = useMemo(
     () => trafficSnapshot.state === 'fresh' && trafficSnapshot.window === timeWindow ? trafficSnapshot.data : [],
@@ -505,14 +508,20 @@ export function ModelStatusConsole() {
   }, [])
 
   const restoreSelectorFocus = useCallback((event: Event) => {
-    event.preventDefault()
-    selectorTriggerRef.current?.focus()
+    const trigger = selectorTriggerRef.current
+    if (trigger?.isConnected) {
+      event.preventDefault()
+      trigger.focus()
+    }
     selectorTriggerRef.current = null
   }, [])
 
   const restoreDetailFocus = useCallback((event: Event) => {
-    event.preventDefault()
-    detailTriggerRef.current?.focus()
+    const trigger = detailTriggerRef.current
+    if (trigger?.isConnected) {
+      event.preventDefault()
+      trigger.focus()
+    }
     detailTriggerRef.current = null
   }, [])
 

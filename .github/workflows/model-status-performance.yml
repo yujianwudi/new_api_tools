@@ -34,4 +34,9 @@ jobs:
 
       - name: Run model status performance acceptance
         working-directory: backend
-        run: go test -tags=performance -run '^TestModelStatusPerformanceSLO$' -count=1 -v ./internal/handler
+        run: |
+          set -euo pipefail
+          test_name='TestModelStatusPerformanceSLO'
+          selected="$(go test -tags=performance -list "^${test_name}$" ./internal/handler)"
+          grep -Fxq -- "$test_name" <<<"$selected"
+          go test -tags=performance -run "^${test_name}$" -count=1 -v ./internal/handler

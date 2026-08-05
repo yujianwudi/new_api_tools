@@ -154,6 +154,7 @@ func TestInviteTopUpAnalysisHandlersRejectInvalidQueryBeforeDatabase(t *testing.
 	}{
 		{name: "page zero", target: "/api/users/invite-topup-analysis?page=0", handler: ListAffiliateStats},
 		{name: "page malformed", target: "/api/users/invite-topup-analysis?page=nope", handler: ListAffiliateStats},
+		{name: "page too large", target: "/api/users/invite-topup-analysis?page=100001", handler: ListAffiliateStats},
 		{name: "page size too large", target: "/api/users/invite-topup-analysis?page_size=101", handler: ListAffiliateStats},
 		{name: "invalid date", target: "/api/users/invite-topup-analysis?start_date=2026-02-30", handler: ListAffiliateStats},
 		{name: "unknown sort", target: "/api/users/invite-topup-analysis?sort_by=success_money", handler: ListAffiliateStats},

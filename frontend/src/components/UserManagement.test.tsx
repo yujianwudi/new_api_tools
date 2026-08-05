@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http } from 'msw'
 import type { ReactNode } from 'react'
@@ -125,13 +125,9 @@ function useSingleUserList(userID = 1, username = 'snapshot-inviter') {
 }
 
 describe('UserManagement request ownership', () => {
-  it('marks full activity statistics unavailable instead of preserving quick zeroes', async () => {
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+  it('keeps trustworthy never-requested evidence when full activity statistics are partial', async () => {
     server.use(
-      http.get('*/api/users/stats', ({ request }) => {
-        const quick = new URL(request.url).searchParams.get('quick') === 'true'
-        if (!quick) return jsonResponse({ success: false, error: { message: 'log source down' } }, 503)
-        return jsonResponse({
+      http.get('*/api/users/stats', () => jsonResponse({
           success: true,
           data: {
             total_users: 1,
@@ -141,18 +137,84 @@ describe('UserManagement request ownership', () => {
             never_requested: 1,
             source_state: 'partial',
           },
-        })
-      }),
+        })),
       http.get('*/api/users/soft-deleted/count', () => jsonResponse({ success: true, data: { count: 0 } })),
       http.get('*/api/auto-group/groups', () => jsonResponse({ success: true, data: { items: [], total: 0 } })),
       http.get('*/api/users', () => jsonResponse(userPayload(1, 'stats-user', 'never'))),
     )
 
     render(<UserManagement />)
-    expect(await screen.findByText('活跃度统计来源不可用；未计算或旧值不会显示为可信数字。')).toBeVisible()
-    expect(screen.getAllByText('N/A')).toHaveLength(4)
-    expect(screen.queryByText('计算中...')).not.toBeInTheDocument()
-    cleanup()
+    expect(await screen.findByText('活跃度证据不完整；当前仅“从未请求”可作为可信数字，其余指标不会显示为 0。')).toBeVisible()
+    expect(screen.getAllByText('N/A')).toHaveLength(3)
+    expect(screen.getByRole('button', { name: /^从未请求 1/ })).toBeVisible()
+    expect(screen.getByRole('button', { name: '预览非常不活跃 (N/A)' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '预览从未请求 (1)' })).toBeEnabled()
+  })
+
+  it('prevents an aborted older statistics response from overwriting a newer refresh', async () => {
+    const olderFull = deferredResponse()
+    let fullCalls = 0
+    let markOlderStarted!: () => void
+    const olderStarted = new Promise<void>(resolve => { markOlderStarted = resolve })
+    server.use(
+      http.get('*/api/users/stats', ({ request }) => {
+        const quick = new URL(request.url).searchParams.get('quick') === 'true'
+        if (quick) {
+          return jsonResponse({
+            success: true,
+            data: {
+              total_users: 1,
+              active_users: null,
+              inactive_users: null,
+              very_inactive_users: null,
+              never_requested: 1,
+              source_state: 'partial',
+            },
+          })
+        }
+        fullCalls += 1
+        if (fullCalls === 1) {
+          markOlderStarted()
+          return olderFull.promise.then(response => response.clone())
+        }
+        return jsonResponse({
+          success: true,
+          data: {
+            total_users: 7,
+            active_users: 7,
+            inactive_users: 0,
+            very_inactive_users: 0,
+            never_requested: 0,
+            source_state: 'fresh',
+          },
+        })
+      }),
+      http.get('*/api/users/soft-deleted/count', () => jsonResponse({ success: true, data: { count: 0 } })),
+      http.get('*/api/auto-group/groups', () => jsonResponse({ success: true, data: { items: [], total: 0 } })),
+      http.get('*/api/users', () => jsonResponse(userPayload(1, 'stats-owner-user'))),
+    )
+
+    const actor = userEvent.setup()
+    render(<UserManagement />)
+    expect(await screen.findByText('stats-owner-user')).toBeVisible()
+    await olderStarted
+
+    await actor.click(screen.getByRole('button', { name: '刷新' }))
+    expect(await screen.findByRole('button', { name: /^活跃用户 7/ })).toBeVisible()
+
+    olderFull.resolve(jsonResponse({
+      success: true,
+      data: {
+        total_users: 99,
+        active_users: 99,
+        inactive_users: 0,
+        very_inactive_users: 0,
+        never_requested: 0,
+        source_state: 'fresh',
+      },
+    }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^活跃用户 99/ })).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /^活跃用户 7/ })).toBeVisible()
   })
 
   it('keeps rows locked while a newer request is pending and ignores the older completion', async () => {
@@ -191,7 +253,6 @@ describe('UserManagement request ownership', () => {
     expect(await screen.findByText('latest-inactive-user')).toBeVisible()
     expect(screen.queryByText('older-active-user')).not.toBeInTheDocument()
     expect(screen.queryByText('initial-user')).not.toBeInTheDocument()
-    cleanup()
   })
 
   it('binds invited-user responses to the selected user and page', async () => {
@@ -227,7 +288,6 @@ describe('UserManagement request ownership', () => {
     inviterA.resolve(jsonResponse(invitedPayload(1, 101, 'invite-for-a')))
     await waitFor(() => expect(screen.queryByText('invite-for-a')).not.toBeInTheDocument())
     expect(screen.getByText('invite-for-b')).toBeVisible()
-    cleanup()
   })
 
   it('replays the first-page as_of and SHA-256 fingerprint for normal invited-user pagination', async () => {

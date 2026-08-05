@@ -12,16 +12,12 @@ export interface InviteTopUpFingerprintInput {
 
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/
 
-function appendLengthPrefixed(target: number[], value: string) {
+function appendLengthPrefixed(target: Uint8Array[], value: string) {
   const encoded = new TextEncoder().encode(value)
   if (encoded.byteLength > 0xffff_ffff) throw new Error('邀请充值查询字段过长')
-  target.push(
-    (encoded.byteLength >>> 24) & 0xff,
-    (encoded.byteLength >>> 16) & 0xff,
-    (encoded.byteLength >>> 8) & 0xff,
-    encoded.byteLength & 0xff,
-    ...encoded,
-  )
+  const prefix = new Uint8Array(4)
+  new DataView(prefix.buffer).setUint32(0, encoded.byteLength, false)
+  target.push(prefix, encoded)
 }
 
 // Cross-language v2 canonical form. Every label and value is UTF-8 encoded
@@ -39,12 +35,19 @@ export function canonicalInviteTopUpQuery(input: InviteTopUpFingerprintInput): U
     ['as_of', String(input.asOf)],
     ['timezone', INVITE_TOP_UP_TIMEZONE],
   ]
-  const bytes: number[] = []
+  const chunks: Uint8Array[] = []
   for (const [label, value] of fields) {
-    appendLengthPrefixed(bytes, label)
-    appendLengthPrefixed(bytes, value)
+    appendLengthPrefixed(chunks, label)
+    appendLengthPrefixed(chunks, value)
   }
-  return new Uint8Array(bytes)
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
+  const canonical = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    canonical.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return canonical
 }
 
 export async function inviteTopUpQueryFingerprint(

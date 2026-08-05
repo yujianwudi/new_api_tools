@@ -219,7 +219,10 @@ func decodeLegacyModelStatusConfig(rawValues map[string]json.RawMessage) (ModelS
 		}
 		present = append(present, strings.TrimPrefix(key, "model_status:"))
 		totalBytes += len(raw)
-		if len(raw) == 0 || totalBytes > MaxModelStatusConfigBytes {
+		if len(raw) == 0 {
+			return ModelStatusConfig{}, nil, fmt.Errorf("%w: legacy Redis key %s is empty", ErrModelStatusConfigInvalid, key)
+		}
+		if totalBytes > MaxModelStatusConfigBytes {
 			return ModelStatusConfig{}, nil, fmt.Errorf("%w: legacy Redis configuration exceeds the size limit", ErrModelStatusConfigInvalid)
 		}
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
@@ -685,8 +688,8 @@ func cloneCustomGroups(groups []ModelStatusCustomGroup) []ModelStatusCustomGroup
 
 func validateUniqueModelNames(values []string, allowEmpty bool) error {
 	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
+	for index := range values {
+		value := strings.TrimSpace(values[index])
 		if (!allowEmpty && value == "") || len(value) > 256 || containsControl(value) {
 			return errors.New("invalid model name")
 		}
@@ -695,6 +698,7 @@ func validateUniqueModelNames(values []string, allowEmpty bool) error {
 			return errors.New("duplicate model name")
 		}
 		seen[key] = struct{}{}
+		values[index] = value
 	}
 	return nil
 }

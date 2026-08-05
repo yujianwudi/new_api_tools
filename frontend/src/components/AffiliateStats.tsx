@@ -660,11 +660,11 @@ export function AffiliateStats() {
                                   <Button
                                     variant="outline" size="sm" disabled={detailPage <= 1}
                                     onClick={event => { event.stopPropagation(); void fetchDetails(row.inviter_id, detailPage - 1) }}
-                                  ><ChevronLeft className="h-3 w-3 mr-1" />上一页</Button>
+                                  ><ChevronLeft aria-hidden="true" className="h-3 w-3 mr-1" />上一页</Button>
                                   <Button
                                     variant="outline" size="sm" disabled={detailPage >= detailData.total_pages}
                                     onClick={event => { event.stopPropagation(); void fetchDetails(row.inviter_id, detailPage + 1) }}
-                                  >下一页<ChevronRight className="h-3 w-3 ml-1" /></Button>
+                                  >下一页<ChevronRight aria-hidden="true" className="h-3 w-3 ml-1" /></Button>
                                 </div>
                               )}
                             </div>

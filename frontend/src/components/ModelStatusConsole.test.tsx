@@ -102,9 +102,78 @@ describe('ModelStatusConsole keyboard and dialog lifecycle', () => {
     const rangeTrigger = await screen.findByRole('button', { name: '监控范围' })
     await actor.click(rangeTrigger)
     expect(await screen.findByRole('dialog', { name: '监控范围' })).toBeVisible()
-    expect(screen.getByRole('textbox', { name: '搜索可监控模型' })).toHaveFocus()
+    await waitFor(() => expect(screen.getByRole('textbox', { name: '搜索可监控模型' })).toHaveFocus())
     await actor.keyboard('{Escape}')
     await waitFor(() => expect(screen.queryByRole('dialog', { name: '监控范围' })).not.toBeInTheDocument())
     expect(rangeTrigger).toHaveFocus()
+  })
+
+  it('does not try to focus a detached detail trigger when the dialog closes', async () => {
+    installModelStatusHandlers()
+    const actor = userEvent.setup()
+    render(<ModelStatusConsole />)
+
+    const detailTrigger = await screen.findByRole('button', { name: '打开模型 model-a 诊断详情' })
+    await actor.click(detailTrigger)
+    expect(await screen.findByRole('dialog', { name: 'model-a' })).toBeVisible()
+
+    const focus = vi.spyOn(detailTrigger, 'focus')
+    const dispatchEvent = EventTarget.prototype.dispatchEvent
+    let unmountAutoFocusDispatched = false
+    vi.spyOn(EventTarget.prototype, 'dispatchEvent').mockImplementation(function (this: EventTarget, event) {
+      const dispatched = dispatchEvent.call(this, event)
+      if (event.type === 'focusScope.autoFocusOnUnmount') unmountAutoFocusDispatched = true
+      return dispatched
+    })
+    detailTrigger.remove()
+
+    await actor.keyboard('{Escape}')
+    await waitFor(() => expect(unmountAutoFocusDispatched).toBe(true))
+    expect(focus).not.toHaveBeenCalled()
+  })
+
+  it('does not try to focus a detached monitor-range trigger when the dialog closes', async () => {
+    installModelStatusHandlers()
+    const actor = userEvent.setup()
+    render(<ModelStatusConsole />)
+
+    const rangeTrigger = await screen.findByRole('button', { name: '监控范围' })
+    await actor.click(rangeTrigger)
+    expect(await screen.findByRole('dialog', { name: '监控范围' })).toBeVisible()
+
+    const focus = vi.spyOn(rangeTrigger, 'focus')
+    const dispatchEvent = EventTarget.prototype.dispatchEvent
+    let unmountAutoFocusDispatched = false
+    vi.spyOn(EventTarget.prototype, 'dispatchEvent').mockImplementation(function (this: EventTarget, event) {
+      const dispatched = dispatchEvent.call(this, event)
+      if (event.type === 'focusScope.autoFocusOnUnmount') unmountAutoFocusDispatched = true
+      return dispatched
+    })
+    rangeTrigger.remove()
+
+    await actor.keyboard('{Escape}')
+    await waitFor(() => expect(unmountAutoFocusDispatched).toBe(true))
+    expect(focus).not.toHaveBeenCalled()
+  })
+
+  it('does not describe a stale traffic snapshot as a degraded numeric rate', async () => {
+    installModelStatusHandlers()
+    server.use(http.post('*/api/model-status/status/batch', () => response([{
+      model_name: 'model-a',
+      time_window: '24h',
+      total_requests: 12,
+      success_count: 10,
+      failure_count: 2,
+      success_rate: null,
+      current_status: 'yellow',
+      traffic_health: 'degraded',
+      source_state: 'stale',
+      slot_data: [],
+    }])))
+
+    render(<ModelStatusConsole />)
+
+    expect((await screen.findAllByText('真实流量证据已过期')).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/真实流量成功率下降至/)).not.toBeInTheDocument()
   })
 })

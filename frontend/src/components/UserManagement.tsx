@@ -197,6 +197,11 @@ export function UserManagement() {
   const [activeTab, setActiveTab] = useState<'list' | 'affiliate'>('list')
   const [stats, setStats] = useState<ActivityStats | null>(null)
   const [statsState, setStatsState] = useState<StatsDataState>('loading')
+  const statsRequestRef = useRef<{ sequence: number; controller: AbortController | null }>({
+    sequence: 0,
+    controller: null,
+  })
+  const statsFullFetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [users, setUsers] = useState<UserInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [userQueryState, setUserQueryState] = useState<QueryDataState>('loading')
@@ -345,11 +350,13 @@ export function UserManagement() {
     try {
       const data = await fetchNewAPICapabilities({ apiUrl, token, signal })
       if (!signal?.aborted) setNewAPICapabilities(data)
+      return !signal?.aborted
     } catch (error) {
       if (!signal?.aborted) {
         setNewAPICapabilities(null)
         setCapabilitiesError(error instanceof Error ? error.message : '能力探测失败')
       }
+      return false
     } finally {
       if (!signal?.aborted) setCapabilitiesLoading(false)
     }
@@ -370,10 +377,22 @@ export function UserManagement() {
   }
 
   const fetchStats = useCallback(async (quick = false) => {
+    statsRequestRef.current.controller?.abort()
+    if (statsFullFetchTimerRef.current !== null) {
+      clearTimeout(statsFullFetchTimerRef.current)
+      statsFullFetchTimerRef.current = null
+    }
+    const controller = new AbortController()
+    const sequence = statsRequestRef.current.sequence + 1
+    statsRequestRef.current = { sequence, controller }
     try {
       const params = quick ? '?quick=true' : ''
-      const response = await fetch(`${apiUrl}/api/users/stats${params}`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/users/stats${params}`, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
       const data = await response.json()
+      if (statsRequestRef.current.sequence !== sequence || controller.signal.aborted) return false
       if (!response.ok || !data.success || !data.data) {
         throw new Error(data.error?.message || '用户活跃度统计不可用')
       }
@@ -382,12 +401,21 @@ export function UserManagement() {
         setStatsState('partial')
         // 快速响应只包含总数与“从未请求”；无论这些值是否为 0，
         // 都必须继续获取完整证据，不能把未计算字段当成可信零。
-        setTimeout(() => { void fetchStats(false) }, 100)
+        statsFullFetchTimerRef.current = setTimeout(() => {
+          statsFullFetchTimerRef.current = null
+          if (statsRequestRef.current.sequence === sequence && !controller.signal.aborted) {
+            void fetchStats(false)
+          }
+        }, 100)
       } else {
-        setStatsState(data.data.source_state === 'fresh' ? 'fresh' : 'unavailable')
+        setStatsState(data.data.source_state === 'fresh'
+          ? 'fresh'
+          : data.data.source_state === 'partial' ? 'partial' : 'unavailable')
       }
       return true
     } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return false
+      if (statsRequestRef.current.sequence !== sequence) return false
       console.error('Failed to fetch stats:', error)
       setStatsState('unavailable')
       return false
@@ -812,9 +840,16 @@ export function UserManagement() {
   }
 
   useEffect(() => {
-    fetchStats(true)  // 首次加载使用快速模式
-    fetchSoftDeletedCount()  // 获取软删除用户数量
-    fetchGroups()  // 获取分组列表
+    void fetchStats(true)  // 首次加载使用快速模式
+    void fetchSoftDeletedCount()  // 获取软删除用户数量
+    void fetchGroups()  // 获取分组列表
+    return () => {
+      statsRequestRef.current.controller?.abort()
+      if (statsFullFetchTimerRef.current !== null) {
+        clearTimeout(statsFullFetchTimerRef.current)
+        statsFullFetchTimerRef.current = null
+      }
+    }
   }, [fetchStats, fetchSoftDeletedCount, fetchGroups])
 
   useEffect(() => {
@@ -834,9 +869,9 @@ export function UserManagement() {
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    const [usersOK, statsOK] = await Promise.all([fetchUsers(), fetchStats(), loadNewAPICapabilities()])
+    const [usersOK, statsOK, capabilitiesOK] = await Promise.all([fetchUsers(), fetchStats(), loadNewAPICapabilities()])
     setRefreshing(false)
-    if (usersOK && statsOK) showToast('success', '数据已刷新')
+    if (usersOK && statsOK && capabilitiesOK) showToast('success', '数据已刷新')
     else showToast('error', '刷新未完整成功，失败数据已明确标记')
   }
 
@@ -1126,7 +1161,7 @@ export function UserManagement() {
       {/* Activity Stats Cards */}
       {statsState === 'partial' && (
         <div role="status" aria-live="polite" className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100">
-          快速统计仅包含用户总数与“从未请求”；其余活跃度正在读取日志证据，不会暂时显示为 0。
+          活跃度证据不完整；当前仅“从未请求”可作为可信数字，其余指标不会显示为 0。
         </div>
       )}
       {statsState === 'unavailable' && (
@@ -1196,7 +1231,7 @@ export function UserManagement() {
                   disabled={batchPreviewing !== null || !stats?.very_inactive_users}
                 >
                   {batchPreviewing === 'very_inactive:soft' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
-                  预览非常不活跃 ({stats?.very_inactive_users || 0})
+                  预览非常不活跃 ({activityStatValue(stats?.very_inactive_users)})
                 </Button>
                 <Button
                   variant="outline"
@@ -1206,7 +1241,7 @@ export function UserManagement() {
                   disabled={batchPreviewing !== null || !stats?.never_requested}
                 >
                   {batchPreviewing === 'never:soft' ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
-                  预览从未请求 ({stats?.never_requested || 0})
+                  预览从未请求 ({activityStatValue(stats?.never_requested, true)})
                 </Button>
               </div>
             </div>
@@ -1916,10 +1951,10 @@ export function UserManagement() {
                   </div>
 
                   {/* 分页 */}
-                  {invitedUsers.total > 10 && (
+                  {invitedUsers.total > INVITED_USERS_PAGE_SIZE && (
                     <div className="flex items-center justify-between pt-2">
                       <span className="text-xs text-muted-foreground">
-                        第 {invitedPage} 页，共 {Math.ceil(invitedUsers.total / 10)} 页
+                        第 {invitedPage} 页，共 {Math.ceil(invitedUsers.total / INVITED_USERS_PAGE_SIZE)} 页
                       </span>
                       <div className="flex gap-1">
                         <Button
@@ -1939,7 +1974,7 @@ export function UserManagement() {
                           size="sm"
                           className="h-7 px-2 text-xs"
                           onClick={() => setInvitedPage(p => p + 1)}
-                          disabled={invitedPage >= Math.ceil(invitedUsers.total / 10) || invitedLoading || invitedState === 'stale'}
+                          disabled={invitedPage >= Math.ceil(invitedUsers.total / INVITED_USERS_PAGE_SIZE) || invitedLoading || invitedState === 'stale'}
                           aria-label="邀请用户下一页"
                         >
                           <ChevronRight aria-hidden="true" className="h-3 w-3" />

@@ -529,6 +529,9 @@ func cleanSQLitePath(path string) (string, error) {
 	if trimmed == "" || trimmed == "." || trimmed == string(filepath.Separator) || trimmed == ":memory:" {
 		return "", fmt.Errorf("unsafe SQLite path")
 	}
+	if strings.ContainsAny(trimmed, "?#") {
+		return "", fmt.Errorf("unsafe SQLite path: DSN delimiters are not allowed")
+	}
 	absolute, err := filepath.Abs(filepath.Clean(trimmed))
 	if err != nil {
 		return "", err

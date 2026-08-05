@@ -40,12 +40,13 @@ func (s *Store) GetLatestModelStatusConfig(ctx context.Context) (ModelStatusConf
 }
 
 func (s *Store) GetModelStatusConfigVersion(ctx context.Context, version int64) (ModelStatusConfigVersion, error) {
+	if s == nil || s.db == nil {
+		return ModelStatusConfigVersion{}, ErrStoreClosed
+	}
 	if version <= 0 {
 		return ModelStatusConfigVersion{}, fmt.Errorf("%w: model status config version must be positive", ErrInvalid)
 	}
-	return scanModelStatusConfig(s.db.QueryRowContext(ctx, `SELECT version, previous_version, changed_key,
-		config_json, actor, request_id, reason, operation_key, created_at
-		FROM model_status_config_versions WHERE version = ?`, version))
+	return getModelStatusConfig(ctx, s.db, version)
 }
 
 func (s *Store) GetModelStatusConfigByOperationKey(ctx context.Context, operationKey string) (ModelStatusConfigVersion, error) {

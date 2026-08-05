@@ -122,4 +122,16 @@ load_install_toolstore_transaction_library "$missing_target" ||
 [[ "$TOOLSTORE_TXN_LIBRARY_SOURCE" == "${recovery_root}/recovery-library.sh" ]] ||
   fail 'installer did not prefer the external recovery library'
 
+# The install-time resolver writes one path to stdout. Even if the env parser is
+# replaced or extended later, an embedded newline must not become two paths.
+unsafe_path_project="${TEST_TMP}/unsafe-toolstore-path"
+mkdir -p "${unsafe_path_project}/data"
+printf 'TOOL_STORE_PATH=./data/control-plane.db\n' >"${unsafe_path_project}/.env"
+if (
+  env_file_value() { printf './data/control\nplane.db\n'; }
+  resolve_install_toolstore_host_path "${unsafe_path_project}/.env" "$unsafe_path_project"
+) >/dev/null; then
+  fail 'install Tool Store resolver accepted an embedded newline'
+fi
+
 printf 'PASS: atomic clone, interrupted checkout, and external recovery-library checks\n'

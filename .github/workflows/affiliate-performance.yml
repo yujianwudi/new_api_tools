@@ -36,9 +36,9 @@ jobs:
         working-directory: backend
         env:
           AFFILIATE_PERF: '1'
-        run: >-
-          go test ./internal/service
-          -run '^TestAffiliateStatsPerformanceAcceptance$'
-          -count=1
-          -v
-          -timeout 10m
+        run: |
+          set -euo pipefail
+          test_name='TestAffiliateStatsPerformanceAcceptance'
+          selected="$(go test -list "^${test_name}$" ./internal/service)"
+          grep -Fxq -- "$test_name" <<<"$selected"
+          go test ./internal/service -run "^${test_name}$" -count=1 -v -timeout 10m

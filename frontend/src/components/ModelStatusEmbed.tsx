@@ -925,6 +925,7 @@ export function ModelStatusEmbed({
   const [maxBatch, setMaxBatch] = useState(PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
   const [statusWindow, setStatusWindow] = useState('')
+  const [statusFetchFailed, setStatusFetchFailed] = useState(false)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -1072,6 +1073,7 @@ export function ModelStatusEmbed({
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
     const requestId = ++statusRequestIdRef.current
     statusRequestControllerRef.current?.abort()
+    setStatusFetchFailed(false)
 
     if (fetchSet.length === 0) {
       statusRequestControllerRef.current = null
@@ -1083,6 +1085,7 @@ export function ModelStatusEmbed({
 
     const controller = new AbortController()
     statusRequestControllerRef.current = controller
+    setLoading(true)
     try {
       const chunkResults = await mapWithConcurrency(
         chunkModelNames(fetchSet, maxBatch),
@@ -1105,12 +1108,14 @@ export function ModelStatusEmbed({
       if (requestId !== statusRequestIdRef.current) return
       setModelStatuses(chunkResults.flat())
       setStatusWindow(timeWindow)
+      setStatusFetchFailed(false)
       setLastUpdate(new Date())
     } catch (error) {
       if (controller.signal.aborted || requestId !== statusRequestIdRef.current || isEmbedAbortError(error)) return
       controller.abort()
       setModelStatuses([])
       setStatusWindow(timeWindow)
+      setStatusFetchFailed(true)
       setLastUpdate(null)
       console.error('Failed to fetch model statuses:', error)
     } finally {
@@ -1211,7 +1216,7 @@ export function ModelStatusEmbed({
   }
 
   // Loading state
-  if (loading && displayedModelStatuses.length === 0) {
+  if ((loading || statusWindow !== timeWindow) && displayedModelStatuses.length === 0) {
     return (
       <div
         className={cn("min-h-screen flex items-center justify-center", styles.container)}
@@ -1468,7 +1473,11 @@ export function ModelStatusEmbed({
           </div>
         ) : (
           <div className={cn("text-center py-16", styles.emptyText)}>
-            {selectedModels.length === 0 ? '请在管理界面选择要监控的模型' : '暂无模型状态数据'}
+            {selectedModels.length === 0
+              ? '请在管理界面选择要监控的模型'
+              : statusFetchFailed
+                ? '模型状态数据源暂不可用，请稍后重试'
+                : '暂无模型状态数据'}
           </div>
         )}
 

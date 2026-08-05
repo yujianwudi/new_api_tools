@@ -27,6 +27,13 @@ describe('invite top-up query fingerprint v2', () => {
     expect(equalSha256Hex(fixtureDigest, 'f'.repeat(64))).toBe(false)
   })
 
+  it('canonicalizes large search fields without spreading bytes into function arguments', () => {
+    const largeSearch = '测'.repeat(100_000)
+    const canonical = canonicalInviteTopUpQuery({ ...fixture, search: largeSearch })
+
+    expect(canonical.byteLength).toBeGreaterThan(new TextEncoder().encode(largeSearch).byteLength)
+  })
+
   it('fails closed when Web Crypto is unavailable or digesting fails', async () => {
     await expect(inviteTopUpQueryFingerprint(fixture, null)).rejects.toThrow('SHA-256')
     const digest = vi.fn().mockRejectedValue(new Error('crypto failed'))

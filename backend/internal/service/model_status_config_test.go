@@ -245,12 +245,12 @@ func TestImportLegacyModelStatusConfigReadsValidatesAndAuditsWholeRedisGroup(t *
 	ctx := context.Background()
 	store := newModelConfigTestStore(t)
 	reader := &fakeLegacyModelStatusConfigReader{values: map[string]json.RawMessage{
-		"model_status:selected_models":  json.RawMessage(`["gpt-a","gpt-b"]`),
+		"model_status:selected_models":  json.RawMessage(`[" gpt-a","gpt-b "]`),
 		"model_status:time_window":      json.RawMessage(`"12h"`),
 		"model_status:theme":            json.RawMessage(`"dark"`),
 		"model_status:refresh_interval": json.RawMessage(`120`),
 		"model_status:sort_mode":        json.RawMessage(`"custom"`),
-		"model_status:custom_order":     json.RawMessage(`["gpt-b","gpt-a"]`),
+		"model_status:custom_order":     json.RawMessage(`[" gpt-b ","gpt-a"]`),
 		"model_status:custom_groups":    json.RawMessage(`[{"id":"primary","name":"Primary","icon":"star","models":["gpt-a"]}]`),
 		"model_status:site_title":       json.RawMessage(`"Production models"`),
 	}}
@@ -270,7 +270,9 @@ func TestImportLegacyModelStatusConfigReadsValidatesAndAuditsWholeRedisGroup(t *
 	if snapshot.Config.TimeWindow != "12h" || snapshot.Config.Theme != "obsidian" ||
 		snapshot.Config.RefreshInterval != 120 || snapshot.Config.SortMode != "custom" ||
 		snapshot.Config.SiteTitle != "Production models" || len(snapshot.Config.SelectedModels) != 2 ||
-		len(snapshot.Config.CustomOrder) != 2 || len(snapshot.Config.CustomGroups) != 1 {
+		len(snapshot.Config.CustomOrder) != 2 || len(snapshot.Config.CustomGroups) != 1 ||
+		snapshot.Config.SelectedModels[0] != "gpt-a" || snapshot.Config.SelectedModels[1] != "gpt-b" ||
+		snapshot.Config.CustomOrder[0] != "gpt-b" || snapshot.Config.CustomOrder[1] != "gpt-a" {
 		t.Fatalf("imported legacy config = %+v", snapshot.Config)
 	}
 	record, err := store.GetModelStatusConfigByOperationKey(ctx, legacyModelStatusConfigOperationKey)
@@ -328,6 +330,33 @@ func TestImportLegacyModelStatusConfigFailsClosedWithoutAdvancingDurableVersion(
 				t.Fatalf("failed import marker error = %v, want ErrNotFound", markerErr)
 			}
 		})
+	}
+}
+
+func TestDecodeLegacyModelStatusConfigReportsEmptyValue(t *testing.T) {
+	_, _, err := decodeLegacyModelStatusConfig(map[string]json.RawMessage{
+		"model_status:theme": json.RawMessage{},
+	})
+	if !errors.Is(err, ErrModelStatusConfigInvalid) ||
+		!strings.Contains(err.Error(), "legacy Redis key model_status:theme is empty") ||
+		strings.Contains(err.Error(), "exceeds the size limit") {
+		t.Fatalf("empty legacy value error = %v", err)
+	}
+}
+
+func TestValidateModelStatusConfigTrimsModelLists(t *testing.T) {
+	configValue := defaultModelStatusConfig()
+	configValue.SelectedModels = []string{" model-a ", "\tmodel-b"}
+	configValue.CustomOrder = []string{" model-b\n", "model-a "}
+
+	if err := ValidateModelStatusConfig(&configValue); err != nil {
+		t.Fatalf("ValidateModelStatusConfig() error = %v", err)
+	}
+	if got := strings.Join(configValue.SelectedModels, ","); got != "model-a,model-b" {
+		t.Fatalf("trimmed selected_models = %q", got)
+	}
+	if got := strings.Join(configValue.CustomOrder, ","); got != "model-b,model-a" {
+		t.Fatalf("trimmed custom_order = %q", got)
 	}
 }
 

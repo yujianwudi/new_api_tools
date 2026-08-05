@@ -619,7 +619,7 @@ resolve_install_toolstore_host_path() {
     data/*) relative="$raw" ;;
     *) return 1 ;;
   esac
-  [[ "$relative" != "data/" && "$relative" != */ ]] || return 1
+  [[ "$relative" != "data/" && "$relative" != */ && "$relative" != *$'\n'* ]] || return 1
   host="$(realpath -m -s -- "${project}/${relative}" 2>/dev/null)" || return 1
   data_root="$(realpath -m -s -- "${project}/data" 2>/dev/null)" || return 1
   [[ "$host" == "$data_root"/* && "$host" == "$(realpath -m -- "$host" 2>/dev/null)" ]] || return 1

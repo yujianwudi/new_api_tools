@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
+	"github.com/new-api-tools/backend/internal/config"
 )
 
 func TestGetModelStatusPropagatesLogQueryErrors(t *testing.T) {
@@ -91,6 +92,11 @@ func TestGetModelStatusMarksSuccessfulEmptyQueryUnknown(t *testing.T) {
 
 func TestGetModelStatusMakesStaleHistoryNonAuthoritative(t *testing.T) {
 	db := installSQLiteForTests(t)
+	if cfg := config.GetOptional(); cfg != nil {
+		previous := cfg.LogFreshnessMaxAge
+		cfg.LogFreshnessMaxAge = 15 * time.Minute
+		t.Cleanup(func() { cfg.LogFreshnessMaxAge = previous })
+	}
 	db.MustExec(`CREATE TABLE logs (
 		model_name TEXT,
 		created_at INTEGER,

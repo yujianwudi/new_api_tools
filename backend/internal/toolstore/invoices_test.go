@@ -536,6 +536,46 @@ func TestVoidingOriginalBlueInvalidatesRelationsAndMakesNetUnreconciled(t *testi
 	}
 }
 
+func TestVoidedRedRelationMismatchDoesNotMakeNetUnreconciled(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	blue := createTestInvoice(t, store, testInvoiceInput("void-red-first-blue", "BLUE-VOID-RED-FIRST", InvoiceBlue, 100))
+	redInput := testInvoiceInput("void-red-first-red", "RED-VOID-RED-FIRST", InvoiceRed, 20)
+	redInput.RelatedInvoiceNumber = blue.InvoiceNumber
+	red := createTestInvoice(t, store, redInput)
+
+	redVoidAudit := testMutationAudit(actionInvoiceVoid)
+	redVoidAudit.IdempotencyKey = "void-red-first-red-operation"
+	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: red.ID, Reason: "red invoice was voided first", IdempotencyKey: redVoidAudit.IdempotencyKey,
+	}, redVoidAudit); err != nil {
+		t.Fatalf("void red invoice: %v", err)
+	}
+	blueVoidAudit := testMutationAudit(actionInvoiceVoid)
+	blueVoidAudit.IdempotencyKey = "void-red-first-blue-operation"
+	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: blue.ID, Reason: "blue invoice was voided after its red invoice", IdempotencyKey: blueVoidAudit.IdempotencyKey,
+	}, blueVoidAudit); err != nil {
+		t.Fatalf("void blue invoice: %v", err)
+	}
+
+	reloaded, err := store.GetInvoice(ctx, red.ID)
+	if err != nil || reloaded.Document.RelationState != InvoiceRelationUnreconciled {
+		t.Fatalf("voided red relation = %+v, %v", reloaded, err)
+	}
+	summary, err := store.InvoiceSummary(ctx, InvoiceSummaryFilter{})
+	if err != nil || len(summary.Groups) != 1 {
+		t.Fatalf("summary after both voids = %+v, %v", summary, err)
+	}
+	group := summary.Groups[0]
+	if group.NetIssuedMinor == nil || *group.NetIssuedMinor != "0" || group.SourceHealth != "ok" ||
+		group.UnreconciledCount != 0 || group.AnomalyCount != 0 || group.EffectiveCount != 0 ||
+		group.VoidedCount != 2 || group.VoidedBlueMinor != "100" || group.VoidedRedMinor != "20" ||
+		summary.SourceHealth != "ok" || summary.UnreconciledCount != 0 || summary.AnomalyCount != 0 {
+		t.Fatalf("voided-only relation mismatch corrupted net trust: group=%+v overall=%+v", group, summary)
+	}
+}
+
 func TestConcurrentRedInvoicesAcrossStoresCannotExceedOriginal(t *testing.T) {
 	first, path := newTestStore(t)
 	second, err := Init(path)

@@ -172,6 +172,17 @@ jobs:
         env:
           AFFILIATE_PERF: '1'
         run: |
+          set -euo pipefail
+          require_selected_test() {
+            local package="$1" test_name="$2"
+            shift 2
+            local selected
+            selected="$(go test "$@" -list "^${test_name}$" "$package")"
+            grep -Fxq -- "$test_name" <<<"$selected"
+          }
+          require_selected_test ./internal/service TestAffiliateStatsPerformanceAcceptance
+          require_selected_test ./internal/handler TestModelStatusPerformanceSLO -tags=performance
+          require_selected_test ./internal/service TestUserManagementPerformanceSLO -tags=performance
           go test ./internal/service -run '^TestAffiliateStatsPerformanceAcceptance$' -count=1 -v -timeout 10m
           go test -tags=performance -run '^TestModelStatusPerformanceSLO$' -count=1 -v ./internal/handler
           go test -tags=performance -run '^TestUserManagementPerformanceSLO$' -count=1 -v ./internal/service

@@ -91,6 +91,17 @@ func TestOnlineBackupFailsClosedForExistingDestinationAndSymlinks(t *testing.T) 
 	}
 }
 
+func TestSQLitePathValidationRejectsDSNDelimiters(t *testing.T) {
+	for _, name := range []string{"query?.db", "fragment#.db"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			if _, err := cleanSQLitePath(path); err == nil || !strings.Contains(err.Error(), "DSN delimiters") {
+				t.Fatalf("cleanSQLitePath(%q) error = %v, want DSN delimiter rejection", path, err)
+			}
+		})
+	}
+}
+
 func TestVerifyBackupRejectsCorruptOrNonToolStoreFiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "corrupt.db")
 	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {

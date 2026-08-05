@@ -220,7 +220,7 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 		}
 		value := new(big.Int).SetInt64(amount)
 		trustedRed := kind != InvoiceRed || (relationState == InvoiceRelationVerified && relationValid == 1)
-		if kind == InvoiceRed && !trustedRed {
+		if status == InvoiceIssued && kind == InvoiceRed && !trustedRed {
 			current.unreconciled++
 			current.anomalies++
 			totalUnreconciled++

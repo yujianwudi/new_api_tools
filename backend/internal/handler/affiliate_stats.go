@@ -13,6 +13,10 @@ import (
 	"github.com/new-api-tools/backend/internal/service"
 )
 
+// maxAffiliatePage bounds deep pagination and keeps the largest possible
+// offset safely within the int range on every supported architecture.
+const maxAffiliatePage = 100000
+
 // RegisterAffiliateStatsRoutes mounts the invite top-up analysis APIs. These
 // routes report current-state attribution and never claim to calculate referral
 // rewards or settlement amounts.
@@ -51,7 +55,7 @@ func strictAffiliateIntQuery(c *gin.Context, name string, defaultValue, maxValue
 }
 
 func parseAffiliateParams(c *gin.Context) (service.AffiliateStatsParams, error) {
-	page, err := strictAffiliateIntQuery(c, "page", 1, 0)
+	page, err := strictAffiliateIntQuery(c, "page", 1, maxAffiliatePage)
 	if err != nil {
 		return service.AffiliateStatsParams{}, err
 	}
