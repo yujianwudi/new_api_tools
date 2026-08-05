@@ -37,6 +37,25 @@ func newInvoiceTestRouter(store *toolstore.Store, authenticated bool, role auth.
 	return router
 }
 
+func TestMaskInvoiceTaxIDUsesRunes(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "multibyte suffix", value: "甲乙丙丁戊", want: "****乙丙丁戊"},
+		{name: "four multibyte runes", value: "甲乙丙丁", want: "****"},
+		{name: "trimmed multibyte value", value: "  税号甲乙丙丁  ", want: "****甲乙丙丁"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maskInvoiceTaxID(tt.value); got != tt.want {
+				t.Fatalf("maskInvoiceTaxID(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestInvoiceHandlerRBACExactMoneyAndPIIRedaction(t *testing.T) {
 	store, _ := newControlPlaneTestStore(t)
 	viewer := newInvoiceTestRouter(store, true, auth.RoleViewer)

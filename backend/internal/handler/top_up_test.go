@@ -223,6 +223,21 @@ func TestTopUpExportRequiresAdminAndWritesIntentOutcomeAudit(t *testing.T) {
 	}
 }
 
+func TestViewerCannotReadTopUpFinancialDetails(t *testing.T) {
+	router := topUpExportRouter(nil, auth.RoleViewer)
+	for _, target := range []string{
+		"/api/top-ups",
+		"/api/top-ups/statistics",
+		"/api/top-ups/1",
+	} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("viewer GET %s status = %d, want 403; body=%s", target, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 func TestTopUpExportRollsBackIntentWhenInitialRecoveryFails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store, storePath := installTopUpExportFixture(t)

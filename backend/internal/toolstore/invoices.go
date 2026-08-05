@@ -24,13 +24,22 @@ const (
 	invoiceColumns = `id, invoice_number, seller_entity, buyer_name, buyer_tax_id,
 		document_kind, related_invoice_number, currency, amount_minor, tax_amount_minor, minor_unit_scale, status, source,
 		idempotency_key, request_fingerprint, issued_at, voided_at, void_reason,
-		created_by, created_at, updated_at`
+		created_by, created_at, updated_at,
+		(SELECT relation.related_invoice_id FROM invoice_document_relations relation
+			WHERE relation.red_invoice_id = invoice_documents.id),
+		COALESCE((SELECT relation.relation_state FROM invoice_document_relations relation
+			WHERE relation.red_invoice_id = invoice_documents.id),
+			CASE WHEN document_kind = 'blue' THEN 'not_applicable' ELSE 'unreconciled' END),
+		COALESCE((SELECT relation.reason_code FROM invoice_document_relations relation
+			WHERE relation.red_invoice_id = invoice_documents.id),
+			CASE WHEN document_kind = 'blue' THEN '' ELSE 'missing_relation' END)`
 )
 
 type invoiceAuditState struct {
 	ID                 int64               `json:"id"`
 	RequestFingerprint string              `json:"request_fingerprint"`
 	DocumentKind       InvoiceDocumentKind `json:"document_kind"`
+	RelatedInvoiceID   *int64              `json:"related_invoice_id,omitempty"`
 	Currency           string              `json:"currency"`
 	AmountMinor        string              `json:"amount_minor"`
 	MinorUnitScale     int                 `json:"minor_unit_scale"`
@@ -133,7 +142,22 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 		return InvoiceSummary{}, err
 	}
 	var query strings.Builder
-	query.WriteString(`SELECT currency, minor_unit_scale, status, document_kind, amount_minor
+	query.WriteString(`SELECT currency, minor_unit_scale, status, document_kind, amount_minor,
+		CASE WHEN document_kind = 'blue' THEN 'not_applicable' ELSE COALESCE((
+			SELECT relation.relation_state FROM invoice_document_relations relation
+			WHERE relation.red_invoice_id = invoice_documents.id
+		), 'unreconciled') END AS relation_state,
+		CASE WHEN document_kind = 'blue' THEN 1 WHEN EXISTS (
+			SELECT 1 FROM invoice_document_relations relation
+			JOIN invoice_documents original ON original.id = relation.related_invoice_id
+			WHERE relation.red_invoice_id = invoice_documents.id
+				AND relation.relation_state = 'verified'
+				AND original.document_kind = 'blue' AND original.status = 'issued'
+				AND trim(original.invoice_number) = trim(invoice_documents.related_invoice_number) COLLATE NOCASE
+				AND trim(original.seller_entity) = trim(invoice_documents.seller_entity) COLLATE NOCASE
+				AND original.currency = invoice_documents.currency
+				AND original.minor_unit_scale = invoice_documents.minor_unit_scale
+		) THEN 1 ELSE 0 END AS relation_valid
 		FROM invoice_documents WHERE 1=1`)
 	args := make([]any, 0, 3)
 	if currency := strings.ToUpper(strings.TrimSpace(filter.Currency)); currency != "" {
@@ -148,23 +172,35 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 	}
 	defer rows.Close()
 	type accumulator struct {
-		currency                                      string
-		scale                                         int
-		blue, red, voidedBlue, voidedRed, voided, net big.Int
-		effectiveCount, voidedCount                   int64
+		currency                                             string
+		scale                                                int
+		blue, red, voidedBlue, voidedRed, voided, net        big.Int
+		effectiveCount, voidedCount, unreconciled, anomalies int64
 	}
 	groups := make([]InvoiceSummaryGroup, 0)
+	totalUnreconciled := int64(0)
+	totalAnomalies := int64(0)
 	var current *accumulator
 	flush := func() {
 		if current == nil {
 			return
 		}
+		var net *string
+		sourceHealth := "ok"
+		if current.unreconciled > 0 {
+			sourceHealth = "unreconciled"
+		} else {
+			value := current.net.String()
+			net = &value
+		}
 		groups = append(groups, InvoiceSummaryGroup{
 			Currency: current.currency, MinorUnitScale: current.scale,
 			BlueIssuedMinor: current.blue.String(), RedIssuedMinor: current.red.String(),
 			VoidedBlueMinor: current.voidedBlue.String(), VoidedRedMinor: current.voidedRed.String(),
-			VoidedMinor: current.voided.String(), NetIssuedMinor: current.net.String(),
+			VoidedMinor: current.voided.String(), NetIssuedMinor: net,
 			EffectiveCount: current.effectiveCount, VoidedCount: current.voidedCount,
+			SourceHealth: sourceHealth, UnreconciledCount: current.unreconciled,
+			AnomalyCount: current.anomalies,
 		})
 	}
 	for rows.Next() {
@@ -173,7 +209,9 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 		var status InvoiceStatus
 		var kind InvoiceDocumentKind
 		var amount int64
-		if err := rows.Scan(&currency, &scale, &status, &kind, &amount); err != nil {
+		var relationState InvoiceRelationState
+		var relationValid int
+		if err := rows.Scan(&currency, &scale, &status, &kind, &amount, &relationState, &relationValid); err != nil {
 			return InvoiceSummary{}, fmt.Errorf("scan invoice summary: %w", err)
 		}
 		if current == nil || current.currency != currency || current.scale != scale {
@@ -181,6 +219,13 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 			current = &accumulator{currency: currency, scale: scale}
 		}
 		value := new(big.Int).SetInt64(amount)
+		trustedRed := kind != InvoiceRed || (relationState == InvoiceRelationVerified && relationValid == 1)
+		if status == InvoiceIssued && kind == InvoiceRed && !trustedRed {
+			current.unreconciled++
+			current.anomalies++
+			totalUnreconciled++
+			totalAnomalies++
+		}
 		switch status {
 		case InvoiceIssued:
 			current.effectiveCount++
@@ -189,7 +234,9 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 				current.net.Add(&current.net, value)
 			} else {
 				current.red.Add(&current.red, value)
-				current.net.Sub(&current.net, value)
+				if trustedRed {
+					current.net.Sub(&current.net, value)
+				}
 			}
 		case InvoiceVoided:
 			current.voidedCount++
@@ -207,10 +254,22 @@ func (s *Store) InvoiceSummary(ctx context.Context, filter InvoiceSummaryFilter)
 		return InvoiceSummary{}, fmt.Errorf("iterate invoice summary: %w", err)
 	}
 	flush()
-	return InvoiceSummary{Groups: groups, GeneratedAt: s.clock()}, nil
+	sourceHealth := "ok"
+	if totalUnreconciled > 0 {
+		sourceHealth = "unreconciled"
+	}
+	return InvoiceSummary{
+		Groups: groups, GeneratedAt: s.clock(), SourceHealth: sourceHealth,
+		UnreconciledCount: totalUnreconciled, AnomalyCount: totalAnomalies,
+	}, nil
 }
 
 func (s *Store) createInvoice(ctx context.Context, executor execQueryer, input InvoiceDocumentInput, fingerprint string) (InvoiceDocument, error) {
+	resolved, err := s.resolveInvoiceRelation(ctx, executor, input)
+	if err != nil {
+		return InvoiceDocument{}, err
+	}
+	input = resolved
 	now := s.clock()
 	result, err := executor.ExecContext(ctx, `INSERT INTO invoice_documents(
 		invoice_number, seller_entity, buyer_name, buyer_tax_id, document_kind, related_invoice_number, currency,
@@ -232,7 +291,84 @@ func (s *Store) createInvoice(ctx context.Context, executor execQueryer, input I
 	if err != nil {
 		return InvoiceDocument{}, fmt.Errorf("read invoice id: %w", err)
 	}
+	if input.DocumentKind == InvoiceRed {
+		if input.RelatedInvoiceID == nil {
+			return InvoiceDocument{}, fmt.Errorf("%w: red invoice relation was not resolved", ErrConflict)
+		}
+		if _, err := executor.ExecContext(ctx, `INSERT INTO invoice_document_relations(
+			red_invoice_id, related_invoice_id, relation_state, reason_code,
+			related_invoice_number_snapshot, seller_entity_snapshot, currency_snapshot,
+			minor_unit_scale_snapshot, created_at, updated_at
+		) VALUES (?, ?, 'verified', '', ?, ?, ?, ?, ?, ?)`,
+			id, *input.RelatedInvoiceID, input.RelatedInvoiceNumber, input.SellerEntity,
+			input.Currency, input.MinorUnitScale, dbTime(now), dbTime(now)); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "exceeds original invoice") {
+				return InvoiceDocument{}, fmt.Errorf("%w: cumulative red invoice amount exceeds original invoice", ErrConflict)
+			}
+			return InvoiceDocument{}, fmt.Errorf("create invoice document relation: %w", err)
+		}
+	}
 	return getInvoiceDocument(ctx, executor, id)
+}
+
+func (s *Store) resolveInvoiceRelation(ctx context.Context, queryer queryRower, input InvoiceDocumentInput) (InvoiceDocumentInput, error) {
+	if input.DocumentKind == InvoiceBlue {
+		if input.RelatedInvoiceID != nil || input.RelatedInvoiceNumber != "" {
+			return InvoiceDocumentInput{}, fmt.Errorf("%w: blue invoice cannot reference another invoice", ErrInvalid)
+		}
+		return input, nil
+	}
+	if input.DocumentKind != InvoiceRed {
+		return InvoiceDocumentInput{}, fmt.Errorf("%w: unsupported invoice document kind", ErrInvalid)
+	}
+
+	var relatedID int64
+	if input.RelatedInvoiceID != nil {
+		relatedID = *input.RelatedInvoiceID
+	} else {
+		var count int
+		if err := queryer.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(id), 0)
+			FROM invoice_documents WHERE document_kind = 'blue'
+				AND trim(seller_entity) = trim(?) COLLATE NOCASE
+				AND trim(invoice_number) = trim(?) COLLATE NOCASE`,
+			input.SellerEntity, input.RelatedInvoiceNumber).Scan(&count, &relatedID); err != nil {
+			return InvoiceDocumentInput{}, fmt.Errorf("resolve related invoice number: %w", err)
+		}
+		if count != 1 || relatedID <= 0 {
+			return InvoiceDocumentInput{}, fmt.Errorf("%w: related invoice number is missing or ambiguous", ErrConflict)
+		}
+	}
+	original, err := getInvoiceDocument(ctx, queryer, relatedID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return InvoiceDocumentInput{}, fmt.Errorf("%w: related invoice does not exist", ErrConflict)
+		}
+		return InvoiceDocumentInput{}, err
+	}
+	if original.DocumentKind != InvoiceBlue || original.Status != InvoiceIssued {
+		return InvoiceDocumentInput{}, fmt.Errorf("%w: related invoice must be an issued blue invoice", ErrConflict)
+	}
+	if !strings.EqualFold(strings.TrimSpace(original.SellerEntity), strings.TrimSpace(input.SellerEntity)) ||
+		original.Currency != input.Currency || original.MinorUnitScale != input.MinorUnitScale {
+		return InvoiceDocumentInput{}, fmt.Errorf("%w: related invoice seller, currency, or precision does not match", ErrConflict)
+	}
+	if input.RelatedInvoiceNumber != "" && !strings.EqualFold(strings.TrimSpace(original.InvoiceNumber), strings.TrimSpace(input.RelatedInvoiceNumber)) {
+		return InvoiceDocumentInput{}, fmt.Errorf("%w: related invoice id and number do not match", ErrConflict)
+	}
+	var credited int64
+	if err := queryer.QueryRowContext(ctx, `SELECT COALESCE(SUM(red.amount_minor), 0)
+		FROM invoice_document_relations relation
+		JOIN invoice_documents red ON red.id = relation.red_invoice_id
+		WHERE relation.related_invoice_id = ? AND relation.relation_state = 'verified'
+			AND red.status = 'issued'`, relatedID).Scan(&credited); err != nil {
+		return InvoiceDocumentInput{}, fmt.Errorf("sum related red invoices: %w", err)
+	}
+	if credited < 0 || credited > original.AmountMinor || input.AmountMinor > original.AmountMinor-credited {
+		return InvoiceDocumentInput{}, fmt.Errorf("%w: cumulative red invoice amount exceeds original invoice", ErrConflict)
+	}
+	input.RelatedInvoiceID = &relatedID
+	input.RelatedInvoiceNumber = original.InvoiceNumber
+	return input, nil
 }
 
 func (s *Store) appendInvoiceEvent(ctx context.Context, executor execQueryer, invoiceID int64, eventType, actor, key string, occurredAt time.Time, details any) (InvoiceEvent, error) {
@@ -296,13 +432,13 @@ func getInvoiceEvent(ctx context.Context, queryer queryRower, id int64) (Invoice
 func scanInvoiceDocument(row rowScanner) (InvoiceDocument, error) {
 	var item InvoiceDocument
 	var issuedAt, createdAt, updatedAt int64
-	var voidedAt sql.NullInt64
+	var voidedAt, relatedInvoiceID sql.NullInt64
 	err := row.Scan(&item.ID, &item.InvoiceNumber, &item.SellerEntity, &item.BuyerName,
 		&item.BuyerTaxID, &item.DocumentKind, &item.RelatedInvoiceNumber,
 		&item.Currency, &item.AmountMinor, &item.TaxAmountMinor,
 		&item.MinorUnitScale, &item.Status, &item.Source, &item.IdempotencyKey,
 		&item.RequestFingerprint, &issuedAt, &voidedAt, &item.VoidReason,
-		&item.CreatedBy, &createdAt, &updatedAt)
+		&item.CreatedBy, &createdAt, &updatedAt, &relatedInvoiceID, &item.RelationState, &item.RelationReason)
 	if err != nil {
 		return InvoiceDocument{}, err
 	}
@@ -312,6 +448,10 @@ func scanInvoiceDocument(row rowScanner) (InvoiceDocument, error) {
 	if voidedAt.Valid {
 		value := fromDBTime(voidedAt.Int64)
 		item.VoidedAt = &value
+	}
+	if relatedInvoiceID.Valid {
+		value := relatedInvoiceID.Int64
+		item.RelatedInvoiceID = &value
 	}
 	return item, nil
 }
@@ -347,8 +487,10 @@ func normalizeInvoiceInput(input InvoiceDocumentInput) (InvoiceDocumentInput, st
 		!validInvoiceText(input.BuyerName, 256, true, true) ||
 		!validInvoiceText(input.BuyerTaxID, 128, false, true) ||
 		(input.DocumentKind != InvoiceBlue && input.DocumentKind != InvoiceRed) ||
-		!validInvoiceText(input.RelatedInvoiceNumber, 128, input.DocumentKind == InvoiceRed, true) ||
-		(input.DocumentKind == InvoiceBlue && input.RelatedInvoiceNumber != "") ||
+		!validInvoiceText(input.RelatedInvoiceNumber, 128, input.DocumentKind == InvoiceRed && input.RelatedInvoiceID == nil, true) ||
+		(input.RelatedInvoiceID != nil && *input.RelatedInvoiceID <= 0) ||
+		(input.DocumentKind == InvoiceBlue && (input.RelatedInvoiceNumber != "" || input.RelatedInvoiceID != nil)) ||
+		(input.DocumentKind == InvoiceRed && input.RelatedInvoiceNumber == "" && input.RelatedInvoiceID == nil) ||
 		(input.DocumentKind == InvoiceRed && strings.EqualFold(input.RelatedInvoiceNumber, input.InvoiceNumber)) ||
 		!validCurrency(input.Currency) || input.AmountMinor <= 0 || input.TaxAmountMinor < 0 ||
 		input.TaxAmountMinor > input.AmountMinor || input.MinorUnitScale < 0 || input.MinorUnitScale > 9 ||
@@ -359,12 +501,14 @@ func normalizeInvoiceInput(input InvoiceDocumentInput) (InvoiceDocumentInput, st
 	}
 	fingerprintPayload := struct {
 		InvoiceNumber, SellerEntity, BuyerName, BuyerTaxID, RelatedInvoiceNumber, Currency string
+		RelatedInvoiceID                                                                   *int64 `json:",omitempty"`
 		DocumentKind                                                                       InvoiceDocumentKind
 		AmountMinor, TaxAmountMinor                                                        int64
 		MinorUnitScale                                                                     int
 		Source, CreatedBy                                                                  string
 		IssuedAt                                                                           int64
 	}{input.InvoiceNumber, input.SellerEntity, input.BuyerName, input.BuyerTaxID, input.RelatedInvoiceNumber, input.Currency,
+		input.RelatedInvoiceID,
 		input.DocumentKind,
 		input.AmountMinor, input.TaxAmountMinor, input.MinorUnitScale, input.Source, input.CreatedBy,
 		input.IssuedAt.UnixMilli()}
@@ -430,13 +574,15 @@ func validInvoiceText(value string, maximum int, required, spreadsheetSafe bool)
 
 func invoiceState(item InvoiceDocument) invoiceAuditState {
 	return invoiceAuditState{ID: item.ID, RequestFingerprint: item.RequestFingerprint, DocumentKind: item.DocumentKind,
-		Currency: item.Currency, AmountMinor: strconv.FormatInt(item.AmountMinor, 10), MinorUnitScale: item.MinorUnitScale,
+		RelatedInvoiceID: item.RelatedInvoiceID,
+		Currency:         item.Currency, AmountMinor: strconv.FormatInt(item.AmountMinor, 10), MinorUnitScale: item.MinorUnitScale,
 		Status: item.Status, IssuedAt: item.IssuedAt, VoidedAt: item.VoidedAt}
 }
 
 func invoiceCreatedEventDetails(item InvoiceDocument) map[string]any {
 	return map[string]any{"invoice_number": item.InvoiceNumber, "document_kind": item.DocumentKind,
-		"related_invoice_number": item.RelatedInvoiceNumber, "currency": item.Currency,
+		"related_invoice_number": item.RelatedInvoiceNumber, "related_invoice_id": item.RelatedInvoiceID,
+		"currency":         item.Currency,
 		"amount_minor":     strconv.FormatInt(item.AmountMinor, 10),
 		"tax_amount_minor": strconv.FormatInt(item.TaxAmountMinor, 10),
 		"minor_unit_scale": item.MinorUnitScale, "source": item.Source}

@@ -26,6 +26,13 @@ var (
 	ErrModelNotAllowed = errors.New("one or more models are not in the probe allowlist")
 )
 
+// A configured run can contain up to 100 models with a two-minute network
+// timeout and a single worker. Six hours covers that maximum execution time,
+// durable transition timeouts, and ordinary clock/scheduling jitter. Startup
+// recovery must not treat a younger run as abandoned because another live
+// instance may still own it.
+const modelProbeRecoveryStaleWindow = 6 * time.Hour
+
 type Manager struct {
 	cfg        *config.Config
 	store      *toolstore.Store
@@ -74,8 +81,9 @@ type ModelStatus struct {
 }
 
 type Summary struct {
-	Config SystemStatus  `json:"config"`
-	Items  []ModelStatus `json:"items"`
+	Config    SystemStatus  `json:"config"`
+	Items     []ModelStatus `json:"items"`
+	FetchedAt time.Time     `json:"fetched_at"`
 }
 
 func NewManager(cfg *config.Config, store *toolstore.Store) *Manager {
@@ -123,11 +131,12 @@ func (m *Manager) Start(parent context.Context) {
 	}
 	m.ctx, m.cancel = context.WithCancel(parent)
 	processStartedAt := m.now().UTC()
+	recoveryStaleBefore := processStartedAt.Add(-modelProbeRecoveryStaleWindow)
 	m.mu.Unlock()
 
 	if m.store != nil {
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		cancelled, err := m.store.CancelInterruptedModelProbeRuns(recoveryCtx, processStartedAt)
+		cancelled, err := m.store.CancelInterruptedModelProbeRuns(recoveryCtx, recoveryStaleBefore)
 		cancel()
 		if err != nil {
 			m.mu.Lock()
@@ -209,7 +218,11 @@ func (m *Manager) queue(ctx context.Context, trigger, actor, runKey string, mode
 	if !m.cfg.ModelProbeEnabled {
 		return toolstore.ModelProbeRun{}, false, ErrDisabled
 	}
-	if m.runner == nil || m.initError != "" || len(m.allowed) == 0 {
+	m.mu.RLock()
+	runner := m.runner
+	configured := runner != nil && m.initError == "" && len(m.allowed) > 0
+	m.mu.RUnlock()
+	if !configured {
 		return toolstore.ModelProbeRun{}, false, ErrNotConfigured
 	}
 	models, err := m.validateRequestedModels(models)
@@ -233,14 +246,6 @@ func (m *Manager) queue(ctx context.Context, trigger, actor, runKey string, mode
 			return toolstore.ModelProbeRun{}, false, existingErr
 		}
 	}
-	used, err := m.store.CountModelProbeAttemptsSince(ctx, startOfUTCDay(m.now().UTC()))
-	if err != nil {
-		return toolstore.ModelProbeRun{}, false, err
-	}
-	if used+len(models) > m.cfg.ModelProbeDailyRequestBudget {
-		return toolstore.ModelProbeRun{}, false, ErrBudgetExceeded
-	}
-
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
@@ -257,20 +262,31 @@ func (m *Manager) queue(ctx context.Context, trigger, actor, runKey string, mode
 		RunKey: runKey, RequestFingerprint: requestFingerprint, TriggerKind: trigger,
 		Actor: actor, RequestedCount: len(models), StartedAt: m.now().UTC(),
 	}
-	run, replayed, err := m.store.CreateModelProbeRun(ctx, input)
+	plans := make([]toolstore.ModelProbeAttemptPlan, 0, len(models))
+	for _, model := range models {
+		plans = append(plans, toolstore.ModelProbeAttemptPlan{
+			ModelName: model, Capability: runner.CapabilityFor(model),
+		})
+	}
+	run, lifecycles, replayed, err := m.store.CreateModelProbeRunWithBudget(
+		ctx, input, plans, startOfUTCDay(input.StartedAt), m.cfg.ModelProbeDailyRequestBudget,
+	)
 	if err != nil || replayed {
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
+		if errors.Is(err, toolstore.ErrModelProbeBudgetExceeded) {
+			err = ErrBudgetExceeded
+		}
 		return run, replayed, err
 	}
 
 	m.wg.Add(1)
-	go m.execute(runCtx, run, models)
+	go m.execute(runCtx, run, lifecycles)
 	return run, false, nil
 }
 
-func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, models []string) {
+func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, lifecycles []toolstore.ModelProbeAttemptLifecycle) {
 	defer m.wg.Done()
 	defer func() {
 		m.mu.Lock()
@@ -282,27 +298,63 @@ func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, mode
 		attempt toolstore.ModelProbeAttemptInput
 		err     error
 	}
-	jobs := make(chan string)
-	results := make(chan result, len(models))
+	jobs := make(chan toolstore.ModelProbeAttemptLifecycle)
+	results := make(chan result, len(lifecycles))
 	workers := m.cfg.ModelProbeMaxConcurrency
-	if workers > len(models) {
-		workers = len(models)
+	if workers > len(lifecycles) {
+		workers = len(lifecycles)
 	}
 	var workersWG sync.WaitGroup
 	workersWG.Add(workers)
 	for index := 0; index < workers; index++ {
 		go func() {
 			defer workersWG.Done()
-			for model := range jobs {
-				attempt := m.runner.Probe(ctx, run.ID, model)
+			for lifecycle := range jobs {
+				if lifecycle.LifecycleState == "reserved" {
+					if ctx.Err() != nil {
+						finishedAt := m.now().UTC()
+						_, err := m.store.SkipReservedModelProbeAttempt(context.Background(), lifecycle.ID,
+							"cancelled_before_send", "Probe run was cancelled before network send", finishedAt)
+						results <- result{attempt: toolstore.ModelProbeAttemptInput{
+							RunID: run.ID, LifecycleID: lifecycle.ID, ModelName: lifecycle.ModelName,
+							Capability: lifecycle.Capability, Outcome: "skipped", ProtocolSuccess: false,
+							ErrorCode: "cancelled_before_send", ErrorMessage: "Probe run was cancelled before network send",
+							StartedAt: finishedAt, FinishedAt: finishedAt,
+						}, err: err}
+						continue
+					}
+					sendCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					_, err := m.store.MarkModelProbeAttemptSent(sendCtx, lifecycle.ID, m.now().UTC())
+					cancel()
+					if err != nil {
+						reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						if _, skipErr := m.store.SkipReservedModelProbeAttempt(reconcileCtx, lifecycle.ID,
+							"send_gate_failed", "Durable sent transition failed; no network request was started", m.now().UTC()); skipErr != nil {
+							_, _ = m.store.MarkModelProbeAttemptUncertain(reconcileCtx, lifecycle.ID,
+								"send_gate_uncertain", "Sent transition outcome could not be proven", m.now().UTC())
+						}
+						reconcileCancel()
+						results <- result{err: err}
+						continue
+					}
+				}
+
+				attempt := m.runner.Probe(ctx, run.ID, lifecycle.ModelName)
+				attempt.LifecycleID = lifecycle.ID
 				_, err := m.store.AppendModelProbeAttempt(context.Background(), attempt)
+				if err != nil && lifecycle.LifecycleState != "skipped" {
+					reconcileCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					_, _ = m.store.MarkModelProbeAttemptUncertain(reconcileCtx, lifecycle.ID,
+						"result_persistence_uncertain", "Network request completed but its result could not be durably settled", m.now().UTC())
+					cancel()
+				}
 				results <- result{attempt: attempt, err: err}
 			}
 		}()
 	}
 	go func() {
-		for _, model := range models {
-			jobs <- model
+		for _, lifecycle := range lifecycles {
+			jobs <- lifecycle
 		}
 		close(jobs)
 		workersWG.Wait()
@@ -340,7 +392,7 @@ func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, mode
 	case failures > 0 || skipped > 0:
 		status = "partial"
 	}
-	finishCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_, finishErr := m.store.FinishModelProbeRun(finishCtx, toolstore.ModelProbeRunFinish{
 		ID: run.ID, Status: status, AttemptedCount: attempted, SuccessCount: successes,
 		FailureCount: failures, SkippedCount: skipped, ErrorCode: errorCode,
@@ -349,11 +401,16 @@ func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, mode
 	if finishErr != nil {
 		log.Error().Err(finishErr).Int64("run_id", run.ID).Msg("model probe run could not be finalized")
 	}
+	finishCancel()
+
+	// Retention is a separate durable operation. A slow or timed-out run
+	// finalization must not consume the cleanup deadline as well.
 	cleanupBefore := m.now().UTC().Add(-m.cfg.ModelProbeRetention)
-	if cleanupErr := m.store.CleanupModelProbes(finishCtx, cleanupBefore); cleanupErr != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if cleanupErr := m.store.CleanupModelProbes(cleanupCtx, cleanupBefore); cleanupErr != nil {
 		log.Warn().Err(cleanupErr).Msg("model probe retention cleanup failed")
 	}
-	cancel()
+	cleanupCancel()
 }
 
 func (m *Manager) Summary(ctx context.Context, models []string) (Summary, error) {
@@ -384,7 +441,7 @@ func (m *Manager) Summary(ctx context.Context, models []string) (Summary, error)
 		view.ProbeHealth, view.SourceState, view.ReasonCode, view.Reason = m.classify(item, allowed, status)
 		items = append(items, view)
 	}
-	return Summary{Config: status, Items: items}, nil
+	return Summary{Config: status, Items: items, FetchedAt: m.now().UTC()}, nil
 }
 
 func (m *Manager) History(ctx context.Context, model string, limit int) ([]toolstore.ModelProbeAttempt, error) {
@@ -395,7 +452,7 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 	if m == nil || m.cfg == nil || m.store == nil {
 		return SystemStatus{State: "unavailable", Message: "Model probe dependencies are unavailable"}, nil
 	}
-	used, err := m.store.CountModelProbeAttemptsSince(ctx, startOfUTCDay(m.now().UTC()))
+	used, err := m.store.CountModelProbeBudgetUsed(ctx, startOfUTCDay(m.now().UTC()))
 	if err != nil {
 		return SystemStatus{}, err
 	}
@@ -406,7 +463,9 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 	m.mu.RLock()
 	running := m.running
 	next := m.nextRunAt
-	configured := m.runner != nil && m.initError == "" && len(m.allowed) > 0
+	initError := m.initError
+	allowedModels := append([]string(nil), m.allowed...)
+	configured := m.runner != nil && initError == "" && len(allowedModels) > 0
 	m.mu.RUnlock()
 	remaining := m.cfg.ModelProbeDailyRequestBudget - used
 	if remaining < 0 {
@@ -418,7 +477,7 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 		state, message = "disabled", "主动探测默认关闭；配置专用模型令牌和白名单后再启用"
 	case !configured:
 		state, message = "misconfigured", "主动探测缺少专用令牌、有效 NewAPI 地址或模型白名单"
-		if m.initError != "" {
+		if initError != "" {
 			message = "主动探测配置无效"
 		}
 	case remaining == 0:
@@ -433,7 +492,7 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 		MaxModelsPerRun: m.cfg.ModelProbeMaxModelsPerRun, DailyRequestBudget: m.cfg.ModelProbeDailyRequestBudget,
 		RequestsUsedToday: used, RequestsRemainingToday: remaining,
 		RetentionDays: int(m.cfg.ModelProbeRetention / (24 * time.Hour)),
-		AllowedModels: append([]string(nil), m.allowed...), LastRun: lastRun,
+		AllowedModels: allowedModels, LastRun: lastRun,
 	}
 	if !next.IsZero() && configured {
 		value := next
@@ -446,12 +505,18 @@ func (m *Manager) classify(item toolstore.ModelProbeSummary, allowed bool, syste
 	if !allowed {
 		return "unavailable", "unavailable", "not_allowed", "模型不在主动探测白名单中"
 	}
+	if !system.Enabled || system.State == "disabled" {
+		return "unavailable", "unavailable", "disabled", system.Message
+	}
+	if !system.Configured || system.State == "misconfigured" {
+		return "unavailable", "unavailable", "misconfigured", system.Message
+	}
+	if system.State == "unavailable" {
+		return "unavailable", "unavailable", "unavailable", system.Message
+	}
 	if item.Latest == nil {
 		if system.Running {
 			return "pending", "pending", "probe_pending", "主动探测正在执行，尚未产生结果"
-		}
-		if !system.Enabled || !system.Configured {
-			return "unavailable", "unavailable", system.State, system.Message
 		}
 		return "unavailable", "unavailable", "no_probe_data", "尚无主动探测数据"
 	}

@@ -19,7 +19,7 @@ RUN npm run build
 # Stage 2: 构建 Go 后端
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS backend-builder
 ARG TARGETARCH
-ARG APP_VERSION=0.6.0
+ARG APP_VERSION=0.6.1
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 WORKDIR /build
@@ -38,6 +38,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -ldflags="-s -w -X github.com/new-api-tools/backend/internal/buildinfo.Version=${APP_VERSION} -X github.com/new-api-tools/backend/internal/buildinfo.Commit=${VCS_REF} -X github.com/new-api-tools/backend/internal/buildinfo.BuildDate=${BUILD_DATE}" \
     -o /build/server \
     ./cmd/server
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
+    -trimpath -o /build/toolstorectl ./cmd/toolstorectl
 
 # Stage 3: 最终镜像 (Nginx + Go binary)
 FROM alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
@@ -54,6 +58,7 @@ RUN apk add --no-cache \
 
 # 复制 Go 二进制
 COPY --from=backend-builder /build/server /app/server
+COPY --from=backend-builder /build/toolstorectl /app/toolstorectl
 
 # 创建低权限运行用户和数据目录。Supervisor 仅负责启动，Nginx/Go 进程均降权运行。
 RUN addgroup -S -g 10001 appgroup && \

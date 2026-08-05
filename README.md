@@ -3,14 +3,14 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.6.0-2563EB?style=for-the-badge" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.6.1-2563EB?style=for-the-badge" />
   <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" />
   <img alt="Docker" src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
   <img alt="Port" src="https://img.shields.io/badge/default_port-1145-0EA5E9?style=for-the-badge" />
 </p>
 
-# NewAPI Tools v0.6.0
+# NewAPI Tools v0.6.1
 
 NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的**独立、旁路、可审计的 API 中转站经营与可靠性控制台**。
 
@@ -20,7 +20,7 @@ NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-
 - 渠道和用户发生了什么，证据能否追溯；
 - 高风险操作是否经过授权、说明理由并留下完整结果。
 
-> v0.6.0 把模型监测从“只有真实流量日志”升级为“被动流量证据 + 受控主动探测”。主动探测默认关闭，只使用专用低权限令牌、精确模型白名单、每日请求预算和能力适配器，不会把无数据或过期数据冒充成健康。
+> v0.6.1 在双源模型监测基础上修复用户条件筛选、邀请明细一致性与模型监测交互，并补齐 Tool Store 回滚、配置耐久性、供应链证明和真实性能门禁。主动探测默认关闭，不会把无数据、部分数据或过期数据冒充成健康。
 
 ## 架构边界
 
@@ -36,7 +36,7 @@ flowchart LR
     Backend --> Metrics["健康检查与 Prometheus 指标"]
 ```
 
-| 边界 | v0.6.0 行为 |
+| 边界 | v0.6.1 行为 |
 |---|---|
 | 代理流量 | 不在 NewAPI 请求链路中，不代理或修改模型请求 |
 | NewAPI schema | 不创建、不迁移、不修改 NewAPI 表结构 |
@@ -46,7 +46,7 @@ flowchart LR
 | 未知上游版本 | 默认只读，拒绝未经验证的写操作 |
 | 主动探测 | 默认关闭；仅调用精确白名单模型，并受能力适配、并发、超时、Token 与每日请求预算约束 |
 
-## v0.6.0 能力
+## v0.6.1 能力
 
 | 模块 | 能力与安全边界 |
 |---|---|
@@ -79,7 +79,7 @@ flowchart LR
 
 ## 发票证据与已开票统计
 
-v0.5.2 的发票模块是控制台自己的证据台账，不是 NewAPI 余额字段，也不是税控开票系统。所有记录只写入 Tool Store：
+自 v0.5.2 引入的发票模块是控制台自己的证据台账，不是 NewAPI 余额字段，也不是税控开票系统。所有记录只写入 Tool Store：
 
 - `invoice_documents` 保存蓝票/红票类型、发票号、关联原票号、购方快照、币种、最小货币单位金额、税额、状态和开票时间；状态只允许从 `issued` 转为 `voided`，文档不可删除；
 - `invoice_events` 以只追加方式记录创建、导入和作废等事实；
@@ -95,7 +95,7 @@ v0.5.2 的发票模块是控制台自己的证据台账，不是 NewAPI 余额�
 
 ## NewAPI 版本与写入限制
 
-v0.6.0 的已验证控制面契约基线是 **NewAPI `v1.0.0-rc.21`**。
+v0.6.1 的已验证控制面契约基线是 **NewAPI `v1.0.0-rc.21`**。
 
 | NewAPI 版本 | 控制面策略 |
 |---|---|
@@ -205,7 +205,7 @@ curl -fsS \
 
 登记、导入和作废理由属于可审计自由文本，可能出现在 `viewer` 可读的通用操作审计或 `operator` 可读的发票事件中，禁止填写购方姓名、税号等 PII。作废请求体只能包含非空 `reason`；`voided_at` 由服务端 Tool Store clock 生成，客户端不能指定或回填作废时间。创建或导入的 `issued_at` 不得晚于服务端时钟，未来开票时间会在 CSV preview 和最终写入边界被拒绝。
 
-除只读 preview 外，所有发票写入都要求 `Idempotency-Key`，并在同一个 Tool Store 事务中写入文档/事件和操作审计。金额响应为十进制字符串；CSV 必须是 UTF-8、最多 1 MiB/500 行，并先 preview 再 confirm，非法金额、币种、日期、重复票号和公式前缀会被明确拒绝。v0.5.2 不提供发票导出 API。
+除只读 preview 外，所有发票写入都要求 `Idempotency-Key`，并在同一个 Tool Store 事务中写入文档/事件和操作审计。金额响应为十进制字符串；CSV 必须是 UTF-8、最多 1 MiB/500 行，并先 preview 再 confirm，非法金额、币种、日期、重复票号和公式前缀会被明确拒绝。v0.6.1 仍不提供发票导出 API。
 
 单张创建、CSV 确认导入和作废会以原始幂等键写入 `cp:<raw-idempotency-key>:intent/outcome` 审计链。浏览器只持久化不含购方信息、金额或 CSV 内容的 pending marker；遇到断网、超时或未知结果时，必须先通过 `GET /api/control-plane/operations/:idempotency_key` 对账。在旧操作终态可证明前，不能修改负载或换新键绕过锁后再次提交。
 
@@ -222,15 +222,15 @@ Tool Store 及其备份会包含购方名称和可选税号快照，必须按财
 
 上述受支持写请求必须带 `Idempotency-Key`，并在 JSON 请求体中提供理由。该键标识当前认证主体的一次逻辑写操作：仅在重试同一路由/动作、同一目标和同一请求体时复用；变更目标或负载必须生成新键，冲突复用返回 `409`。永久删除还要求 `admin` 角色和上游版本能力通过。
 
-v0.5.2 遇到网络中断、上游超时或审计尾部失败时，不会根据页面当前状态猜测结果，也不会盲目重放原请求。浏览器会保留无敏感负载的 pending marker，并通过 `GET /api/control-plane/operations/:idempotency_key` 读取与当前 actor、认证方式、动作和目标绑定的完整 intent/outcome 链；只有可证明的终态才能释放本地提交锁，损坏或孤立审计链返回 `503` 并继续失败关闭。
+v0.6.1 遇到网络中断、上游超时或审计尾部失败时，不会根据页面当前状态猜测结果，也不会盲目重放原请求。浏览器会保留无敏感负载的 pending marker，并通过 `GET /api/control-plane/operations/:idempotency_key` 读取与当前 actor、认证方式、动作和目标绑定的完整 intent/outcome 链；只有可证明的终态才能释放本地提交锁，损坏或孤立审计链返回 `503` 并继续失败关闭。
 
 兑换码创建要求 `admin`。创建的 `count` 和批量删除的 `ids` 均限制为每次请求 `1..100`；单码额度和单次总额度还分别受 `REDEMPTION_MAX_QUOTA_PER_CODE`、`REDEMPTION_MAX_TOTAL_QUOTA` 限制，默认约为 US$100/码和 US$1000/次。所有限制都在写入 intent 和调用 NewAPI 前执行；服务端不会自动拆分。安全重试由 `Idempotency-Key`、请求绑定和 intent/outcome 审计共同保证，而不是由批次大小保证。
 
 ## 已禁用或降级的危险旧功能
 
-v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的自动风控：
+v0.6.1 继续缩小自动化写入面。下面的旧能力不得视为可用的自动风控：
 
-| 旧能力 | v0.5.2 状态 |
+| 旧能力 | v0.6.1 状态 |
 |---|---|
 | Abuse Broadcast sidecar 表和后台写入器 | 不挂载；由 Tool Store 风险案件替代 |
 | AI 自动评估、自动扫描、连接测试 | 返回 `501 NOT_IMPLEMENTED` |
@@ -239,7 +239,7 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 | 批量永久清理 | 仅预览或禁用 |
 | Token 批量变更 | 无版本化适配器，返回 501 |
 | 批量开启 IP 记录 | 返回 501 |
-| Storage 通用配置入口（GET/POST/DELETE） | 全部返回 501；v0.5.2 不提供通用配置读取或写入 |
+| Storage 通用配置入口（GET/POST/DELETE） | 全部返回 501；v0.6.1 不提供通用配置读取或写入 |
 | 自动创建数据库索引 | 禁用，只列出建议 |
 | 缓存 warmup 状态 | 返回 501；请使用健康接口 |
 | 解封后批量恢复 Token | 不执行，避免复活已泄漏凭据 |
@@ -249,21 +249,22 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 ### 一键安装
 
 ```bash
-INSTALLER_COMMIT_SHA=4b0819645d17ba3c1873967ce86239dba3a73a7c
-INSTALL_SCRIPT_SHA256=b72f5e35ea33a9059b96b020f89d990d712cd168ff6338edae7c9359712e84eb
+# v0.6.1 installer is pinned to an immutable audited commit and blob hash.
+INSTALLER_COMMIT_SHA=2e46e6352f926c048fa996de51c53f2f40d9fbd0
+INSTALL_SCRIPT_SHA256=c23bae15c239a4ae2b11bcd1013d53d76eb20d4ca40ecdd163a381052d103462
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   "https://raw.githubusercontent.com/yujianwudi/new_api_tools/${INSTALLER_COMMIT_SHA}/install.sh" \
   --output "$install_script"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$install_script" | sha256sum -c - || exit 1
-NEWAPI_TOOLS_REF=v0.6.0 \
-NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
-NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \
+NEWAPI_TOOLS_REF=v0.6.1 \
+NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:REPLACE_WITH_64_HEX_MANIFEST_DIGEST \
+NEWAPI_TOOLS_EXPECTED_REVISION=REPLACE_WITH_40_HEX_RELEASE_COMMIT \
 bash "$install_script"
 ```
 
-安装器 commit 与 SHA-256 已固定在本仓库文档中。执行前仍必须从 v0.6.0 发行页复制并替换 `<MANIFEST_DIGEST>` 与 `<RELEASE_COMMIT_SHA>`；任一占位符未替换时不要执行。
+安装器 commit 与脚本 SHA-256 已固定；执行前仍必须从 v0.6.1 发行页复制真实的 manifest digest 与 release commit，并替换剩余全部 `REPLACE_WITH_*`。任一占位符未替换时不要执行。
 
 安装器会：
 
@@ -279,15 +280,16 @@ bash "$install_script"
 
 ### 手动部署
 
-v0.6.0 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
+v0.6.1 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧版 `docker-compose` v1 会被安装/部署脚本拒绝。
 
 ```bash
-git clone --branch v0.6.0 --depth 1 https://github.com/yujianwudi/new_api_tools.git
+git clone --branch v0.6.1 --depth 1 https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
-# 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下两个真实值：
+# 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下三个真实值：
 NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
 NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \
+NEWAPI_TOOLS_RELEASE_TAG=v0.6.1 \
 bash ./deploy.sh
 ```
 
@@ -305,6 +307,7 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 |---|---|---|
 | `NEWAPI_TOOLS_IMAGE` | 部署镜像；手动部署必须使用 `repo@sha256:digest` | 无默认值；安装/部署脚本自动解析并持久化 digest |
 | `NEWAPI_TOOLS_EXPECTED_REVISION` | 镜像必须匹配的 40 位 Git commit | 显式镜像时必填；从发行页复制 |
+| `NEWAPI_TOOLS_RELEASE_TAG` | 镜像签名与 provenance 必须匹配的严格发行标签 | 显式发行 digest 时必填，如 `v0.6.1` |
 | `SQL_DSN` | NewAPI 主库 DSN | 必填 |
 | `LOG_SQL_DSN` | 可选日志分库 DSN；留空回落主库 | 可选 |
 | `NEWAPI_BASEURL` | NewAPI 内部基地址 | 如 `http://new-api:3000` |
@@ -312,6 +315,9 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 | `NEWAPI_ADMIN_USER_ID` | 管理员用户 ID | 写操作必填 |
 | `REDEMPTION_MAX_QUOTA_PER_CODE` | 单个兑换码最大 quota | `50000000`（约 US$100） |
 | `REDEMPTION_MAX_TOTAL_QUOTA` | 单次生成最大总 quota | `500000000`（约 US$1000） |
+| `AFFILIATE_EVIDENCE_ROW_CAP` | 单次邀请充值证据哈希允许读取的成功充值行数；超限返回 422，不生成截断哈希 | `20000`；合法范围 `1-100000` |
+| `AFFILIATE_QUERY_TIMEOUT_SECONDS` | 邀请充值 list/summary/detail 整次服务端 deadline；更早的调用方 deadline 优先 | `5`；合法范围 `1-60` |
+| `AFFILIATE_QUERY_MAX_CONCURRENCY` | 每实例同时运行的邀请充值重查询上限；排队受 context/deadline 约束 | `2`；合法范围 `1-16` |
 | `TOOL_STORE_PATH` | 独立 Tool Store 路径 | `DATA_DIR/control-plane.db` |
 | `ADMIN_PASSWORD` | 控制台登录密码 | 必填，安装器生成 |
 | `API_KEY` | 控制台 API Key | 必填，安装器生成 |
@@ -334,7 +340,7 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 升级前备份配置和 Tool Store。下面的 Compose 示例从运行中容器解析实际的 `TOOL_STORE_PATH`（未显式配置时按 `DATA_DIR/control-plane.db` 解析），然后先停止服务再复制 SQLite；不要在服务运行时直接 `cp` 数据库文件：
 
 ```bash
-backup_dir="backups/v0.6.0-$(date +%Y%m%d%H%M%S)"
+backup_dir="backups/v0.6.1-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$backup_dir"
 cp -- .env "$backup_dir/.env"
 
@@ -367,7 +373,7 @@ curl -fsS http://127.0.0.1:1145/readyz
 docker compose logs --tail=200 newapi-tools
 ```
 
-依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)。
+依赖诊断需要 JWT 或 API Key；`/metrics` 需要独立观测 token。更完整的升级、回滚和兼容性说明见 [`RELEASE_0.6.1.md`](./RELEASE_0.6.1.md)。
 
 ## 回滚
 
@@ -394,16 +400,21 @@ go vet ./...
 
 cd ../frontend
 npm ci
+npm test
 npm run lint
+npx tsc --noEmit
 npm run build
-npm audit --omit=dev
+npm audit --audit-level=high --registry=https://registry.npmjs.org
+npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org
 ```
 
-CI 还会执行 `govulncheck`、部署脚本测试、Compose 校验、多架构构建和镜像身份检查。Docker 基础镜像与 Redis 使用多架构 manifest digest 固定；GeoIP 数据固定到提交 `a83d44508ee6831c2770b2c4be91f9850ec429d7`，并在构建和运行时校验 SHA-256 `168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf`。固定 GeoIP 快照无法下载或校验失败时，镜像构建失败关闭。发布镜像同时生成 SBOM 和 provenance。
+CI 还会执行 `govulncheck`、部署脚本测试、Compose 校验、10 万用户/30 天日志、邀请充值与 1000 模型性能门禁、多架构构建和镜像身份检查。Docker 基础镜像与 Redis 使用多架构 manifest digest 固定；GeoIP 数据固定到提交 `a83d44508ee6831c2770b2c4be91f9850ec429d7`，并在构建和运行时校验 SHA-256 `168b01d10d0742129be1bee92bba85affaaefcf2e86b4187bcf1924ea50068bf`。固定 GeoIP 快照无法下载或校验失败时，镜像构建失败关闭。发布镜像同时生成 SBOM、Cosign 签名和受策略校验的 SLSA v1 provenance。
 
 ## 项目资料
 
 - 路线图：[`docs/ROADMAP.md`](./docs/ROADMAP.md)
+- v0.6.1 整改任务书与验收标准：[`docs/V0.6.1_REMEDIATION_TASK_BOOK.md`](./docs/V0.6.1_REMEDIATION_TASK_BOOK.md)
+- v0.6.1 发行说明：[`RELEASE_0.6.1.md`](./RELEASE_0.6.1.md)
 - v0.6.0 发行说明：[`RELEASE_0.6.0.md`](./RELEASE_0.6.0.md)
 - v0.6 模型监测任务书：[`docs/V0.6_MODEL_MONITORING_TASK_BOOK.md`](./docs/V0.6_MODEL_MONITORING_TASK_BOOK.md)
 - v0.5.2 发行说明：[`RELEASE_0.5.2.md`](./RELEASE_0.5.2.md)

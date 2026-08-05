@@ -31,12 +31,15 @@ die() { log_error "$*"; exit 1; }
 REPO_URL="https://github.com/yujianwudi/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
-INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.6.0}"
+NEWAPI_TOOLS_SIGNING_REPOSITORY="yujianwudi/new_api_tools"
+NEWAPI_TOOLS_COSIGN_IMAGE="ghcr.io/sigstore/cosign/cosign:v3.1.2@sha256:d91bc4e7e95e8d2f549c747a72dc174f90579e410a1695f57f686674f84ce849"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.6.1}"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
 INSTALL_COMMIT=""
 NEWAPI_TOOLS_IMAGE_DERIVED=false
 NEWAPI_TOOLS_EXPECTED_REVISION=""
+NEWAPI_TOOLS_RELEASE_TAG=""
 REINSTALL=false
 INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE=""
 INSTALL_ROLLBACK_ENV_AVAILABLE=false
@@ -44,6 +47,50 @@ INSTALL_ROLLBACK_ENV_CONTENT=""
 INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
 INSTALL_STATE_LOCK_FD=""
 INSTALL_STATE_LOCK_PATH=""
+INSTALL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_TOOLSTORE_TXN_LOADED=false
+
+load_install_toolstore_transaction_library() {
+  local project_dir="$1" library
+  local project_abs root mode system external_active=false
+  if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]]; then
+    return 0
+  fi
+  project_abs="$(realpath -m -s -- "$project_dir" 2>/dev/null)" || return 1
+  [[ "$project_abs" == "$(realpath -m -- "$project_dir" 2>/dev/null)" ]] || return 1
+  root="$(dirname -- "$project_abs")/.$(basename -- "$project_abs").toolstore-transactions"
+  if [[ -e "${root}/active.env" || -L "${root}/active.env" ]]; then
+    [[ -f "${root}/active.env" && ! -L "${root}/active.env" ]] || return 1
+    library="${root}/recovery-library.sh"
+    external_active=true
+  else
+    library="${project_dir}/scripts/toolstore_transaction.sh"
+  fi
+  if [[ ! -f "$library" || -L "$library" ]]; then
+    [[ "$external_active" != "true" ]] || return 1
+    if [[ -f "${INSTALL_SCRIPT_DIR}/scripts/toolstore_transaction.sh" &&
+          ! -L "${INSTALL_SCRIPT_DIR}/scripts/toolstore_transaction.sh" ]]; then
+      library="${INSTALL_SCRIPT_DIR}/scripts/toolstore_transaction.sh"
+    else
+      library="${root}/recovery-library.sh"
+    fi
+  fi
+  [[ -f "$library" && ! -L "$library" ]] || return 1
+  mode="$(stat -Lc '%a' -- "$library" 2>/dev/null)" || return 1
+  system="$(uname -s 2>/dev/null || true)"
+  if [[ "$system" != MINGW* && "$system" != MSYS* && "$system" != CYGWIN* ]]; then
+    if [[ "$library" == */recovery-library.sh ]]; then
+      [[ "$mode" == "600" ]] || return 1
+    else
+      [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+      (( (8#$mode & 0022) == 0 )) || return 1
+    fi
+  fi
+  TOOLSTORE_TXN_LIBRARY_SOURCE="$library"
+  # shellcheck source=scripts/toolstore_transaction.sh
+  source "$library"
+  INSTALL_TOOLSTORE_TXN_LOADED=true
+}
 
 # The lock is project-scoped but stored beside the project directory. It must
 # survive a purge and must be available before a first-install target exists.
@@ -160,6 +207,144 @@ image_repository_without_tag() {
   printf '%s\n' "$image"
 }
 
+run_install_cosign() {
+  local runner="${NEWAPI_TOOLS_COSIGN_RUNNER:-}"
+  if [[ -n "$runner" ]]; then
+    "$runner" "$@"
+    return
+  fi
+  local policy_file="${NEWAPI_TOOLS_COSIGN_POLICY_FILE:-}"
+  local -a policy_mount=()
+  if [[ -n "$policy_file" ]]; then
+    [[ "$policy_file" == /* && -f "$policy_file" && ! -L "$policy_file" ]] || return 1
+    policy_mount=(--volume "${policy_file}:/tmp/newapi-tools-provenance-policy.cue:ro")
+  fi
+  docker run --rm \
+    --read-only \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges:true \
+    --user=65532:65532 \
+    --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m \
+    --env=HOME=/tmp \
+    --env=XDG_CACHE_HOME=/tmp \
+    "${policy_mount[@]}" \
+    "$NEWAPI_TOOLS_COSIGN_IMAGE" "$@"
+}
+
+verify_install_release_signature() {
+  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
+  local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_names=(
+    'Build and Push Docker Image'
+    'Recover Release Image From Existing Tag'
+  )
+  local -a workflow_triggers=(push workflow_dispatch)
+
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  is_immutable_newapi_tools_image "$image" || return 1
+  [[ "$(image_repository_without_tag "$image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
+  expected_ref="refs/tags/${tag}"
+
+  for index in "${!workflow_files[@]}"; do
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
+    if run_install_cosign verify \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
+      --certificate-github-workflow-ref "$expected_ref" \
+      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-name "${workflow_names[index]}" \
+      --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
+      -a "git_sha=${git_sha}" \
+      -a "tag=${tag}" \
+      "$image" >/dev/null; then
+      return 0
+    fi
+  done
+  log_error "发行镜像签名未匹配允许的 build.yml 或 release-recovery.yml 标签工作流身份"
+  return 1
+}
+
+verify_install_release_provenance() {
+  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
+  local repository manifest_digest policy_file policy_argument
+  local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_names=(
+    'Build and Push Docker Image'
+    'Recover Release Image From Existing Tag'
+  )
+  local -a workflow_triggers=(push workflow_dispatch)
+
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  is_immutable_newapi_tools_image "$image" || return 1
+  repository="$(image_repository_without_tag "$image")"
+  [[ "$repository" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
+  manifest_digest="${image##*@}"
+  expected_ref="refs/tags/${tag}"
+
+  for index in "${!workflow_files[@]}"; do
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
+    policy_file="$(mktemp)" || return 1
+    cat >"$policy_file" <<EOF
+package newapi_tools_release
+
+"_type": "https://in-toto.io/Statement/v1"
+predicateType: "https://slsa.dev/provenance/v1"
+subject: [{
+  name: "${repository}"
+  digest: sha256: "${manifest_digest#sha256:}"
+}]
+predicate: {
+  buildDefinition: {
+    buildType: "${identity}"
+    externalParameters: {
+      repository: "https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}"
+      ref: "${expected_ref}"
+      revision: "${git_sha}"
+      tag: "${tag}"
+      manifest_digest: "${manifest_digest}"
+      platform_digests: {
+        "linux/amd64": =~"^sha256:[0-9a-f]{64}$"
+        "linux/arm64": =~"^sha256:[0-9a-f]{64}$"
+      }
+    }
+    resolvedDependencies: [{
+      uri: "git+https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}@${expected_ref}"
+      digest: gitCommit: "${git_sha}"
+    }]
+  }
+  runDetails: builder: id: "${identity}"
+}
+EOF
+    chmod 0444 "$policy_file" || { rm -f -- "$policy_file"; return 1; }
+    policy_argument="$policy_file"
+    if [[ -z "${NEWAPI_TOOLS_COSIGN_RUNNER:-}" ]]; then
+      policy_argument='/tmp/newapi-tools-provenance-policy.cue'
+    fi
+    if NEWAPI_TOOLS_COSIGN_POLICY_FILE="$policy_file" run_install_cosign verify-attestation \
+      --type slsaprovenance1 \
+      --policy "$policy_argument" \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
+      --certificate-github-workflow-ref "$expected_ref" \
+      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-name "${workflow_names[index]}" \
+      --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
+      -a "git_sha=${git_sha}" \
+      -a "tag=${tag}" \
+      "$image" >/dev/null; then
+      rm -f -- "$policy_file"
+      return 0
+    fi
+    rm -f -- "$policy_file"
+  done
+  log_error "发行镜像缺少与 subject、平台 digest、tag 和 commit 绑定的受信 SLSA provenance"
+  return 1
+}
+
 resolve_install_image_digest() {
   local image="$1" expected_revision="${2:-}" repository actual_revision
   local -a matching_digests=()
@@ -237,6 +422,14 @@ pin_install_image_after_pull() {
     log_error "候选镜像 digest 或源码版本验证失败；现有服务保持不变"
     return 1
   fi
+  if [[ -n "$NEWAPI_TOOLS_RELEASE_TAG" ]] &&
+    { ! verify_install_release_signature \
+        "$resolved" "$NEWAPI_TOOLS_RELEASE_TAG" "$NEWAPI_TOOLS_EXPECTED_REVISION" ||
+      ! verify_install_release_provenance \
+        "$resolved" "$NEWAPI_TOOLS_RELEASE_TAG" "$NEWAPI_TOOLS_EXPECTED_REVISION"; }; then
+    log_error "候选发行镜像的 Sigstore 身份、标签、commit、注解或 subject digest 验证失败；现有服务保持不变"
+    return 1
+  fi
   NEWAPI_TOOLS_IMAGE="$resolved"
   export NEWAPI_TOOLS_IMAGE
   log_success "候选部署镜像已验证并固定为 ${resolved}"
@@ -248,17 +441,17 @@ resolve_install_image() {
 
   local image=""
   if [[ -n "$requested_image" ]]; then
+    [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 仅用于严格发行标签；开发 ref 必须从 Git checkout 派生短 SHA 镜像"
     is_immutable_newapi_tools_image "$requested_image" ||
       die "显式 NEWAPI_TOOLS_IMAGE 必须使用发行页核验过的 repo@sha256:<digest>"
     [[ "$(image_repository_without_tag "$requested_image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
       die "显式 NEWAPI_TOOLS_IMAGE 必须属于受信任仓库 ${NEWAPI_TOOLS_IMAGE_REPOSITORY}"
     image="$requested_image"
-  elif [[ "$ref" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  elif [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     die "发行版本 ${ref} 必须同时提供发行页中的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
-  elif [[ "$ref" == "main" ]]; then
-    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
   else
-    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
   fi
 
   validate_newapi_tools_image "$image"
@@ -270,6 +463,30 @@ validate_install_ref() {
     die "NEWAPI_TOOLS_REF 格式无效"
   [[ "$INSTALL_REF" != *..* && "$INSTALL_REF" != *@\{* && "$INSTALL_REF" != */ && "$INSTALL_REF" != *. ]] ||
     die "NEWAPI_TOOLS_REF 格式无效"
+  if [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+    [[ ! "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    die "发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式"
+  fi
+}
+
+install_release_tag_at_commit() {
+  local commit="$1" tags tag release_tag=""
+  tags="$(git tag --points-at "$commit")" ||
+    die "无法枚举安装 commit ${commit} 上的 Git tag"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+      [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      die "安装 commit 上的发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式: ${tag}"
+    fi
+    [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] ||
+      die "发行标签必须是 annotated tag: ${tag}"
+    [[ -z "$release_tag" ]] ||
+      die "同一安装 commit 不能同时关联多个发行标签: ${release_tag}, ${tag}"
+    release_tag="$tag"
+  done <<< "$tags"
+  printf '%s\n' "$release_tag"
 }
 
 verify_install_origin() {
@@ -297,7 +514,7 @@ checkout_install_ref() {
     git show-ref --verify --quiet "refs/remotes/origin/main" ||
       die "远端 main 分支不存在"
     target="refs/remotes/origin/main"
-  elif [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  elif [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     git show-ref --verify --quiet "refs/tags/${INSTALL_REF}" ||
       die "发行版本 ${INSTALL_REF} 缺少签出的 Git tag"
     target="refs/tags/${INSTALL_REF}"
@@ -313,11 +530,25 @@ checkout_install_ref() {
   local commit
   commit="$(git rev-parse --verify "${target}^{commit}")" ||
     die "无法解析安装版本 ${INSTALL_REF}"
+  local commit_release_tag
+  if ! commit_release_tag="$(install_release_tag_at_commit "$commit")"; then
+    die "无法安全解析安装 commit ${commit} 的发行标签身份"
+  fi
+  if [[ -n "$commit_release_tag" && "$INSTALL_REF" != "$commit_release_tag" ]]; then
+    die "安装 ref ${INSTALL_REF} 指向发行 commit ${commit_release_tag}；必须改用该发行标签及其签名镜像"
+  fi
+  if [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+        "$commit_release_tag" != "$INSTALL_REF" ]]; then
+    die "发行 ref ${INSTALL_REF} 未解析到同名 annotated tag"
+  fi
 
-  if [[ "$INSTALL_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+  if [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+        -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
     die "发行版本 ${INSTALL_REF} 必须使用发行页提供的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
   fi
   if [[ -n "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+    [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 仅用于严格发行标签；开发 ref 必须从 Git checkout 派生短 SHA 镜像"
     is_immutable_newapi_tools_image "$REQUESTED_NEWAPI_TOOLS_IMAGE" ||
       die "显式 NEWAPI_TOOLS_IMAGE 必须使用 repo@sha256:<64 位小写十六进制>"
     [[ "$(image_repository_without_tag "$REQUESTED_NEWAPI_TOOLS_IMAGE")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
@@ -332,6 +563,11 @@ checkout_install_ref() {
 
   git reset --hard "$commit"
   INSTALL_COMMIT="$commit"
+  if [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    NEWAPI_TOOLS_RELEASE_TAG="$INSTALL_REF"
+  else
+    NEWAPI_TOOLS_RELEASE_TAG=""
+  fi
   if [[ -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
     NEWAPI_TOOLS_IMAGE_DERIVED=true
     NEWAPI_TOOLS_EXPECTED_REVISION="$commit"
@@ -339,7 +575,7 @@ checkout_install_ref() {
     NEWAPI_TOOLS_IMAGE_DERIVED=false
     NEWAPI_TOOLS_EXPECTED_REVISION="${REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION,,}"
   fi
-  export NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
+  export NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION NEWAPI_TOOLS_RELEASE_TAG
   NEWAPI_TOOLS_IMAGE="$(resolve_install_image "$INSTALL_REF" "$commit" "$REQUESTED_NEWAPI_TOOLS_IMAGE")"
   export NEWAPI_TOOLS_IMAGE
   export NEWAPI_TOOLS_SOURCE_COMMIT="$commit"
@@ -395,6 +631,34 @@ env_file_value() {
   printf '%s\n' "$value"
 }
 
+# Resolve the only Tool Store host mapping supported by the shipped Compose
+# file without loading the transaction library. This lets genuine pre-Tool-
+# Store installations upgrade through the legacy health contract, while any
+# configured unsafe path still fails before the old service is stopped.
+resolve_install_toolstore_host_path() {
+  local env_file="$1" project_dir="$2" project raw relative host data_root
+  [[ -f "$env_file" && ! -L "$env_file" ]] || return 1
+  project="$(realpath -m -s -- "$project_dir" 2>/dev/null)" || return 1
+  [[ "$project" == "$(realpath -m -- "$project_dir" 2>/dev/null)" && "$project" != "/" ]] || return 1
+  if grep -qE '^TOOL_STORE_PATH=' "$env_file"; then
+    raw="$(env_file_value "$env_file" TOOL_STORE_PATH)"
+    [[ -n "$raw" ]] || return 1
+  else
+    raw="/app/data/control-plane.db"
+  fi
+  case "$raw" in
+    /app/data/*) relative="data/${raw#/app/data/}" ;;
+    ./data/*) relative="${raw#./}" ;;
+    data/*) relative="$raw" ;;
+    *) return 1 ;;
+  esac
+  [[ "$relative" != "data/" && "$relative" != */ && "$relative" != *$'\n'* ]] || return 1
+  host="$(realpath -m -s -- "${project}/${relative}" 2>/dev/null)" || return 1
+  data_root="$(realpath -m -s -- "${project}/data" 2>/dev/null)" || return 1
+  [[ "$host" == "$data_root"/* && "$host" == "$(realpath -m -- "$host" 2>/dev/null)" ]] || return 1
+  printf '%s\n' "$host"
+}
+
 env_content_value() {
   local content="$1" key="$2" value
   value="$(printf '%s\n' "$content" | awk -v k="$key" '
@@ -409,6 +673,42 @@ env_content_value() {
     value="${value:1:${#value}-2}"
   fi
   printf '%s\n' "$value"
+}
+
+validate_install_credential_separation_content() {
+  local content="$1" index prior value
+  local -a names=(
+    ADMIN_PASSWORD
+    API_KEY
+    JWT_SECRET
+    NEWAPI_ADMIN_ACCESS_TOKEN
+    MODEL_PROBE_API_KEY
+    OBSERVABILITY_TOKEN
+  )
+  local -a values=()
+
+  for index in "${!names[@]}"; do
+    value="$(env_content_value "$content" "${names[index]}")"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    values[index]="$value"
+    [[ -n "$value" ]] || continue
+    for ((prior = 0; prior < index; prior++)); do
+      if [[ -n "${values[prior]:-}" && "$value" == "${values[prior]}" ]]; then
+        log_error "凭据变量 ${names[prior]} 与 ${names[index]} 不得复用同一非空值"
+        return 1
+      fi
+    done
+  done
+}
+
+validate_install_credential_separation_file() {
+  local env_file="$1"
+  [[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] || {
+    log_error "凭据预检要求安全且可读的常规 .env 文件"
+    return 1
+  }
+  validate_install_credential_separation_content "$(<"$env_file")"
 }
 
 dotenv_quote() {
@@ -532,14 +832,41 @@ validate_install_rollback_compose_bundle() {
   [[ "$(env_content_value "$marker_content" 'COMPOSE_BASE')" == "present" ]]
 }
 
+configure_install_toolstore_compose_sources() {
+  local env_file="$1" marker_content name key state source_var
+  validate_install_rollback_compose_bundle "$env_file" || return 1
+  marker_content="$(load_install_mode600_file "$(install_rollback_compose_marker_path "$env_file")")" || return 1
+  while IFS= read -r name; do
+    key="$(install_rollback_compose_state_key "$name")" || return 1
+    state="$(env_content_value "$marker_content" "$key")"
+    case "$name" in
+      docker-compose.yml) source_var=TOOLSTORE_TXN_COMPOSE_BASE_SOURCE ;;
+      docker-compose.host.yml) source_var=TOOLSTORE_TXN_COMPOSE_HOST_SOURCE ;;
+      docker-compose.logdb.yml) source_var=TOOLSTORE_TXN_COMPOSE_LOGDB_SOURCE ;;
+    esac
+    if [[ "$state" == "present" ]]; then
+      printf -v "$source_var" '%s' "$(install_rollback_compose_snapshot_path "$env_file" "$name")"
+    elif [[ "$state" == "absent" ]]; then
+      printf -v "$source_var" '%s' '__ABSENT__'
+    else
+      return 1
+    fi
+  done < <(install_rollback_compose_files)
+}
+
+clear_install_toolstore_compose_sources() {
+  unset TOOLSTORE_TXN_COMPOSE_BASE_SOURCE TOOLSTORE_TXN_COMPOSE_HOST_SOURCE TOOLSTORE_TXN_COMPOSE_LOGDB_SOURCE
+}
+
 discard_install_rollback_compose_bundle() {
-  local env_file="$1" marker name snapshot_file
+  local env_file="$1" marker name snapshot_file cleanup_ok=true
   marker="$(install_rollback_compose_marker_path "$env_file")"
-  durable_remove_install_file "$marker" || return 1
   while IFS= read -r name; do
     snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
-    durable_remove_install_file "$snapshot_file" || return 1
+    durable_remove_install_file "$snapshot_file" || cleanup_ok=false
   done < <(install_rollback_compose_files)
+  durable_remove_install_file "$marker" || cleanup_ok=false
+  [[ "$cleanup_ok" == "true" ]]
 }
 
 persist_install_rollback_compose_bundle() {
@@ -639,17 +966,75 @@ remove_install_rollback_snapshot() {
 }
 
 commit_install_rollback_transaction() {
-  local env_file="$1"
-  remove_install_rollback_snapshot "$env_file" || return 1
-  INSTALL_ROLLBACK_ENV_AVAILABLE=false
-  INSTALL_ROLLBACK_ENV_CONTENT=""
-  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
-  if ! discard_install_rollback_compose_bundle "$env_file"; then
-    # The authoritative .env rollback marker is already durably gone, so a
-    # leftover mode-600 Compose copy is inert. Do not roll back a healthy
-    # candidate after its commit point; the next transaction will replace it.
-    log_warn "部署已提交，但无法清理非活动 Compose 回滚副本"
+  local env_file="$1" snapshot_file cleanup_ok=true
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" != "true" ||
+      -z "$INSTALL_ROLLBACK_ENV_CONTENT" ]]; then
+      cleanup_ok=false
+    elif remove_install_rollback_snapshot "$env_file"; then
+      INSTALL_ROLLBACK_ENV_AVAILABLE=false
+      INSTALL_ROLLBACK_ENV_CONTENT=""
+      INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+    else
+      cleanup_ok=false
+    fi
+  else
+    INSTALL_ROLLBACK_ENV_AVAILABLE=false
+    INSTALL_ROLLBACK_ENV_CONTENT=""
+    INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
   fi
+  if ! discard_install_rollback_compose_bundle "$env_file"; then
+    cleanup_ok=false
+  fi
+  [[ "$cleanup_ok" == "true" ]]
+}
+
+start_and_finalize_committed_install_candidate() {
+  local env_file="$1" project_dir="$2" candidate_image="$3"
+  shift 3
+  local snapshot_file rollback_content cleanup_ok=true
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    if rollback_content="$(load_install_rollback_snapshot "$env_file")"; then
+      INSTALL_ROLLBACK_ENV_CONTENT="$rollback_content"
+      INSTALL_ROLLBACK_ENV_AVAILABLE=true
+    else
+      INSTALL_ROLLBACK_ENV_CONTENT=""
+      INSTALL_ROLLBACK_ENV_AVAILABLE=false
+      cleanup_ok=false
+      log_warn "Tool Store 已提交；旧安装回滚快照不可读，已保留该文件和提交证据，仍将启动正式候选"
+    fi
+  else
+    INSTALL_ROLLBACK_ENV_CONTENT=""
+    INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  fi
+
+  if ! commit_install_rollback_transaction "$env_file"; then
+    cleanup_ok=false
+    log_warn "Tool Store 已提交；旧安装或 Compose 回滚快照未完全清理，仍将启动正式候选，禁止恢复旧 schema"
+  fi
+
+  if ! start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" "$@"; then
+    log_error "Tool Store 已提交且不能安全回滚；正式候选启动失败，提交证据与未清理文件均已保留"
+    return 1
+  fi
+
+  if [[ "$cleanup_ok" == "true" ]]; then
+    if ! toolstore_txn_finish_committed "$project_dir"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据清理返回失败"
+    elif toolstore_txn_has_active "$project_dir"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据仍处于活动状态"
+    fi
+  fi
+
+  if [[ "$cleanup_ok" != "true" ]]; then
+    log_warn "正式候选已健康并保持运行；已保留 active.env 与未删除快照，下次运行 install.sh 将幂等重试清理，请勿手工恢复旧数据库、配置或镜像"
+  fi
+  log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
 }
 
 durable_remove_install_tree() {
@@ -764,7 +1149,7 @@ migrate_image_env_file() {
     if [[ -n "$existing_image" ]]; then
       selected_image="$existing_image"
     else
-      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.6.0"
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.6.1"
     fi
   fi
   validate_newapi_tools_image "$selected_image"
@@ -895,9 +1280,9 @@ is_install_legacy_db_ready_response() {
 }
 
 verify_install_application_health() {
-  local mode="$1" ready_body="" legacy_body=""
-  ready_body="$(docker exec newapi-tools curl --silent --show-error \
-    http://localhost:8080/readyz 2>/dev/null || true)"
+  local mode="$1" container="${2:-newapi-tools}" port="${3:-8080}" ready_body="" legacy_body=""
+  ready_body="$(docker exec "$container" curl --silent --show-error \
+    "http://localhost:${port}/readyz" 2>/dev/null || true)"
   if is_install_v05_ready_response "$ready_body"; then
     return 0
   fi
@@ -905,8 +1290,8 @@ verify_install_application_health() {
   if printf '%s' "$ready_body" | grep -Eq '^[[:space:]]*\{'; then
     return 1
   fi
-  legacy_body="$(docker exec newapi-tools curl --fail --silent --show-error \
-    http://localhost:8080/api/health/db 2>/dev/null || true)"
+  legacy_body="$(docker exec "$container" curl --fail --silent --show-error \
+    "http://localhost:${port}/api/health/db" 2>/dev/null || true)"
   is_install_legacy_db_ready_response "$legacy_body"
 }
 
@@ -918,6 +1303,106 @@ start_install_services_and_wait() {
   run_install_compose "$env_file" "$project_dir" "$image_override" "$@" \
     up -d --wait --wait-timeout 180 || return 1
   verify_install_application_health "$health_mode"
+}
+
+install_isolated_candidate_name() {
+  local project_dir="$1" container request_id compose_project candidate_image project
+  toolstore_txn_candidate_identity "$project_dir" container request_id compose_project candidate_image project || return 1
+  printf '%s\n' "$container"
+}
+
+stop_install_isolated_candidate() {
+  local project_dir="$1"
+  toolstore_txn_remove_candidate_container "$project_dir"
+}
+
+start_install_isolated_candidate_and_wait() {
+  local env_file="$1" project_dir="$2" image_override="$3"
+  shift 3
+  local container request_id compose_project candidate_image project created_ref container_id deadline
+  toolstore_txn_candidate_identity "$project_dir" container request_id compose_project candidate_image project || return 1
+  [[ "$image_override" == "$candidate_image" ]] || return 1
+  ! docker inspect "$container" >/dev/null 2>&1 || return 1
+  created_ref="$(run_install_compose "$env_file" "$project_dir" "$image_override" "$@" \
+    run --no-deps -d --name "$container" \
+    --label "io.newapi-tools.candidate.purpose=toolstore-migration-candidate" \
+    --label "io.newapi-tools.candidate.request-id=${request_id}" \
+    --label "io.newapi-tools.candidate.compose-project=${compose_project}" \
+    --label "io.newapi-tools.candidate.project-dir=${project}" \
+    --label "io.newapi-tools.candidate.image=${candidate_image}" \
+    -e SERVER_HOST=127.0.0.1 -e SERVER_PORT=8000 -e MODEL_PROBE_ENABLED=false \
+    --entrypoint /app/server newapi-tools)" || return 1
+  created_ref="${created_ref##*$'\n'}"
+  created_ref="${created_ref%$'\r'}"
+  [[ "$created_ref" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+  container_id="$(docker inspect --format '{{.Id}}' "$created_ref" 2>/dev/null)" || return 1
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if ! toolstore_txn_record_candidate_container_id "$project_dir" "$container_id"; then
+    docker rm -f "$container_id" >/dev/null 2>&1 || return 1
+    ! docker inspect "$container_id" >/dev/null 2>&1 || return 1
+    return 1
+  fi
+  if ! toolstore_txn_candidate_container_matches "$project_dir" "$container_id"; then
+    toolstore_txn_remove_created_candidate_by_id "$project_dir" "$container_id" || return 1
+    return 1
+  fi
+  restore_runtime_network_connections "$project_dir" "$container_id" || return 1
+  deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    [[ "$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)" == "true" ]] || return 1
+    if verify_install_application_health candidate "$container_id" 8000; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+recover_active_install_toolstore_transaction() {
+  local project_dir="$1" content state rollback_image candidate_image
+  local -a compose_args=()
+  load_install_toolstore_transaction_library "$project_dir" || return 1
+  toolstore_txn_has_active "$project_dir" || return 0
+  content="$(toolstore_txn_load_record "$project_dir")" || return 1
+  state="$(toolstore_txn_env_value "$content" STATE)"
+  stop_install_isolated_candidate "$project_dir" || return 1
+  if [[ "$state" == "committed" ]]; then
+    candidate_image="$(toolstore_txn_env_value "$content" CANDIDATE_IMAGE)"
+    (migrate_image_env_file "${project_dir}/.env" "$candidate_image" true) || return 1
+    setup_compose_files "$project_dir"
+    build_install_compose_args "${project_dir}/.env" "$project_dir" compose_args
+    start_and_finalize_committed_install_candidate \
+      "${project_dir}/.env" "$project_dir" "$candidate_image" "${compose_args[@]}"
+    return $?
+  fi
+  rollback_image="$(toolstore_txn_env_value "$content" OLD_IMAGE)"
+  toolstore_txn_restore_files "$project_dir" || return 1
+  setup_compose_files "$project_dir"
+  build_install_compose_args "${project_dir}/.env" "$project_dir" compose_args
+  if [[ "$state" == "preparing" || "$state" == "preflight" ]]; then
+    start_install_services_and_wait "${project_dir}/.env" "$project_dir" rollback \
+      "$rollback_image" "${compose_args[@]}" || return 1
+    toolstore_txn_retire_preflight "$project_dir" || return 1
+    return 0
+  fi
+  if [[ "$state" == "rolled_back" ]]; then
+    start_install_services_and_wait "${project_dir}/.env" "$project_dir" rollback \
+      "$rollback_image" "${compose_args[@]}" || return 1
+    toolstore_txn_retire_rolled_back "$project_dir" || return 1
+    log_success "已验证上次回滚后的旧服务并保留证据；下一候选将创建全新 Tool Store 备份"
+    return 0
+  fi
+  toolstore_txn_unstage_data "$project_dir" || return 1
+  if ! run_install_compose "${project_dir}/.env" "$project_dir" "$rollback_image" \
+    "${compose_args[@]}" down; then
+    log_warn "清理中断事务容器返回失败；仍尝试恢复数据库并重建旧服务"
+  fi
+  toolstore_txn_restore_database "$project_dir" || return 1
+  start_install_services_and_wait "${project_dir}/.env" "$project_dir" rollback \
+    "$rollback_image" "${compose_args[@]}" || return 1
+  toolstore_txn_mark_rolled_back "$project_dir" || return 1
+  toolstore_txn_retire_rolled_back "$project_dir" || return 1
+  log_success "已恢复并验证中断事务前的 Tool Store、旧配置和旧镜像"
 }
 
 build_install_compose_args() {
@@ -1108,6 +1593,7 @@ restart_install_services_transactionally() {
   local candidate_image="$NEWAPI_TOOLS_IMAGE" rollback_image container_names project_name=""
   local rollback_env_file="$env_file"
   local rollback_content="" rollback_config_restored=true candidate_healthy=false rollback_healthy=false
+  local toolstore_commit_succeeded=false
   local -a candidate_compose_args=() rollback_compose_args=()
   if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
     rollback_content="$(load_install_rollback_snapshot "$env_file")" ||
@@ -1146,6 +1632,36 @@ restart_install_services_transactionally() {
     rollback_compose_args=("${candidate_compose_args[@]}")
   fi
 
+  local toolstore_host_path
+  if ! toolstore_host_path="$(resolve_install_toolstore_host_path "$rollback_env_file" "$project_dir")"; then
+    die "旧安装的 TOOL_STORE_PATH 为空、越界或穿越 symlink；拒绝停止旧服务"
+  fi
+  if [[ -e "$toolstore_host_path" || -L "$toolstore_host_path" ]]; then
+    local toolstore_prepare_ok=false
+    [[ -f "$toolstore_host_path" && ! -L "$toolstore_host_path" ]] ||
+      die "旧安装的 Tool Store 不是安全的常规文件；拒绝停止旧服务"
+    load_install_toolstore_transaction_library "$project_dir" ||
+      die "当前 checkout 缺少安全的 Tool Store 事务库；拒绝停止旧服务"
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+      configure_install_toolstore_compose_sources "$env_file" ||
+        die "无法把旧 Compose 清单绑定到 Tool Store 回滚记录"
+    fi
+    if toolstore_txn_prepare "$rollback_env_file" "$project_dir" \
+      "$rollback_image" "$candidate_image" "$candidate_image"; then
+      toolstore_prepare_ok=true
+    fi
+    clear_install_toolstore_compose_sources
+    if [[ "$toolstore_prepare_ok" != "true" ]]; then
+      if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
+        restore_install_previous_configuration "$env_file" "$project_dir" ||
+          log_error "高危：Tool Store 备份失败后无法恢复完整旧安装配置"
+      fi
+      die "候选切换前无法创建并二次验证 Tool Store Online Backup；旧服务保持运行"
+    fi
+  else
+    log_warn "旧安装没有 Tool Store 文件，按 pre-Tool-Store 兼容升级处理；候选仍必须通过内容健康检查"
+  fi
+
   log_info "重启服务并等待候选版本健康..."
   if ! run_install_compose "$rollback_env_file" "$project_dir" "$rollback_image" \
     "${rollback_compose_args[@]}" down; then
@@ -1162,16 +1678,47 @@ restart_install_services_transactionally() {
     build_install_compose_args "$env_file" "$project_dir" rollback_compose_args
     if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" \
       "${rollback_compose_args[@]}"; then
+      if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+        toolstore_txn_has_active "$project_dir"; then
+        toolstore_txn_retire_preflight "$project_dir" ||
+          die "旧服务已恢复，但无法退役仅供预检的 Tool Store 备份"
+      fi
       die "候选版本尚未启动；初次停止失败后已恢复旧镜像 ${rollback_image}"
     fi
     die "初次停止失败，且旧镜像 ${rollback_image} 无法恢复健康；请立即检查 docker compose ps/logs"
   fi
 
-  if start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" \
+  if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+    toolstore_txn_has_active "$project_dir"; then
+    if ! toolstore_txn_authoritative_backup "$project_dir" ||
+      ! toolstore_txn_mark_candidate "$project_dir"; then
+      recover_active_install_toolstore_transaction "$project_dir" ||
+        die "旧服务已停止，但无法建立权威 Tool Store 回滚锚点且自动恢复失败"
+      die "候选版本尚未启动；权威 Tool Store 备份失败后已恢复旧服务"
+    fi
+    if start_install_isolated_candidate_and_wait "$env_file" "$project_dir" "$candidate_image" \
+      "${candidate_compose_args[@]}"; then
+      candidate_healthy=true
+    else
+      stop_install_isolated_candidate "$project_dir" ||
+        die "隔离候选停止身份或容器 ID 无法验证；禁止恢复数据库或启动旧服务"
+      log_error "隔离候选无法启动、恢复运行时网络或通过内容健康检查，将执行回滚"
+    fi
+  elif start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" \
     "${candidate_compose_args[@]}"; then
     candidate_healthy=true
   else
     log_error "候选服务无法启动、恢复运行时网络或通过内容健康检查，将执行回滚"
+  fi
+
+  if [[ "$candidate_healthy" == "true" ]]; then
+    if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+      toolstore_txn_has_active "$project_dir"; then
+      if ! stop_install_isolated_candidate "$project_dir" || ! toolstore_txn_verify_candidate "$project_dir"; then
+        candidate_healthy=false
+        log_error "隔离候选停止或 Tool Store schema/关键表验证失败，将执行数据库与镜像回滚"
+      fi
+    fi
   fi
 
   if [[ "$candidate_healthy" == "true" ]]; then
@@ -1180,16 +1727,54 @@ restart_install_services_transactionally() {
     if (migrate_image_env_file "$env_file" "$candidate_image" true); then
       NEWAPI_TOOLS_IMAGE="$candidate_image"
       export NEWAPI_TOOLS_IMAGE
-      if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" != "true" ]] ||
-        commit_install_rollback_transaction "$env_file"; then
-        log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+      if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+        toolstore_txn_has_active "$project_dir" &&
+        ! toolstore_txn_verify_candidate "$project_dir"; then
+        candidate_healthy=false
+        log_error "候选服务健康，但 Tool Store schema/核心表计数验证失败，将执行数据库与镜像回滚"
+      elif [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+        toolstore_txn_has_active "$project_dir"; then
+        if toolstore_txn_commit "$project_dir"; then
+          toolstore_commit_succeeded=true
+        else
+          candidate_healthy=false
+          log_error "候选服务已健康，但 Tool Store 提交结果未确认；将读取持久事务状态后决定恢复方向"
+        fi
+      elif [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] &&
+        ! commit_install_rollback_transaction "$env_file"; then
+        candidate_healthy=false
+        log_error "候选镜像已提交，但无法持久清理安装回滚快照"
+      else
+        if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" != "true" ]] ||
+          ! toolstore_txn_has_active "$project_dir"; then
+          log_success "候选镜像已健康，部署镜像已提交为 ${candidate_image}"
+          return 0
+        fi
+      fi
+    fi
+    [[ "$candidate_healthy" == "false" || "$toolstore_commit_succeeded" == "true" ]] ||
+      log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
+  fi
+
+  if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+    toolstore_txn_has_active "$project_dir"; then
+    local committed_content committed_state
+    committed_content="$(toolstore_txn_load_record "$project_dir")" ||
+      die "无法读取候选晋升事务状态；拒绝猜测是否可回滚"
+    committed_state="$(toolstore_txn_env_value "$committed_content" STATE)"
+    if [[ "$committed_state" == "committed" ]]; then
+      if start_and_finalize_committed_install_candidate \
+        "$env_file" "$project_dir" "$candidate_image" "${candidate_compose_args[@]}"; then
         return 0
       fi
-      candidate_healthy=false
-      log_error "候选镜像已提交，但无法持久清理安装回滚快照，将执行回滚"
+      die "Tool Store 已提交且不能安全回滚；正式候选启动失败，事务证据已保留供下次继续晋升"
     fi
-    [[ "$candidate_healthy" == "false" ]] ||
-      log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
+  fi
+
+  if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+    toolstore_txn_has_active "$project_dir"; then
+    stop_install_isolated_candidate "$project_dir" ||
+      die "无法证明隔离候选已停止；禁止恢复数据库或启动旧服务"
   fi
 
   if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
@@ -1214,9 +1799,23 @@ restart_install_services_transactionally() {
     log_error "清理失败的候选服务时发生错误；仍将尝试重建旧服务"
   fi
 
+  if [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+    toolstore_txn_has_active "$project_dir"; then
+    toolstore_txn_unstage_data "$project_dir" ||
+      die "Tool Store 数据目录无法恢复到项目树；旧镜像未启动，回滚证据已保留"
+    toolstore_txn_restore_database "$project_dir" ||
+      die "Tool Store 原子恢复失败；旧镜像不会在可能不兼容的 schema 上启动，回滚证据已保留"
+  fi
+
   if start_install_services_and_wait "$env_file" "$project_dir" rollback "$rollback_image" \
     "${rollback_compose_args[@]}"; then
     rollback_healthy=true
+  fi
+
+  if [[ "$rollback_healthy" == "true" && "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
+    toolstore_txn_has_active "$project_dir"; then
+    toolstore_txn_mark_rolled_back "$project_dir" ||
+      die "旧服务已恢复健康，但无法持久化 Tool Store 回滚完成状态；证据已保留"
   fi
 
   if [[ "$rollback_config_restored" == "true" && "$rollback_healthy" == "true" ]]; then
@@ -1306,7 +1905,7 @@ ensure_container_network() {
 
 # Compose down/up 会移除 docker network connect 手动附加的网络；每次重建后恢复它们。
 restore_runtime_network_connections() {
-  local project_dir="$1"
+  local project_dir="$1" tools_container="${2:-newapi-tools}"
   local env_file="${project_dir}/.env"
   [[ -f "$env_file" ]] || return 0
 
@@ -1337,16 +1936,16 @@ restore_runtime_network_connections() {
 
   case "$network_mode" in
     bridge)
-      ensure_container_network "newapi-tools" "${original_network:-bridge}" " NewAPI 原始 bridge 网络"
+      ensure_container_network "$tools_container" "${original_network:-bridge}" " NewAPI 原始 bridge 网络"
       ;;
     host)
       ;;
     *)
-      ensure_container_network "newapi-tools" "$newapi_network" " NewAPI 网络"
+      ensure_container_network "$tools_container" "$newapi_network" " NewAPI 网络"
       ;;
   esac
 
-  ensure_container_network "newapi-tools" "$log_network" "日志库网络"
+  ensure_container_network "$tools_container" "$log_network" "日志库网络"
 }
 
 #######################################
@@ -1379,6 +1978,7 @@ check_requirements() {
   command -v flock >/dev/null 2>&1 || missing+=("flock")
   command -v id >/dev/null 2>&1 || missing+=("id")
   command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
+  command -v realpath >/dev/null 2>&1 || missing+=("realpath")
   command -v stat >/dev/null 2>&1 || missing+=("stat")
   command -v sync >/dev/null 2>&1 || missing+=("sync")
 
@@ -1617,7 +2217,34 @@ show_initial_env_detection() {
 # 检测是否已安装服务
 #######################################
 check_existing_installation() {
-  local target_dir="${INSTALL_DIR}/${PROJECT_NAME}"
+  local target_dir="${INSTALL_DIR}/${PROJECT_NAME}" target_abs transaction_root active_record
+  local committed_cleanup_pending=false recovery_content recovery_state
+
+  target_abs="$(realpath -m -s -- "$target_dir" 2>/dev/null)" ||
+    die "无法解析安装目标路径"
+  [[ "$target_abs" == "$(realpath -m -- "$target_dir" 2>/dev/null)" ]] ||
+    die "安装目标或其父路径穿越 symlink"
+  transaction_root="$(dirname -- "$target_abs")/.$(basename -- "$target_abs").toolstore-transactions"
+  active_record="${transaction_root}/active.env"
+  if [[ -e "$active_record" || -L "$active_record" ]]; then
+    [[ -f "$active_record" && ! -L "$active_record" ]] ||
+      die "外置 Tool Store 活动事务记录不安全"
+    PROJECT_DIR="$target_dir"
+    load_install_toolstore_transaction_library "$target_dir" ||
+      die "无法加载 mode-600 外置 Tool Store 恢复库"
+    recover_active_install_toolstore_transaction "$target_dir" ||
+      die "项目树缺失或不完整时，外置 Tool Store 事务无法安全恢复"
+    if toolstore_txn_has_active "$target_dir"; then
+      recovery_content="$(toolstore_txn_load_record "$target_dir")" ||
+        die "正式候选恢复后无法读取保留的 Tool Store 提交证据"
+      recovery_state="$(toolstore_txn_env_value "$recovery_content" STATE)"
+      [[ "$recovery_state" == "committed" ]] ||
+        die "Tool Store 恢复返回成功但仍保留非 committed 活动事务"
+      committed_cleanup_pending=true
+    fi
+  fi
+  cleanup_install_clone_staging "$target_dir" ||
+    die "无法安全清理上次中断的临时 clone 目录"
 
   # 检查项目目录是否存在
   if [[ ! -d "$target_dir" ]]; then
@@ -1627,11 +2254,44 @@ check_existing_installation() {
     return 0
   fi
 
+  if [[ ! -f "${target_dir}/.env" || -L "${target_dir}/.env" ||
+    ! -f "${target_dir}/docker-compose.yml" || -L "${target_dir}/docker-compose.yml" ]]; then
+    if install_interrupted_checkout_is_trusted "$target_dir"; then
+      log_warn "检测到可信 origin 的中断 clone/checkout；将在同级隔离后重新原子发布"
+      return 0
+    fi
+    die "安装目标是未知或不完整的目录，且没有可恢复的外置事务；拒绝当作现有安装或覆盖"
+  fi
+
   # 设置 PROJECT_DIR 供后续函数使用
   PROJECT_DIR="$target_dir"
 
+  if [[ -f "${target_dir}/scripts/toolstore_transaction.sh" ]]; then
+    load_install_toolstore_transaction_library "$target_dir" ||
+      die "Tool Store 事务库不安全或不可读取"
+    if [[ "$committed_cleanup_pending" != "true" ]] &&
+      toolstore_txn_has_active "$target_dir"; then
+      recover_active_install_toolstore_transaction "$target_dir" ||
+        die "未完成的 Tool Store 事务无法安全恢复；拒绝进入管理菜单"
+      if toolstore_txn_has_active "$target_dir"; then
+        recovery_content="$(toolstore_txn_load_record "$target_dir")" ||
+          die "正式候选恢复后无法读取保留的 Tool Store 提交证据"
+        recovery_state="$(toolstore_txn_env_value "$recovery_content" STATE)"
+        [[ "$recovery_state" == "committed" ]] ||
+          die "Tool Store 恢复返回成功但仍保留非 committed 活动事务"
+        committed_cleanup_pending=true
+      fi
+    fi
+  fi
+
   # Recover an interrupted update before exposing restart/start actions in the
   # management menu. The snapshot remains active until a later update commits.
+  if [[ "$committed_cleanup_pending" == "true" ]]; then
+    log_warn "Tool Store 已提交且正式候选健康；旧快照仅为待清理证据，本次不进入变更菜单，也不按其恢复旧配置、旧镜像或旧 schema"
+    log_success "当前候选服务可用；下次运行 install.sh 将幂等重试快照与提交证据清理"
+    exit 0
+  fi
+
   local rollback_snapshot="${target_dir}/.env.rollback"
   if [[ -e "$rollback_snapshot" || -L "$rollback_snapshot" ]]; then
     capture_install_rollback_env "${target_dir}/.env"
@@ -1806,7 +2466,7 @@ show_management_menu() {
     echo "  6) 启动服务   (启动已停止的容器)"
     echo ""
     echo "  7) 重新配置   (备份当前配置，重新运行部署向导)"
-    echo "  8) 重新安装   (删除容器和配置，保留数据，全新部署)"
+    echo "  8) 安全重装   (在线备份 Tool Store，保留回滚证据后重建项目)"
     echo "  9) 完全卸载   (删除所有内容，包括数据，需确认)"
     echo " 10) 完全重装   (完全卸载后重新安装，需确认)"
     echo ""
@@ -1857,14 +2517,10 @@ show_management_menu() {
         ;;
       8)
         echo ""
-        echo -e "${YELLOW}重新安装将：${NC}"
-        echo "  • 删除现有 newapi-tools 容器和 .env 配置"
-        echo "  • 保留 data 目录（GeoIP / 本地存储）"
-        echo "  • 重新运行部署向导"
+        echo -e "${YELLOW}安全重装将先创建并二次验证 Tool Store Online Backup，停止旧服务后才暂存 data 并重建项目。${NC}"
+        echo "任何备份、路径、权限、恢复或健康检查失败都会停止操作并保留旧部署/回滚证据。"
         echo ""
-        echo -e "${GREEN}NewAPI 自身的数据库 / 用户数据完全不受影响${NC}"
-        echo ""
-        read -r -p "确认重新安装? [y/N]: " confirm
+        read -r -p "确认执行安全重装? [y/N]: " confirm
         if [[ "$confirm" =~ ^[yY]$ ]]; then
           REINSTALL=true
           perform_cleanup "$target_dir"
@@ -2214,6 +2870,8 @@ do_logs_interactive() {
 do_restart_interactive() {
   local project_dir="$1"
   cd "$project_dir"
+  validate_install_credential_separation_file "${project_dir}/.env" ||
+    die "凭据预检失败；服务未重启"
   setup_compose_files "$project_dir"
   log_info "重启服务..."
   $DOCKER_COMPOSE restart
@@ -2240,6 +2898,8 @@ do_stop_interactive() {
 do_start_interactive() {
   local project_dir="$1"
   cd "$project_dir"
+  validate_install_credential_separation_file "${project_dir}/.env" ||
+    die "凭据预检失败；服务未启动"
   setup_compose_files "$project_dir"
   log_info "启动服务..."
   $DOCKER_COMPOSE start
@@ -2255,6 +2915,9 @@ do_reconfigure_interactive() {
   local project_dir="$1"
   cd "$project_dir"
   log_info "重新配置服务..."
+
+  validate_install_credential_separation_file "${project_dir}/.env" ||
+    die "凭据预检失败；拒绝更新现有部署"
 
   # 备份旧配置
   if [[ -e ".env" || -L ".env" ]]; then
@@ -2279,7 +2942,8 @@ do_reconfigure_interactive() {
 
   # 运行部署脚本
   if [[ "$NEWAPI_TOOLS_IMAGE_DERIVED" == "true" ]]; then
-    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
+    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION \
+      NEWAPI_TOOLS_RELEASE_TAG
   fi
   exec ./deploy.sh
 }
@@ -2422,60 +3086,161 @@ do_full_reinstall_interactive() {
 # 执行清理操作 (重新安装时)
 #######################################
 perform_cleanup() {
-  local target_dir="$1"
-  
-  log_info "开始清理已安装的服务..."
+  local target_dir="$1" env_file="${1}/.env" rollback_content old_image
+  local rollback_env_file old_project toolstore_prepare_ok=false
+  local -a rollback_compose_args=()
+  [[ -n "$target_dir" && "$target_dir" != "/" && -d "$target_dir" && ! -L "$target_dir" ]] ||
+    die "安全重装拒绝空路径、根目录、symlink 或不存在的项目树"
+  [[ -f "$env_file" && ! -L "$env_file" ]] ||
+    die "安全重装缺少安全的旧 .env；未停止服务、未删除目录"
+  load_install_toolstore_transaction_library "$target_dir" ||
+    die "当前安装尚无 Tool Store 事务库；请先使用菜单 1 更新，再执行安全重装"
 
-  # 1. 停止并删除容器
-  log_info "停止并删除相关容器..."
-  
-  # 尝试使用 docker-compose 停止
-  if [[ -f "${target_dir}/docker-compose.yml" ]]; then
-    stop_install_project_for_removal "$target_dir" ||
-      die "清理旧安装时服务移除失败；项目配置与回滚快照已保留"
+  prepare_install_rollback_transaction "$env_file" "$target_dir"
+  [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] ||
+    die "无法建立旧镜像/配置/Compose 回滚锚点；未停止服务、未删除目录"
+  rollback_content="$(load_install_rollback_snapshot "$env_file")" ||
+    die "旧配置回滚快照不可读；未停止服务、未删除目录"
+  old_image="$(env_content_value "$rollback_content" NEWAPI_TOOLS_IMAGE)"
+  rollback_env_file="$(install_rollback_snapshot_path "$env_file")"
+  old_project="$(env_content_value "$rollback_content" COMPOSE_PROJECT_NAME)"
+  [[ "$old_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] ||
+    die "旧 Compose project 身份无效；未停止服务、未删除目录"
+  INSTALL_COMPOSE_PROJECT_NAME_OVERRIDE="$old_project"
+  build_install_rollback_compose_args "$env_file" "$target_dir" rollback_compose_args ||
+    die "旧 Compose 清单回滚快照不完整；未停止服务、未删除目录"
+
+  configure_install_toolstore_compose_sources "$env_file" ||
+    die "无法把旧 Compose 清单绑定到 Tool Store 安全重装记录"
+  if toolstore_txn_prepare "$rollback_env_file" "$target_dir" \
+    "$old_image" "$old_image" "$old_image"; then
+    toolstore_prepare_ok=true
   fi
-
-  # 强制删除可能残留的容器
-  local containers
-  containers=$(docker ps -a --format '{{.Names}}' | grep -E '^(newapi-tools-backend|newapi-tools-frontend)$' 2>/dev/null || true)
-  if [[ -n "$containers" ]]; then
-    echo "$containers" | xargs -r docker rm -f 2>/dev/null || true
-    log_success "已删除相关容器"
+  clear_install_toolstore_compose_sources
+  if [[ "$toolstore_prepare_ok" != "true" ]]; then
+    restore_install_previous_configuration "$env_file" "$target_dir" || true
+    die "Tool Store Online Backup/二次校验失败；旧服务保持运行，项目目录未删除"
   fi
-
-  # 2. 删除本项目残留 Docker 资源
-  cleanup_project_docker_resources
-
-  # 3. 删除项目目录
-  log_info "删除项目目录: $target_dir"
-  if [[ -d "$target_dir" || -L "$target_dir" ]]; then
-    durable_remove_install_tree "$target_dir" ||
-      die "无法持久删除旧项目目录；清理未完成"
-    log_success "已删除项目目录"
+  if ! run_install_compose "$rollback_env_file" "$target_dir" "$old_image" \
+    "${rollback_compose_args[@]}" down; then
+    die "旧服务停止失败；Tool Store 备份和旧部署证据已保留，项目目录未删除"
   fi
-
-  log_success "清理完成，准备全新安装"
-  echo ""
+  toolstore_txn_authoritative_backup "$target_dir" ||
+    die "旧服务已停止，但无法创建停写后的权威 Tool Store 备份；事务证据和旧项目均已保留"
+  toolstore_txn_stage_data "$target_dir" ||
+    die "Tool Store/data 无法安全迁出待删树；旧项目和备份证据已保留"
+  durable_remove_install_tree "$target_dir" ||
+    die "旧项目树删除失败；暂存 data 和事务证据已保留，可重复运行恢复"
+  log_success "旧项目已在 Tool Store 备份验证和 data 暂存完成后移除；准备重建"
 }
 
 #######################################
 # Clone 或更新项目
 #######################################
+install_clone_fault_point() {
+  local point="$1"
+  if [[ "${INSTALL_CLONE_FAULT_POINT:-}" == "$point" ]]; then
+    log_error "clone 故障注入点: ${point}"
+    return 97
+  fi
+}
+
+install_interrupted_checkout_is_trusted() {
+  local target="$1" origin
+  [[ -d "$target" && ! -L "$target" && -d "${target}/.git" && ! -L "${target}/.git" ]] || return 1
+  origin="$(git -C "$target" remote get-url origin 2>/dev/null)" || return 1
+  case "$origin" in
+    "https://github.com/yujianwudi/new_api_tools"|\
+    "https://github.com/yujianwudi/new_api_tools.git"|\
+    "git@github.com:yujianwudi/new_api_tools.git"|\
+    "ssh://git@github.com/yujianwudi/new_api_tools.git") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_clone_staging_path() {
+  local target="$1" parent base
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  printf '%s/.%s.clone-staging\n' "$parent" "$base"
+}
+
+cleanup_install_clone_staging() {
+  local target="$1" staging marker
+  staging="$(install_clone_staging_path "$target")" || return 1
+  marker="${staging}/.newapi-tools-clone-staging"
+  [[ -e "$staging" || -L "$staging" ]] || return 0
+  [[ -d "$staging" && ! -L "$staging" && -f "$marker" && ! -L "$marker" ]] || return 1
+  [[ "$(<"$marker")" == "new-api-tools-clone-staging-v1" ]] || return 1
+  durable_remove_install_tree "$staging"
+}
+
+quarantine_interrupted_install_checkout() {
+  local target="$1" parent base parent_abs target_abs quarantine
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  parent_abs="$(cd -- "$parent" && pwd -P)" || return 1
+  target_abs="$(realpath -m -s -- "$target")" || return 1
+  [[ "$target_abs" == "${parent_abs}/${base}" && "$target_abs" != "/" ]] || return 1
+  install_interrupted_checkout_is_trusted "$target_abs" || return 1
+  quarantine="${parent_abs}/.${base}.interrupted-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  [[ ! -e "$quarantine" && ! -L "$quarantine" ]] || return 1
+  mv -T -- "$target_abs" "$quarantine" || return 1
+  sync -f "$parent_abs" || return 1
+  log_warn "已把可信但不完整的旧 checkout 隔离保留到 ${quarantine}"
+}
+
 clone_or_update_project() {
-  local target_dir="${INSTALL_DIR}/${PROJECT_NAME}"
+  local target_dir="${INSTALL_DIR}/${PROJECT_NAME}" parent staging checkout marker
 
   if [[ -d "$target_dir" ]]; then
-    log_info "项目已存在，正在同步到 ${INSTALL_REF}..."
-    cd "$target_dir"
-    checkout_install_ref
-  else
-    log_info "正在克隆项目到: $target_dir"
-    git clone --no-checkout "$REPO_URL" "$target_dir"
-    log_success "项目克隆完成"
-    cd "$target_dir"
-    checkout_install_ref
+    if [[ -f "${target_dir}/.env" && ! -L "${target_dir}/.env" &&
+      -f "${target_dir}/docker-compose.yml" && ! -L "${target_dir}/docker-compose.yml" ]]; then
+      log_info "项目已存在，正在同步到 ${INSTALL_REF}..."
+      cd "$target_dir"
+      checkout_install_ref
+      PROJECT_DIR="$target_dir"
+      return 0
+    fi
+    quarantine_interrupted_install_checkout "$target_dir" ||
+      die "现有不完整项目树无法安全隔离；拒绝覆盖"
   fi
 
+  parent="$(dirname -- "$target_dir")"
+  [[ -d "$parent" && ! -L "$parent" ]] || die "clone 目标父目录不安全"
+  cleanup_install_clone_staging "$target_dir" ||
+    die "上次中断的 clone staging 目录不属于本安装器；拒绝删除"
+  staging="$(install_clone_staging_path "$target_dir")"
+  checkout="${staging}/tree"
+  marker="${staging}/.newapi-tools-clone-staging"
+  mkdir -m 700 "$staging" || die "无法创建同级 clone staging 目录"
+  (umask 077; printf 'new-api-tools-clone-staging-v1\n' >"$marker") ||
+    die "无法写入 clone staging 身份标记"
+  chmod 600 "$marker" || die "无法保护 clone staging 身份标记"
+  sync -f "$marker" && sync -f "$staging" || die "无法持久化 clone staging 身份"
+
+  log_info "正在隔离克隆项目，验证完成后才原子发布到: $target_dir"
+  git clone --no-checkout "$REPO_URL" "$checkout"
+  install_clone_fault_point after_clone || return $?
+  cd "$checkout"
+  checkout_install_ref
+  install_clone_fault_point after_checkout || return $?
+  [[ -f "${checkout}/deploy.sh" && ! -L "${checkout}/deploy.sh" &&
+    -f "${checkout}/docker-compose.yml" && ! -L "${checkout}/docker-compose.yml" &&
+    -f "${checkout}/scripts/toolstore_transaction.sh" && ! -L "${checkout}/scripts/toolstore_transaction.sh" ]] ||
+    die "候选 checkout 缺少安全的部署/事务文件"
+  [[ "$(git -C "$checkout" rev-parse --verify HEAD)" == "$INSTALL_COMMIT" ]] ||
+    die "候选 checkout HEAD 与已验证安装 commit 不一致"
+  [[ ! -e "$target_dir" && ! -L "$target_dir" ]] ||
+    die "clone 验证期间最终目标被并发创建"
+  install_clone_fault_point before_publish || return $?
+  mv -T -- "$checkout" "$target_dir" || die "无法原子发布已验证 checkout"
+  sync -f "$parent" || die "无法持久化已验证 checkout 发布"
+  install_clone_fault_point after_publish || return $?
+  cleanup_install_clone_staging "$target_dir" ||
+    log_warn "checkout 已发布，但无法清理空的 clone staging 目录"
+  log_success "项目克隆、版本验证和原子发布完成"
+  cd "$target_dir"
   PROJECT_DIR="$target_dir"
 }
 
@@ -2667,6 +3432,8 @@ migrate_env_file() {
 
   # Commit every migration addition/removal as one complete dotenv image. This
   # also repairs old permissive modes without exposing a truncate/append window.
+  validate_install_credential_separation_content "$content" ||
+    die "凭据预检失败；完整 .env 迁移结果未发布"
   atomic_write_install_dotenv "$env_file" "$content" ||
     die "无法原子持久化完整 .env 迁移结果"
 
@@ -2729,6 +3496,9 @@ quick_update() {
   if [[ ! -f "$compose_file" ]]; then
     die "找不到 docker-compose.yml 文件"
   fi
+
+  validate_install_credential_separation_file "$env_file" ||
+    die "凭据预检失败；拒绝更新现有部署"
 
   cd "$PROJECT_DIR"
 
@@ -2805,6 +3575,22 @@ quick_update() {
 # 运行部署脚本
 #######################################
 run_deploy() {
+  if load_install_toolstore_transaction_library "$PROJECT_DIR" &&
+    toolstore_txn_has_active "$PROJECT_DIR"; then
+    local continuation_content continuation_state
+    toolstore_txn_restore_config_only "$PROJECT_DIR" ||
+      die "安全重装无法恢复旧配置；事务证据已保留"
+    toolstore_txn_unstage_data "$PROJECT_DIR" ||
+      die "安全重装无法把暂存 data 恢复到新项目树；事务证据已保留"
+    continuation_content="$(toolstore_txn_load_record "$PROJECT_DIR")" ||
+      die "安全重装无法读取外置事务记录"
+    continuation_state="$(toolstore_txn_env_value "$continuation_content" STATE)"
+    [[ "$continuation_state" == "authoritative" ]] ||
+      die "安全重装 data 恢复后事务未回到权威备份状态"
+    TOOLSTORE_TXN_CONTINUE_REQUEST="$(toolstore_txn_env_value "$continuation_content" REQUEST_ID)"
+    export TOOLSTORE_TXN_CONTINUE_REQUEST
+  fi
+
   # 如果不是重新安装且已有配置，执行快速更新
   if [[ "$REINSTALL" == "false" && -f "${PROJECT_DIR}/.env" ]]; then
     if quick_update; then
@@ -2822,7 +3608,8 @@ run_deploy() {
 
   # 运行部署脚本
   if [[ "$NEWAPI_TOOLS_IMAGE_DERIVED" == "true" ]]; then
-    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION
+    unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_IMAGE_DERIVED NEWAPI_TOOLS_EXPECTED_REVISION \
+      NEWAPI_TOOLS_RELEASE_TAG
   fi
   exec "${PROJECT_DIR}/deploy.sh"
 }
@@ -2889,8 +3676,8 @@ NewAPI Middleware Tool - 安装管理脚本
 环境变量:
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
-  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.6.0；main 会锁定本次 commit 的短 SHA 镜像）
-  NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；发行/自定义 ref 必填
+  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.6.1；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；严格发行标签必填，开发 ref 禁止显式设置
   NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 
 更多信息: https://github.com/yujianwudi/new_api_tools

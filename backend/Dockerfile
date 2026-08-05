@@ -7,7 +7,7 @@
 # Stage 1: Build Go binary
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS builder
 ARG TARGETARCH
-ARG APP_VERSION=0.6.0
+ARG APP_VERSION=0.6.1
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
@@ -29,6 +29,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -ldflags="-s -w -X github.com/new-api-tools/backend/internal/buildinfo.Version=${APP_VERSION} -X github.com/new-api-tools/backend/internal/buildinfo.Commit=${VCS_REF} -X github.com/new-api-tools/backend/internal/buildinfo.BuildDate=${BUILD_DATE}" \
     -o /build/server \
     ./cmd/server
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
+    -trimpath -o /build/toolstorectl ./cmd/toolstorectl
 
 # Stage 2: Minimal production image
 FROM alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
@@ -55,6 +59,7 @@ RUN addgroup -S -g 10001 appgroup && \
 
 # Copy binary from builder
 COPY --from=builder --chown=appuser:appgroup /build/server /app/server
+COPY --from=builder --chown=appuser:appgroup /build/toolstorectl /app/toolstorectl
 
 # Create data directory
 RUN mkdir -p /app/data && chown -R appuser:appgroup /app

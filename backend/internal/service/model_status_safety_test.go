@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
+	"github.com/new-api-tools/backend/internal/config"
 )
 
 func TestGetModelStatusPropagatesLogQueryErrors(t *testing.T) {
@@ -84,8 +85,41 @@ func TestGetModelStatusMarksSuccessfulEmptyQueryUnknown(t *testing.T) {
 	if status["current_status"] != "unknown" {
 		t.Fatalf("empty model was not marked unknown: %+v", status)
 	}
-	if status["success_rate"] != float64(0) {
-		t.Fatalf("empty model reported a non-zero success rate: %+v", status)
+	if status["success_rate"] != nil || status["source_state"] != "empty" || status["traffic_health"] != "unknown" {
+		t.Fatalf("empty model reported numeric or authoritative health: %+v", status)
+	}
+}
+
+func TestGetModelStatusMakesStaleHistoryNonAuthoritative(t *testing.T) {
+	db := installSQLiteForTests(t)
+	if cfg := config.GetOptional(); cfg != nil {
+		previous := cfg.LogFreshnessMaxAge
+		cfg.LogFreshnessMaxAge = 15 * time.Minute
+		t.Cleanup(func() { cfg.LogFreshnessMaxAge = previous })
+	}
+	db.MustExec(`CREATE TABLE logs (
+		model_name TEXT,
+		created_at INTEGER,
+		type INTEGER,
+		completion_tokens INTEGER
+	)`)
+	db.MustExec(`INSERT INTO logs(model_name, created_at, type, completion_tokens)
+		VALUES ('stale-green-model', ?, 2, 1)`, time.Now().Add(-20*time.Minute).Unix())
+	cache.Get().ClearLocal()
+
+	status, err := NewModelStatusService().GetModelStatus("stale-green-model", "1h")
+	if err != nil {
+		t.Fatalf("stale model status returned error: %v", err)
+	}
+	if status["source_state"] != "stale" || status["current_status"] != "unknown" ||
+		status["traffic_health"] != "unknown" || status["success_rate"] != nil {
+		t.Fatalf("stale history remained authoritative: %+v", status)
+	}
+	if status["observed_status"] != "green" || status["observed_rate"] != float64(100) {
+		t.Fatalf("stale diagnostic evidence was not preserved: %+v", status)
+	}
+	if _, ok := status["fetched_at"].(string); !ok {
+		t.Fatalf("status snapshot is missing fetched_at: %+v", status)
 	}
 }
 

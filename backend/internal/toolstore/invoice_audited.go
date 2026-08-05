@@ -3,6 +3,7 @@ package toolstore
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,55 @@ type invoiceAuditRequest struct {
 	Request struct {
 		Fingerprint string `json:"fingerprint"`
 	} `json:"request"`
+}
+
+// immediateInvoiceTx keeps the relation lookup, cumulative-red check, invoice
+// write, event and audit chain behind one SQLite write reservation. Independent
+// Store instances therefore cannot both validate against the same old total.
+type immediateInvoiceTx struct {
+	conn *sql.Conn
+	done bool
+}
+
+func (s *Store) beginImmediateInvoiceTx(ctx context.Context) (*immediateInvoiceTx, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &immediateInvoiceTx{conn: conn}, nil
+}
+
+func (tx *immediateInvoiceTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return tx.conn.ExecContext(ctx, query, args...)
+}
+
+func (tx *immediateInvoiceTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return tx.conn.QueryRowContext(ctx, query, args...)
+}
+
+func (tx *immediateInvoiceTx) Commit(ctx context.Context) error {
+	if tx == nil || tx.conn == nil || tx.done {
+		return sql.ErrTxDone
+	}
+	_, err := tx.conn.ExecContext(ctx, "COMMIT")
+	if err == nil {
+		tx.done = true
+		return tx.conn.Close()
+	}
+	return err
+}
+
+func (tx *immediateInvoiceTx) Rollback() {
+	if tx == nil || tx.conn == nil || tx.done {
+		return
+	}
+	_, _ = tx.conn.ExecContext(context.Background(), "ROLLBACK")
+	tx.done = true
+	_ = tx.conn.Close()
 }
 
 // CreateInvoiceAudited writes an intent, the invoice document and event, and
@@ -40,11 +90,14 @@ func (s *Store) CreateInvoiceAudited(ctx context.Context, input InvoiceDocumentI
 		return InvoiceDocument{}, OperationAudit{}, err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginImmediateInvoiceTx(ctx)
 	if err != nil {
+		if invoiceSQLiteContention(err) {
+			return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: invoice changed concurrently", ErrConflict)
+		}
 		return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("begin audited invoice create: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Rollback()
 	if existing, found, replayErr := findInvoiceOutcomeReplay(ctx, tx, intent, outcome); replayErr != nil {
 		return InvoiceDocument{}, OperationAudit{}, replayErr
 	} else if found {
@@ -57,7 +110,7 @@ func (s *Store) CreateInvoiceAudited(ctx context.Context, input InvoiceDocumentI
 		if getErr != nil || created.RequestFingerprint != fingerprint {
 			return InvoiceDocument{}, OperationAudit{}, replayConflict("invoice create")
 		}
-		if commitErr := tx.Commit(); commitErr != nil {
+		if commitErr := tx.Commit(ctx); commitErr != nil {
 			return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("commit audited invoice create replay: %w", commitErr)
 		}
 		return created, existing, nil
@@ -90,7 +143,7 @@ func (s *Store) CreateInvoiceAudited(ctx context.Context, input InvoiceDocumentI
 	if err != nil {
 		return InvoiceDocument{}, OperationAudit{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("commit audited invoice create: %w", err)
 	}
 	return created, audit, nil
@@ -191,6 +244,16 @@ func (s *Store) VoidInvoiceAudited(ctx context.Context, input InvoiceVoidInput, 
 	if rows != 1 {
 		return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: invoice changed concurrently", ErrConflict)
 	}
+	if before.DocumentKind == InvoiceBlue {
+		if _, err := tx.ExecContext(ctx, `UPDATE invoice_document_relations SET
+			relation_state = 'unreconciled', reason_code = 'original_voided', updated_at = ?
+			WHERE related_invoice_id = ? AND relation_state = 'verified'`, dbTime(now), before.ID); err != nil {
+			if invoiceSQLiteContention(err) {
+				return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("%w: invoice changed concurrently", ErrConflict)
+			}
+			return InvoiceDocument{}, OperationAudit{}, fmt.Errorf("invalidate red invoice relations: %w", err)
+		}
+	}
 	updated, err := getInvoiceDocument(ctx, tx, input.ID)
 	if err != nil {
 		return InvoiceDocument{}, OperationAudit{}, err
@@ -258,11 +321,14 @@ func (s *Store) ImportInvoicesAudited(ctx context.Context, inputs []InvoiceDocum
 	if err != nil {
 		return InvoiceImportResult{}, OperationAudit{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginImmediateInvoiceTx(ctx)
 	if err != nil {
+		if invoiceSQLiteContention(err) {
+			return InvoiceImportResult{}, OperationAudit{}, fmt.Errorf("%w: invoice import changed concurrently", ErrConflict)
+		}
 		return InvoiceImportResult{}, OperationAudit{}, fmt.Errorf("begin audited invoice import: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Rollback()
 	if existing, found, replayErr := findInvoiceOutcomeReplay(ctx, tx, intent, outcome); replayErr != nil {
 		return InvoiceImportResult{}, OperationAudit{}, replayErr
 	} else if found {
@@ -278,7 +344,7 @@ func (s *Store) ImportInvoicesAudited(ctx context.Context, inputs []InvoiceDocum
 			}
 			items[index] = item
 		}
-		if commitErr := tx.Commit(); commitErr != nil {
+		if commitErr := tx.Commit(ctx); commitErr != nil {
 			return InvoiceImportResult{}, OperationAudit{}, fmt.Errorf("commit audited invoice import replay: %w", commitErr)
 		}
 		return InvoiceImportResult{Items: items, Count: len(items)}, existing, nil
@@ -321,7 +387,7 @@ func (s *Store) ImportInvoicesAudited(ctx context.Context, inputs []InvoiceDocum
 	if err != nil {
 		return InvoiceImportResult{}, OperationAudit{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return InvoiceImportResult{}, OperationAudit{}, fmt.Errorf("commit audited invoice import: %w", err)
 	}
 	return InvoiceImportResult{Items: items, Count: len(items)}, audit, nil

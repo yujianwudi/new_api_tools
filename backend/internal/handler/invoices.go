@@ -35,6 +35,7 @@ type invoiceCreateRequest struct {
 	BuyerTaxID           string                        `json:"buyer_tax_id"`
 	DocumentKind         toolstore.InvoiceDocumentKind `json:"document_kind"`
 	RelatedInvoiceNumber string                        `json:"related_invoice_number"`
+	RelatedInvoiceID     *int64                        `json:"related_invoice_id"`
 	Currency             string                        `json:"currency"`
 	AmountMinor          invoiceMinorAmount            `json:"amount_minor"`
 	TaxAmountMinor       invoiceMinorAmount            `json:"tax_amount_minor"`
@@ -122,7 +123,11 @@ func (h *InvoiceHandler) Summary(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, models.NewSuccessResponse(gin.H{
 		"groups": groups, "generated_at": formatControlPlaneTime(summary.GeneratedAt),
-		"source_health": gin.H{"status": "ok"}, "capabilities": invoiceCapabilities(c),
+		"source_health": gin.H{
+			"status": summary.SourceHealth, "unreconciled_count": summary.UnreconciledCount,
+			"anomaly_count": summary.AnomalyCount,
+		},
+		"capabilities": invoiceCapabilities(c),
 	}))
 }
 
@@ -207,7 +212,8 @@ func (h *InvoiceHandler) Create(c *gin.Context) {
 		InvoiceNumber: request.InvoiceNumber, SellerEntity: request.SellerEntity,
 		BuyerName: request.BuyerName, BuyerTaxID: request.BuyerTaxID,
 		DocumentKind: request.DocumentKind, RelatedInvoiceNumber: request.RelatedInvoiceNumber,
-		Currency: request.Currency, AmountMinor: request.AmountMinor.value,
+		RelatedInvoiceID: request.RelatedInvoiceID,
+		Currency:         request.Currency, AmountMinor: request.AmountMinor.value,
 		TaxAmountMinor: request.TaxAmountMinor.value, MinorUnitScale: request.MinorUnitScale,
 		Source: "manual", IdempotencyKey: audit.IdempotencyKey,
 		IssuedAt: request.IssuedAt.UTC(), CreatedBy: identity.Actor,
@@ -407,7 +413,9 @@ func invoiceDocumentJSON(item toolstore.InvoiceDocument, revealPII bool) gin.H {
 		"id": item.ID, "invoice_number": item.InvoiceNumber, "seller_entity": item.SellerEntity,
 		"buyer_name": buyerName, "buyer_tax_id": buyerTaxID,
 		"document_kind": item.DocumentKind, "related_invoice_number": item.RelatedInvoiceNumber,
-		"currency": item.Currency, "amount_minor": strconv.FormatInt(item.AmountMinor, 10),
+		"related_invoice_id": item.RelatedInvoiceID, "relation_state": item.RelationState,
+		"relation_reason": item.RelationReason,
+		"currency":        item.Currency, "amount_minor": strconv.FormatInt(item.AmountMinor, 10),
 		"tax_amount_minor": strconv.FormatInt(item.TaxAmountMinor, 10),
 		"minor_unit_scale": item.MinorUnitScale, "status": item.Status, "source": item.Source,
 		"issued_at":  formatControlPlaneTime(item.IssuedAt),
@@ -432,6 +440,8 @@ func invoiceSummaryJSON(group toolstore.InvoiceSummaryGroup) gin.H {
 		"voided_minor":      group.VoidedMinor,
 		"net_issued_minor":  group.NetIssuedMinor,
 		"effective_count":   group.EffectiveCount, "voided_count": group.VoidedCount,
+		"source_health": group.SourceHealth, "unreconciled_count": group.UnreconciledCount,
+		"anomaly_count": group.AnomalyCount,
 	}
 }
 
@@ -457,12 +467,12 @@ func maskInvoiceName(value string) string {
 }
 
 func maskInvoiceTaxID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 {
 		return ""
 	}
-	if len(value) <= 4 {
+	if len(runes) <= 4 {
 		return "****"
 	}
-	return "****" + value[len(value)-4:]
+	return "****" + string(runes[len(runes)-4:])
 }

@@ -277,21 +277,21 @@ assert_eq \
   'main ref selects the current seven-character commit tag' \
   'ghcr.io/yujianwudi/new_api_tools:0123456' \
   resolve_install_image_in_subshell 'main' "$test_commit" ''
-assert_rejected \
-  'custom ref without an explicit image fails closed' \
-  resolve_install_image_in_subshell 'feature/test' "$test_commit" ''
 assert_eq \
-  'explicit digest overrides a custom ref' \
-  'ghcr.io/yujianwudi/new_api_tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'custom development ref derives the current seven-character commit tag' \
+  'ghcr.io/yujianwudi/new_api_tools:0123456' \
+  resolve_install_image_in_subshell 'feature/test' "$test_commit" ''
+assert_rejected \
+  'explicit digest cannot bypass release verification through a custom ref' \
   resolve_install_image_in_subshell 'feature/test' "$test_commit" \
   'ghcr.io/yujianwudi/new_api_tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 assert_rejected \
   'explicit install digest from an untrusted repository is rejected' \
-  resolve_install_image_in_subshell 'feature/test' "$test_commit" \
+  resolve_install_image_in_subshell 'v0.2.0' "$test_commit" \
   'ghcr.io/example/new_api_tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 assert_rejected \
   'image references containing whitespace are rejected' \
-  resolve_install_image_in_subshell 'main' "$test_commit" 'ghcr.io/example/new_api_tools:bad value'
+  resolve_install_image_in_subshell 'v0.2.0' "$test_commit" 'ghcr.io/example/new_api_tools:bad value'
 
 resolved_test_image='ghcr.io/yujianwudi/new_api_tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 previous_test_image='ghcr.io/yujianwudi/new_api_tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -405,7 +405,7 @@ assert_rejected \
   resolve_explicit_deploy_digest_fixture 'ffffffffffffffffffffffffffffffffffffffff'
 
 resolve_deploy_identity_fixture() (
-  local mode="$1" exact_tag=''
+  local mode="$1" exact_tags=''
   log_info() { :; }
   git() {
     case "${3:-}" in
@@ -416,8 +416,14 @@ resolve_deploy_identity_fixture() (
           return 0
         fi
         ;;
-      describe)
-        [[ -n "$exact_tag" ]] && printf '%s\n' "$exact_tag"
+      tag)
+        [[ "${4:-}" == '--points-at' ]] || return 1
+        [[ -n "$exact_tags" ]] && printf '%s\n' "$exact_tags"
+        return 0
+        ;;
+      cat-file)
+        [[ "${4:-}" == '-t' && "${5:-}" == refs/tags/* ]] || return 1
+        printf 'tag\n'
         return 0
         ;;
     esac
@@ -426,8 +432,14 @@ resolve_deploy_identity_fixture() (
 
   REQUESTED_NEWAPI_TOOLS_IMAGE=''
   REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION=''
+  REQUESTED_NEWAPI_TOOLS_RELEASE_TAG=''
   case "$mode" in
     explicit-release)
+      REQUESTED_NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+      REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="$test_commit"
+      REQUESTED_NEWAPI_TOOLS_RELEASE_TAG='v0.6.1'
+      ;;
+    explicit-no-release-tag)
       REQUESTED_NEWAPI_TOOLS_IMAGE="$resolved_test_image"
       REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="$test_commit"
       ;;
@@ -443,7 +455,13 @@ resolve_deploy_identity_fixture() (
       REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="$test_commit"
       ;;
     tag-checkout)
-      exact_tag='v0.5.0'
+      exact_tags='v0.5.0'
+      ;;
+    hidden-release-tag)
+      exact_tags=$'dev-latest\nv0.6.1'
+      ;;
+    multiple-release-tags)
+      exact_tags=$'v0.6.0\nv0.6.1'
       ;;
   esac
 
@@ -460,6 +478,9 @@ assert_eq \
   "ghcr.io/yujianwudi/new_api_tools:0123456|${test_commit}|true" \
   resolve_deploy_identity_fixture derived-development
 assert_rejected \
+  'explicit deploy digest without a release tag cannot bypass release verification' \
+  resolve_deploy_identity_fixture explicit-no-release-tag
+assert_rejected \
   'explicit deploy digest without expected revision fails closed' \
   resolve_deploy_identity_fixture explicit-missing-revision
 assert_rejected \
@@ -471,6 +492,278 @@ assert_rejected \
 assert_rejected \
   'release tag checkout without explicit digest and revision fails closed' \
   resolve_deploy_identity_fixture tag-checkout
+assert_rejected \
+  'a non-semver tag cannot hide a release tag on the same deployment commit' \
+  resolve_deploy_identity_fixture hidden-release-tag
+assert_rejected \
+  'multiple release tags on one deployment commit are ambiguous and rejected' \
+  resolve_deploy_identity_fixture multiple-release-tags
+
+fake_cosign_runner() {
+  local command="${1:-}"
+  [[ "$command" == 'verify' || "$command" == 'verify-attestation' ]] || return 1
+  shift
+  local identity='' issuer='' repository='' workflow_ref='' workflow_sha=''
+  local workflow_name='' workflow_trigger='' annotation_sha='' annotation_tag='' subject=''
+  local predicate_type='' policy_file=''
+  while (( $# > 0 )); do
+    case "$1" in
+      --type) predicate_type="${2:-}"; shift 2 ;;
+      --policy) policy_file="${2:-}"; shift 2 ;;
+      --certificate-identity) identity="${2:-}"; shift 2 ;;
+      --certificate-oidc-issuer) issuer="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-repository) repository="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-ref) workflow_ref="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-sha) workflow_sha="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-name) workflow_name="${2:-}"; shift 2 ;;
+      --certificate-github-workflow-trigger) workflow_trigger="${2:-}"; shift 2 ;;
+      -a)
+        case "${2:-}" in
+          git_sha=*) annotation_sha="${2#git_sha=}" ;;
+          tag=*) annotation_tag="${2#tag=}" ;;
+          *) return 1 ;;
+        esac
+        shift 2
+        ;;
+      --*) return 1 ;;
+      *)
+        [[ -z "$subject" ]] || return 1
+        subject="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ "$identity" == "$FAKE_COSIGN_IDENTITY" &&
+     "$issuer" == "$FAKE_COSIGN_ISSUER" &&
+     "$repository" == "$FAKE_COSIGN_REPOSITORY" &&
+     "$workflow_ref" == "$FAKE_COSIGN_REF" &&
+     "$workflow_sha" == "$FAKE_COSIGN_SHA" &&
+     "$workflow_name" == "$FAKE_COSIGN_NAME" &&
+     "$workflow_trigger" == "$FAKE_COSIGN_TRIGGER" &&
+     "$annotation_sha" == "$FAKE_COSIGN_ANNOTATION_SHA" &&
+     "$annotation_tag" == "$FAKE_COSIGN_ANNOTATION_TAG" &&
+     "$subject" == "$FAKE_COSIGN_SUBJECT" ]] || return 1
+
+  [[ "$command" == 'verify-attestation' ]] || return 0
+  [[ "$predicate_type" == 'slsaprovenance1' && -f "$policy_file" && ! -L "$policy_file" ]] || return 1
+  grep -Fq '"_type": "https://in-toto.io/Statement/v1"' "$policy_file" &&
+    grep -Fq 'predicateType: "https://slsa.dev/provenance/v1"' "$policy_file" &&
+    grep -Fq "name: \"${FAKE_PROVENANCE_SUBJECT_NAME}\"" "$policy_file" &&
+    grep -Fq "digest: sha256: \"${FAKE_PROVENANCE_SUBJECT_DIGEST}\"" "$policy_file" &&
+    grep -Fq "buildType: \"${FAKE_PROVENANCE_BUILD_TYPE}\"" "$policy_file" &&
+    grep -Fq "repository: \"${FAKE_PROVENANCE_REPOSITORY}\"" "$policy_file" &&
+    grep -Fq "ref: \"${FAKE_PROVENANCE_REF}\"" "$policy_file" &&
+    grep -Fq "revision: \"${FAKE_PROVENANCE_REVISION}\"" "$policy_file" &&
+    grep -Fq "tag: \"${FAKE_PROVENANCE_TAG}\"" "$policy_file" &&
+    grep -Fq "manifest_digest: \"${FAKE_PROVENANCE_MANIFEST_DIGEST}\"" "$policy_file" &&
+    grep -Fq "uri: \"${FAKE_PROVENANCE_DEPENDENCY}\"" "$policy_file" &&
+    grep -Fq "digest: gitCommit: \"${FAKE_PROVENANCE_REVISION}\"" "$policy_file" &&
+    grep -Fq '"linux/amd64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
+    grep -Fq '"linux/arm64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
+    [[ "$FAKE_PROVENANCE_AMD64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
+       "$FAKE_PROVENANCE_ARM64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+verify_release_signature_fixture() (
+  local verifier="$1" workflow_kind="$2" mutation="${3:-none}"
+  local release_tag='v0.6.1' workflow_file workflow_name workflow_trigger
+  case "$workflow_kind" in
+    build)
+      workflow_file='build.yml'
+      workflow_name='Build and Push Docker Image'
+      workflow_trigger='push'
+      ;;
+    recovery)
+      workflow_file='release-recovery.yml'
+      workflow_name='Recover Release Image From Existing Tag'
+      workflow_trigger='workflow_dispatch'
+      ;;
+    *) return 1 ;;
+  esac
+
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
+  FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
+  FAKE_COSIGN_REF="refs/tags/${release_tag}"
+  FAKE_COSIGN_SHA="$test_commit"
+  FAKE_COSIGN_NAME="$workflow_name"
+  FAKE_COSIGN_TRIGGER="$workflow_trigger"
+  FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
+  FAKE_COSIGN_ANNOTATION_TAG="$release_tag"
+  FAKE_COSIGN_SUBJECT="$resolved_test_image"
+
+  case "$mutation" in
+    none) ;;
+    identity) FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/forged.yml@refs/tags/${release_tag}" ;;
+    issuer) FAKE_COSIGN_ISSUER='https://issuer.example.invalid' ;;
+    repository) FAKE_COSIGN_REPOSITORY='attacker/new_api_tools' ;;
+    ref) FAKE_COSIGN_REF='refs/heads/main' ;;
+    sha) FAKE_COSIGN_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
+    name) FAKE_COSIGN_NAME='Forged Workflow' ;;
+    trigger) FAKE_COSIGN_TRIGGER='pull_request' ;;
+    annotation-sha) FAKE_COSIGN_ANNOTATION_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
+    annotation-tag) FAKE_COSIGN_ANNOTATION_TAG='v9.9.9' ;;
+    digest) FAKE_COSIGN_SUBJECT='ghcr.io/yujianwudi/new_api_tools@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    *) return 1 ;;
+  esac
+
+  NEWAPI_TOOLS_COSIGN_RUNNER=fake_cosign_runner
+  "$verifier" "$resolved_test_image" "$release_tag" "$test_commit"
+)
+
+verify_release_provenance_fixture() (
+  local verifier="$1" workflow_kind="$2" mutation="${3:-none}"
+  local release_tag='v0.6.1' workflow_file workflow_name workflow_trigger
+  case "$workflow_kind" in
+    build)
+      workflow_file='build.yml'
+      workflow_name='Build and Push Docker Image'
+      workflow_trigger='push'
+      ;;
+    recovery)
+      workflow_file='release-recovery.yml'
+      workflow_name='Recover Release Image From Existing Tag'
+      workflow_trigger='workflow_dispatch'
+      ;;
+    *) return 1 ;;
+  esac
+
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
+  FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
+  FAKE_COSIGN_REF="refs/tags/${release_tag}"
+  FAKE_COSIGN_SHA="$test_commit"
+  FAKE_COSIGN_NAME="$workflow_name"
+  FAKE_COSIGN_TRIGGER="$workflow_trigger"
+  FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
+  FAKE_COSIGN_ANNOTATION_TAG="$release_tag"
+  FAKE_COSIGN_SUBJECT="$resolved_test_image"
+  FAKE_PROVENANCE_SUBJECT_NAME='ghcr.io/yujianwudi/new_api_tools'
+  FAKE_PROVENANCE_SUBJECT_DIGEST="${resolved_test_image##*@sha256:}"
+  FAKE_PROVENANCE_BUILD_TYPE="$FAKE_COSIGN_IDENTITY"
+  FAKE_PROVENANCE_REPOSITORY='https://github.com/yujianwudi/new_api_tools'
+  FAKE_PROVENANCE_REF="refs/tags/${release_tag}"
+  FAKE_PROVENANCE_REVISION="$test_commit"
+  FAKE_PROVENANCE_TAG="$release_tag"
+  FAKE_PROVENANCE_MANIFEST_DIGEST="${resolved_test_image##*@}"
+  FAKE_PROVENANCE_DEPENDENCY="git+https://github.com/yujianwudi/new_api_tools@refs/tags/${release_tag}"
+  FAKE_PROVENANCE_AMD64_DIGEST='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  FAKE_PROVENANCE_ARM64_DIGEST='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+  case "$mutation" in
+    none) ;;
+    subject-name) FAKE_PROVENANCE_SUBJECT_NAME='ghcr.io/attacker/new_api_tools' ;;
+    subject-digest) FAKE_PROVENANCE_SUBJECT_DIGEST='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    build-type) FAKE_PROVENANCE_BUILD_TYPE='https://github.com/attacker/workflows/build.yml@refs/tags/v0.6.1' ;;
+    repository) FAKE_PROVENANCE_REPOSITORY='https://github.com/attacker/new_api_tools' ;;
+    ref) FAKE_PROVENANCE_REF='refs/heads/main' ;;
+    revision) FAKE_PROVENANCE_REVISION='ffffffffffffffffffffffffffffffffffffffff' ;;
+    tag) FAKE_PROVENANCE_TAG='v9.9.9' ;;
+    manifest) FAKE_PROVENANCE_MANIFEST_DIGEST='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
+    dependency) FAKE_PROVENANCE_DEPENDENCY='git+https://github.com/attacker/new_api_tools@refs/heads/main' ;;
+    platform) FAKE_PROVENANCE_AMD64_DIGEST='not-a-digest' ;;
+    *) return 1 ;;
+  esac
+
+  NEWAPI_TOOLS_COSIGN_RUNNER=fake_cosign_runner
+  "$verifier" "$resolved_test_image" "$release_tag" "$test_commit"
+)
+
+for verifier in verify_install_release_signature verify_deploy_release_signature; do
+  assert_eq \
+    "${verifier} accepts the exact protected build workflow identity" \
+    '' \
+    verify_release_signature_fixture "$verifier" build
+  assert_eq \
+    "${verifier} accepts the exact protected recovery workflow identity" \
+    '' \
+    verify_release_signature_fixture "$verifier" recovery
+  for mutation in identity issuer repository ref sha name trigger annotation-sha annotation-tag digest; do
+    assert_rejected \
+      "${verifier} rejects forged release certificate field ${mutation}" \
+      verify_release_signature_fixture "$verifier" build "$mutation"
+  done
+done
+
+for verifier in verify_install_release_provenance verify_deploy_release_provenance; do
+  assert_eq \
+    "${verifier} accepts exact build provenance content" \
+    '' \
+    verify_release_provenance_fixture "$verifier" build
+  assert_eq \
+    "${verifier} accepts exact recovery provenance content" \
+    '' \
+    verify_release_provenance_fixture "$verifier" recovery
+  for mutation in subject-name subject-digest build-type repository ref revision tag manifest dependency platform; do
+    assert_rejected \
+      "${verifier} rejects forged provenance field ${mutation}" \
+      verify_release_provenance_fixture "$verifier" build "$mutation"
+  done
+done
+
+credential_separation_fixture() (
+  local mode="$1" first="${2:-}" second="${3:-}" content='' name value
+  local -a credential_names=(
+    ADMIN_PASSWORD API_KEY JWT_SECRET NEWAPI_ADMIN_ACCESS_TOKEN MODEL_PROBE_API_KEY OBSERVABILITY_TOKEN
+  )
+  for name in "${credential_names[@]}"; do
+    value="unique-${name}"
+    if [[ "$mode" == 'duplicate' && ( "$name" == "$first" || "$name" == "$second" ) ]]; then
+      value='duplicated-secret-that-must-never-be-logged'
+    fi
+    content+="${name}=${value}"$'\n'
+  done
+
+  if [[ "$mode" == 'distinct' ]]; then
+    validate_install_credential_separation_content "$content"
+    validate_deploy_credential_separation_content "$content"
+    printf 'accepted\n'
+    return
+  fi
+  if validate_install_credential_separation_content "$content" >/dev/null 2>&1; then
+    return 1
+  fi
+  if validate_deploy_credential_separation_content "$content" >/dev/null 2>&1; then
+    return 1
+  fi
+  printf 'rejected\n'
+)
+
+assert_eq \
+  'install and deploy accept six distinct credential values' \
+  'accepted' \
+  credential_separation_fixture distinct
+
+credential_names=(
+  ADMIN_PASSWORD API_KEY JWT_SECRET NEWAPI_ADMIN_ACCESS_TOKEN MODEL_PROBE_API_KEY OBSERVABILITY_TOKEN
+)
+for ((credential_left = 0; credential_left < ${#credential_names[@]}; credential_left++)); do
+  for ((credential_right = credential_left + 1; credential_right < ${#credential_names[@]}; credential_right++)); do
+    assert_eq \
+      "install and deploy reject reuse between ${credential_names[credential_left]} and ${credential_names[credential_right]}" \
+      'rejected' \
+      credential_separation_fixture duplicate \
+      "${credential_names[credential_left]}" "${credential_names[credential_right]}"
+  done
+done
+
+credential_error_redaction_result() (
+  local content output status secret='duplicated-secret-that-must-never-be-logged'
+  content="ADMIN_PASSWORD=${secret}"$'\n'"API_KEY=${secret}"$'\n'
+  set +e
+  output="$(validate_deploy_credential_separation_content "$content" 2>&1)"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || return 1
+  [[ "$output" == *ADMIN_PASSWORD* && "$output" == *API_KEY* ]] || return 1
+  [[ "$output" != *"$secret"* ]] || return 1
+  printf 'names-only\n'
+)
+
+assert_eq \
+  'credential reuse errors expose variable names but never secret values or hashes' \
+  'names-only' \
+  credential_error_redaction_result
 
 resolve_deploy_digest_candidates_fixture() (
   local mode="$1"
@@ -579,9 +872,12 @@ assert_eq \
   migrate_newapi_baseurl_fixture whitespace
 
 checkout_commit_for_ref() (
-  local ref="$1"
+  local ref="$1" point_tags="${2:-}"
   local remote_commit='1111111111111111111111111111111111111111'
   local tag_commit='2222222222222222222222222222222222222222'
+  if [[ -z "$point_tags" && "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    point_tags="$ref"
+  fi
 
   log_success() { :; }
   git() {
@@ -609,6 +905,16 @@ checkout_commit_for_ref() (
           *) return 1 ;;
         esac
         ;;
+      tag)
+        [[ "${2:-}" == '--points-at' ]] || return 1
+        [[ -n "$point_tags" ]] && printf '%s\n' "$point_tags"
+        return 0
+        ;;
+      cat-file)
+        [[ "${2:-}" == '-t' && "${3:-}" == refs/tags/* ]] || return 1
+        printf 'tag\n'
+        return 0
+        ;;
       reset)
         return 0
         ;;
@@ -619,11 +925,12 @@ checkout_commit_for_ref() (
   }
 
   INSTALL_REF="$ref"
-  REQUESTED_NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  REQUESTED_NEWAPI_TOOLS_IMAGE=''
   if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    REQUESTED_NEWAPI_TOOLS_IMAGE="$resolved_test_image"
     REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="$tag_commit"
   else
-    REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="$remote_commit"
+    REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION=''
   fi
   checkout_install_ref
   printf '%s\n' "$INSTALL_COMMIT"
@@ -641,6 +948,9 @@ assert_eq \
   'a semver release ref prefers its immutable tag over a colliding branch' \
   '2222222222222222222222222222222222222222' \
   checkout_commit_for_ref 'v0.2.0'
+assert_rejected \
+  'a non-semver install ref cannot hide a release tag on the same commit' \
+  checkout_commit_for_ref 'feature/test' $'dev-latest\nv0.6.1'
 
 checkout_release_identity_rejected() (
   local mode="$1" tag_commit='2222222222222222222222222222222222222222'
@@ -2665,6 +2975,493 @@ assert_eq \
   "1|${previous_test_image}|old-secret|present|present" \
   install_persistent_transaction_result 42
 
+install_toolstore_commit_has_no_false_rollback_error() (
+  local fixture order_file error_file toolstore_file status txn_state='prepared'
+  fixture="$(mktemp -d)"
+  order_file="$(mktemp)"
+  error_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$order_file" "$error_file"' EXIT
+  toolstore_file="${fixture}/control-plane.db"
+  : > "$toolstore_file"
+  : > "${fixture}/docker-compose.yml"
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$previous_test_image" > "${fixture}/.env"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { printf 'success:%s\n' "$*" >> "$order_file"; }
+  log_error() { printf 'error:%s\n' "$*" >> "$error_file"; }
+  list_install_container_names() { return 0; }
+  setup_compose_files() { :; }
+  build_install_compose_args() { local -n output="$3"; output=(); }
+  run_install_compose() { printf 'compose:%s\n' "${!#}" >> "$order_file"; }
+  resolve_install_toolstore_host_path() { printf '%s\n' "$toolstore_file"; }
+  load_install_toolstore_transaction_library() { INSTALL_TOOLSTORE_TXN_LOADED=true; }
+  configure_install_toolstore_compose_sources() { :; }
+  clear_install_toolstore_compose_sources() { :; }
+  toolstore_txn_prepare() { printf 'txn:prepare\n' >> "$order_file"; }
+  toolstore_txn_has_active() { [[ "$txn_state" != 'finished' ]]; }
+  toolstore_txn_authoritative_backup() { printf 'txn:backup\n' >> "$order_file"; }
+  toolstore_txn_mark_candidate() { txn_state='candidate'; printf 'txn:candidate\n' >> "$order_file"; }
+  start_install_isolated_candidate_and_wait() { printf 'start:isolated\n' >> "$order_file"; }
+  stop_install_isolated_candidate() { printf 'stop:isolated\n' >> "$order_file"; }
+  toolstore_txn_verify_candidate() { printf 'txn:verify\n' >> "$order_file"; }
+  migrate_image_env_file() { printf 'env:commit\n' >> "$order_file"; }
+  toolstore_txn_commit() { txn_state='committed'; printf 'txn:commit\n' >> "$order_file"; }
+  toolstore_txn_load_record() { printf 'STATE=%s\n' "$txn_state"; }
+  toolstore_txn_env_value() {
+    local content="$1" key="$2"
+    sed -n "s/^${key}=//p" <<<"$content" | tail -n1
+  }
+  start_install_services_and_wait() { printf 'start:%s\n' "$3" >> "$order_file"; }
+  toolstore_txn_finish_committed() { txn_state='finished'; printf 'txn:finish\n' >> "$order_file"; }
+
+  INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  INSTALL_TOOLSTORE_TXN_LOADED=false
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  set +e
+  (restart_install_services_transactionally "${fixture}/.env" "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s\n' \
+    "$status" \
+    "$(paste -sd, "$order_file")" \
+    "$([[ -s "$error_file" ]] && paste -sd, "$error_file" || printf none)"
+)
+
+assert_eq \
+  'installer Tool Store commit reaches formal activation without a false rollback error' \
+  '0|txn:prepare,compose:down,txn:backup,txn:candidate,start:isolated,stop:isolated,txn:verify,env:commit,txn:verify,txn:commit,start:candidate,txn:finish,success:隔离候选验证和正式晋升均已完成，部署镜像为 ghcr.io/yujianwudi/new_api_tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|none' \
+  install_toolstore_commit_has_no_false_rollback_error
+
+install_toolstore_irreversible_boundary_result() (
+  local mode="$1" fixture state_file event_file error_file toolstore_file status rollback_available=false
+  fixture="$(mktemp -d)"
+  state_file="$(mktemp)"
+  event_file="$(mktemp)"
+  error_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$state_file" "$event_file" "$error_file"' EXIT
+  printf 'prepared\n' > "$state_file"
+  toolstore_file="${fixture}/control-plane.db"
+  : > "$toolstore_file"
+  : > "${fixture}/docker-compose.yml"
+  printf 'NEWAPI_TOOLS_IMAGE=%s\n' "$previous_test_image" > "${fixture}/.env"
+  if [[ "$mode" == 'snapshot-cleanup-error' ||
+    "$mode" == 'snapshot-cleanup-formal-error' ||
+    "$mode" == 'compose-cleanup-error' ||
+    "$mode" == 'evidence-cleanup-error' ]]; then
+    rollback_available=true
+    printf 'NEWAPI_TOOLS_IMAGE=%s\nCOMPOSE_PROJECT_NAME=old-project\n' \
+      "$previous_test_image" > "${fixture}/.env.rollback"
+    chmod 600 "${fixture}/.env.rollback"
+  fi
+
+  log_info() { :; }
+  log_warn() { printf 'warn:%s\n' "$*" >> "$error_file"; }
+  log_success() { printf 'success\n' >> "$event_file"; }
+  log_error() { printf '%s\n' "$*" >> "$error_file"; }
+  list_install_container_names() { return 0; }
+  setup_compose_files() { :; }
+  build_install_compose_args() { local -n output="$3"; output=(); }
+  build_install_rollback_compose_args() { local -n output="$3"; output=(); }
+  run_install_compose() { printf 'compose:%s\n' "${!#}" >> "$event_file"; }
+  load_install_rollback_snapshot() {
+    printf 'NEWAPI_TOOLS_IMAGE=%s\nCOMPOSE_PROJECT_NAME=old-project\n' "$previous_test_image"
+  }
+  install_rollback_snapshot_path() { printf '%s.rollback\n' "$1"; }
+  resolve_install_toolstore_host_path() { printf '%s\n' "$toolstore_file"; }
+  load_install_toolstore_transaction_library() { INSTALL_TOOLSTORE_TXN_LOADED=true; }
+  configure_install_toolstore_compose_sources() { :; }
+  clear_install_toolstore_compose_sources() { :; }
+  toolstore_txn_prepare() { printf 'prepare\n' >> "$event_file"; }
+  toolstore_txn_has_active() { [[ "$(<"$state_file")" != 'finished' ]]; }
+  toolstore_txn_authoritative_backup() { printf 'backup\n' >> "$event_file"; }
+  toolstore_txn_mark_candidate() { printf 'candidate\n' > "$state_file"; }
+  start_install_isolated_candidate_and_wait() { printf 'isolated-start\n' >> "$event_file"; }
+  stop_install_isolated_candidate() { printf 'isolated-stop\n' >> "$event_file"; }
+  toolstore_txn_verify_candidate() { printf 'verify\n' >> "$event_file"; }
+  migrate_image_env_file() { printf 'env:%s\n' "$2" >> "$event_file"; }
+  toolstore_txn_commit() {
+    printf 'committed\n' > "$state_file"
+    printf 'commit\n' >> "$event_file"
+    [[ "$mode" != 'commit-marker-error' ]]
+  }
+  toolstore_txn_load_record() { printf 'STATE=%s\n' "$(<"$state_file")"; }
+  toolstore_txn_env_value() {
+    local content="$1" key="$2"
+    sed -n "s/^${key}=//p" <<<"$content" | tail -n1
+  }
+  remove_install_rollback_snapshot() {
+    printf 'snapshot-cleanup\n' >> "$event_file"
+    if [[ "$mode" == 'snapshot-cleanup-error' ||
+      "$mode" == 'snapshot-cleanup-formal-error' ]]; then
+      return 1
+    fi
+    rm -f -- "$(install_rollback_snapshot_path "$1")"
+  }
+  discard_install_rollback_compose_bundle() {
+    printf 'compose-cleanup\n' >> "$event_file"
+    [[ "$mode" != 'compose-cleanup-error' ]]
+  }
+  start_install_services_and_wait() {
+    printf 'formal:%s\n' "$3" >> "$event_file"
+    [[ ( "$mode" != 'formal-start-error' &&
+      "$mode" != 'snapshot-cleanup-formal-error' ) || "$3" != 'candidate' ]]
+  }
+  toolstore_txn_finish_committed() {
+    printf 'evidence-cleanup\n' >> "$event_file"
+    [[ "$mode" != 'evidence-cleanup-error' ]] || return 1
+    printf 'finished\n' > "$state_file"
+  }
+  restore_install_previous_configuration() { printf 'restore-config\n' >> "$event_file"; }
+  toolstore_txn_unstage_data() { printf 'unstage-data\n' >> "$event_file"; }
+  toolstore_txn_restore_database() { printf 'restore-database\n' >> "$event_file"; }
+
+  INSTALL_ROLLBACK_ENV_AVAILABLE="$rollback_available"
+  INSTALL_TOOLSTORE_TXN_LOADED=false
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  set +e
+  (restart_install_services_transactionally "${fixture}/.env" "$fixture") >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(<"$state_file")" \
+    "$(grep -c '^restore-config$' "$event_file" || true)" \
+    "$(grep -c '^restore-database$' "$event_file" || true)" \
+    "$(grep -c '^formal:candidate$' "$event_file" || true)" \
+    "$(grep -c '将读取持久事务状态后决定恢复方向' "$error_file" || true)" \
+    "$(grep -c '下次运行 install.sh 将幂等重试清理' "$error_file" || true)"
+)
+
+assert_eq \
+  'installer recovers an after-commit-marker error from durable committed state without restoring the old schema' \
+  '0|finished|0|0|1|1|0' \
+  install_toolstore_irreversible_boundary_result commit-marker-error
+assert_eq \
+  'installer snapshot-cleanup failure still starts a healthy formal candidate and retains committed evidence without rollback' \
+  '0|committed|0|0|1|0|1' \
+  install_toolstore_irreversible_boundary_result snapshot-cleanup-error
+assert_eq \
+  'installer formal startup failure after Tool Store commit preserves committed evidence and never restores the old schema' \
+  '1|committed|0|0|1|0|0' \
+  install_toolstore_irreversible_boundary_result formal-start-error
+assert_eq \
+  'installer cleanup failure plus formal startup failure returns nonzero with committed evidence and zero rollback' \
+  '1|committed|0|0|1|0|0' \
+  install_toolstore_irreversible_boundary_result snapshot-cleanup-formal-error
+assert_eq \
+  'installer Compose snapshot cleanup failure still returns actionable success for a healthy formal candidate' \
+  '0|committed|0|0|1|0|1' \
+  install_toolstore_irreversible_boundary_result compose-cleanup-error
+assert_eq \
+  'installer committed-evidence cleanup failure keeps active evidence after a healthy formal candidate' \
+  '0|committed|0|0|1|0|1' \
+  install_toolstore_irreversible_boundary_result evidence-cleanup-error
+
+install_committed_cleanup_pending_exits_before_mutation_menu() (
+  local fixture target transaction_root event_file first_status second_status
+  fixture="$(mktemp -d)"
+  event_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$event_file"' EXIT
+  target="${fixture}/project"
+  transaction_root="${fixture}/.project.toolstore-transactions"
+  mkdir -p "${target}/scripts" "$transaction_root"
+  : > "${target}/.env"
+  : > "${target}/docker-compose.yml"
+  : > "${target}/scripts/toolstore_transaction.sh"
+  printf 'STATE=committed\n' > "${transaction_root}/active.env"
+
+  log_info() { :; }
+  log_warn() { printf 'warn:%s\n' "$*" >> "$event_file"; }
+  log_success() { printf 'success:%s\n' "$*" >> "$event_file"; }
+  load_install_toolstore_transaction_library() { :; }
+  recover_active_install_toolstore_transaction() { printf 'recover\n' >> "$event_file"; }
+  toolstore_txn_has_active() { return 0; }
+  toolstore_txn_load_record() { printf 'STATE=committed\n'; }
+  toolstore_txn_env_value() {
+    local content="$1" key="$2"
+    sed -n "s/^${key}=//p" <<<"$content" | tail -n1
+  }
+  cleanup_install_clone_staging() { :; }
+  prepare_install_rollback_transaction() { printf 'prepare\n' >> "$event_file"; }
+  restore_install_previous_configuration() { printf 'restore\n' >> "$event_file"; }
+  show_management_menu() { printf 'menu\n' >> "$event_file"; }
+
+  INSTALL_DIR="$fixture"
+  PROJECT_NAME='project'
+  set +e
+  (check_existing_installation) >/dev/null 2>&1
+  first_status=$?
+  (check_existing_installation) >/dev/null 2>&1
+  second_status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$first_status" \
+    "$second_status" \
+    "$(grep -c '^recover$' "$event_file" || true)" \
+    "$(grep -c '^prepare$' "$event_file" || true)" \
+    "$(grep -c '^restore$' "$event_file" || true)" \
+    "$(grep -c '^menu$' "$event_file" || true)" \
+    "$(grep -c '^warn:' "$event_file" || true)" \
+    "$(grep -c '^success:' "$event_file" || true)" \
+    "$([[ -f "${transaction_root}/active.env" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'installer committed cleanup pending retries recovery next run and exits before prepare, restore, or mutation menu' \
+  '0|0|2|0|0|0|2|2|present' \
+  install_committed_cleanup_pending_exits_before_mutation_menu
+
+deploy_toolstore_irreversible_boundary_result() (
+  local mode="$1" fixture state_file event_file error_file toolstore_file status
+  fixture="$(mktemp -d)"
+  state_file="$(mktemp)"
+  event_file="$(mktemp)"
+  error_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$state_file" "$event_file" "$error_file"' EXIT
+  printf 'prepared\n' > "$state_file"
+  toolstore_file="${fixture}/control-plane.db"
+  : > "$toolstore_file"
+  ENV_FILE="${fixture}/.env"
+  printf '%s\n' \
+    "NEWAPI_TOOLS_IMAGE=${resolved_test_image}" \
+    'COMPOSE_PROJECT_NAME=old-project' \
+    'ADMIN_PASSWORD=candidate-secret' > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  log_info() { :; }
+  log_warn() { printf 'warn:%s\n' "$*" >> "$error_file"; }
+  log_success() { printf 'success:%s\n' "$*" >> "$event_file"; }
+  log_error() { printf 'error:%s\n' "$*" >> "$error_file"; }
+  validate_deploy_credential_separation_file() { :; }
+  download_geoip_database() { :; }
+  list_deploy_container_names() { printf 'newapi-tools\n'; }
+  resolve_deploy_running_compose_project() { printf 'old-project\n'; }
+  resolve_deploy_running_image_digest() { printf '%s\n' "$previous_test_image"; }
+  persist_deploy_image_env() { printf 'env:%s\n' "$2" >> "$event_file"; }
+  persist_deploy_compose_project_env() { :; }
+  run_deploy_compose() { printf 'compose:%s\n' "${3:-}" >> "$event_file"; }
+  pin_deploy_image_after_pull() {
+    NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+    export NEWAPI_TOOLS_IMAGE
+  }
+  toolstore_txn_resolve_db_path() { printf '%s\n' "$toolstore_file"; }
+  toolstore_txn_prepare() { printf 'prepared\n' > "$state_file"; printf 'prepare\n' >> "$event_file"; }
+  toolstore_txn_has_active() { [[ "$(<"$state_file")" != 'finished' ]]; }
+  toolstore_txn_authoritative_backup() { printf 'backup\n' >> "$event_file"; }
+  toolstore_txn_mark_candidate() { printf 'candidate\n' > "$state_file"; }
+  start_deploy_isolated_candidate_and_wait() { printf 'isolated-start\n' >> "$event_file"; }
+  stop_deploy_isolated_candidate() { printf 'isolated-stop\n' >> "$event_file"; }
+  toolstore_txn_verify_candidate() { printf 'verify\n' >> "$event_file"; }
+  toolstore_txn_commit() { printf 'committed\n' > "$state_file"; printf 'commit\n' >> "$event_file"; }
+  toolstore_txn_load_record() { printf 'STATE=%s\n' "$(<"$state_file")"; }
+  toolstore_txn_env_value() {
+    local content="$1" key="$2"
+    sed -n "s/^${key}=//p" <<<"$content" | tail -n1
+  }
+  remove_deploy_rollback_snapshot() {
+    printf 'snapshot-cleanup\n' >> "$event_file"
+    if [[ "$mode" == 'snapshot-cleanup-error' ||
+      "$mode" == 'snapshot-cleanup-formal-error' ]]; then
+      return 1
+    fi
+    rm -f -- "$(deploy_rollback_snapshot_path)"
+  }
+  start_deploy_services_and_wait() {
+    printf 'formal:%s\n' "$1" >> "$event_file"
+    [[ ( "$mode" != 'formal-start-error' &&
+      "$mode" != 'snapshot-cleanup-formal-error' ) || "$1" != 'candidate' ]]
+  }
+  toolstore_txn_finish_committed() {
+    printf 'evidence-cleanup\n' >> "$event_file"
+    [[ "$mode" != 'evidence-cleanup-error' ]] || return 1
+    printf 'finished\n' > "$state_file"
+  }
+  restore_deploy_previous_configuration() { printf 'restore-config\n' >> "$event_file"; }
+  toolstore_txn_unstage_data() { printf 'unstage-data\n' >> "$event_file"; }
+  toolstore_txn_restore_database() { printf 'restore-database\n' >> "$event_file"; }
+  toolstore_txn_mark_rolled_back() { printf 'rolled-back\n' > "$state_file"; }
+
+  DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+  DEPLOY_ROLLBACK_ENV_CONTENT="NEWAPI_TOOLS_IMAGE=${previous_test_image}"$'\n''COMPOSE_PROJECT_NAME=old-project'
+  DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  DEPLOY_ENV_GENERATED_THIS_RUN=false
+  NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+  export NEWAPI_TOOLS_IMAGE
+  FRONTEND_BIND='0.0.0.0'
+  FRONTEND_PORT='1145'
+  ADMIN_PASSWORD='candidate-secret'
+  AUTO_GENERATED_PASSWORD=false
+  set +e
+  (start_services) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(<"$state_file")" \
+    "$(grep -c '^restore-config$' "$event_file" || true)" \
+    "$(grep -c '^restore-database$' "$event_file" || true)" \
+    "$(grep -c '^formal:candidate$' "$event_file" || true)" \
+    "$(grep -c '^snapshot-cleanup$' "$event_file" || true)" \
+    "$(grep -c '下次运行 deploy.sh 将幂等重试清理' "$error_file" || true)" \
+    "$([[ -e "${ENV_FILE}.rollback" || -L "${ENV_FILE}.rollback" ]] && printf present || printf absent)"
+)
+
+assert_eq \
+  'deploy snapshot-cleanup failure still starts a healthy formal candidate and retains committed evidence without rollback' \
+  '0|committed|0|0|1|1|1|present' \
+  deploy_toolstore_irreversible_boundary_result snapshot-cleanup-error
+assert_eq \
+  'deploy cleanup failure plus formal startup failure returns nonzero with committed evidence and zero rollback' \
+  '1|committed|0|0|1|1|0|present' \
+  deploy_toolstore_irreversible_boundary_result snapshot-cleanup-formal-error
+assert_eq \
+  'deploy formal startup failure after Tool Store commit preserves committed evidence and never restores old state' \
+  '1|committed|0|0|1|1|0|absent' \
+  deploy_toolstore_irreversible_boundary_result formal-start-error
+assert_eq \
+  'deploy committed-evidence cleanup failure keeps active evidence after a healthy formal candidate' \
+  '0|committed|0|0|1|1|1|absent' \
+  deploy_toolstore_irreversible_boundary_result evidence-cleanup-error
+
+deploy_main_committed_recovery_precedes_resolution_result() (
+  local recovery_fixture_mode="$1" fixture event_file state_file status recorded_candidate
+  fixture="$(mktemp -d)"
+  event_file="$(mktemp)"
+  state_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$event_file" "$state_file"' EXIT
+  # install.sh is sourced later in this test file and also defines main().
+  # Reload deploy.sh in this subshell so this fixture exercises deploy main().
+  source "${REPO_ROOT}/deploy.sh"
+  printf 'committed\n' > "$state_file"
+  recorded_candidate='ghcr.io/yujianwudi/new_api_tools@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+  ENV_FILE="${fixture}/.env"
+
+  log_info() { :; }
+  log_warn() { printf 'warn:%s\n' "$*" >> "$event_file"; }
+  log_success() { printf 'success:%s\n' "$*" >> "$event_file"; }
+  log_error() { printf 'error:%s\n' "$*" >> "$event_file"; }
+  need_cmd() { :; }
+  detect_docker_compose() { :; }
+  acquire_deploy_state_lock() { printf 'lock\n' >> "$event_file"; }
+  toolstore_txn_has_active() { [[ "$(<"$state_file")" != 'finished' ]]; }
+  toolstore_txn_load_record() {
+    printf 'STATE=%s\nCANDIDATE_IMAGE=%s\nREQUEST_ID=test-request\n' \
+      "$(<"$state_file")" "$recorded_candidate"
+  }
+  toolstore_txn_env_value() {
+    local content="$1" key="$2"
+    sed -n "s/^${key}=//p" <<<"$content" | tail -n1
+  }
+  stop_deploy_isolated_candidate() { printf 'stop-isolated\n' >> "$event_file"; }
+  persist_deploy_image_env() { printf 'persist:%s\n' "$2" >> "$event_file"; }
+  configure_deploy_context_from_env() { printf 'configure-recorded\n' >> "$event_file"; }
+  start_deploy_services_and_wait() {
+    if [[ "$1" == 'candidate' ]]; then
+      printf 'formal:%s\n' "$2" >> "$event_file"
+    else
+      printf 'unexpected:old-rollback\n' >> "$event_file"
+    fi
+  }
+  toolstore_txn_finish_committed() {
+    printf 'finish\n' >> "$event_file"
+    if [[ "$recovery_fixture_mode" == 'cleaned' ]]; then
+      printf 'finished\n' > "$state_file"
+    fi
+  }
+  resolve_deploy_image() {
+    printf 'resolve:release-tag-without-tuple\n' >> "$event_file"
+    return 1
+  }
+  run_deploy_compose() { printf 'unexpected:pull-or-compose\n' >> "$event_file"; }
+  detect_environment() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  detect_log_database() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  interactive_config() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  check_compose_file() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  list_deploy_container_names() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  capture_deploy_rollback_env() { printf 'unexpected:old-rollback\n' >> "$event_file"; }
+  recover_preexisting_deploy_rollback_snapshot() { printf 'unexpected:old-rollback\n' >> "$event_file"; }
+  generate_env_file() { printf 'unexpected:new-config\n' >> "$event_file"; }
+  start_services() { printf 'unexpected:new-deployment\n' >> "$event_file"; }
+  restore_deploy_previous_configuration() { printf 'unexpected:old-rollback\n' >> "$event_file"; }
+
+  REQUESTED_NEWAPI_TOOLS_IMAGE=''
+  REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION=''
+  REQUESTED_NEWAPI_TOOLS_RELEASE_TAG=''
+  unset NEWAPI_TOOLS_IMAGE NEWAPI_TOOLS_EXPECTED_REVISION NEWAPI_TOOLS_RELEASE_TAG
+  set +e
+  (main) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(<"$state_file")" \
+    "$(grep -c "^formal:${recorded_candidate}$" "$event_file" || true)" \
+    "$(grep -c '^resolve:' "$event_file" || true)" \
+    "$(grep -c '^unexpected:' "$event_file" || true)" \
+    "$(grep -c "^persist:${recorded_candidate}$" "$event_file" || true)" \
+    "$(grep -c '^finish$' "$event_file" || true)"
+)
+
+assert_eq \
+  'deploy main recovers a recorded committed candidate before release resolution when cleanup remains pending' \
+  '0|committed|1|0|0|1|1' \
+  deploy_main_committed_recovery_precedes_resolution_result pending
+assert_eq \
+  'deploy main does not resolve a new release request after committed recovery fully cleans active evidence' \
+  '0|finished|1|0|0|1|1' \
+  deploy_main_committed_recovery_precedes_resolution_result cleaned
+
+deploy_main_without_active_resolves_new_request() (
+  local fixture event_file status
+  fixture="$(mktemp -d)"
+  event_file="$(mktemp)"
+  trap 'rm -rf "$fixture"; rm -f "$event_file"' EXIT
+  source "${REPO_ROOT}/deploy.sh"
+  ENV_FILE="${fixture}/.env"
+
+  log_info() { :; }
+  log_warn() { :; }
+  log_success() { :; }
+  log_error() { :; }
+  need_cmd() { :; }
+  detect_docker_compose() { :; }
+  acquire_deploy_state_lock() { :; }
+  toolstore_txn_has_active() { return 1; }
+  resolve_deploy_image() {
+    printf 'resolve\n' >> "$event_file"
+    NEWAPI_TOOLS_IMAGE="$resolved_test_image"
+    export NEWAPI_TOOLS_IMAGE
+  }
+  detect_environment() { :; }
+  detect_log_database() { :; }
+  interactive_config() { :; }
+  check_compose_file() { :; }
+  list_deploy_container_names() { return 0; }
+  capture_deploy_rollback_env() { printf 'capture\n' >> "$event_file"; }
+  recover_preexisting_deploy_rollback_snapshot() { :; }
+  generate_env_file() { printf 'generate\n' >> "$event_file"; }
+  start_services() { printf 'start\n' >> "$event_file"; }
+
+  set +e
+  (main) >/dev/null 2>&1
+  status=$?
+  set -e
+  printf '%s|%s|%s|%s|%s\n' \
+    "$status" \
+    "$(grep -c '^resolve$' "$event_file" || true)" \
+    "$(grep -c '^capture$' "$event_file" || true)" \
+    "$(grep -c '^generate$' "$event_file" || true)" \
+    "$(grep -c '^start$' "$event_file" || true)"
+)
+
+assert_eq \
+  'deploy main resolves the new request normally when no durable Tool Store transaction is active' \
+  '0|1|1|1|1' \
+  deploy_main_without_active_resolves_new_request
+
 deploy_fresh_preseeded_env_has_no_false_rollback() (
   local fixture before after
   fixture="$(mktemp -d)"
@@ -3198,7 +3995,8 @@ deploy_generate_env_atomic_result() (
   USE_HOST_MODE=false
   USE_BRIDGE_MODE=false
   DEPLOY_ENV_GENERATED_THIS_RUN=false
-  unset NEWAPI_BASEURL OBSERVABILITY_TOKEN
+  unset NEWAPI_BASEURL
+  OBSERVABILITY_TOKEN='observability-secret'
   log_info() { :; }
   log_success() { :; }
   log_error() { :; }

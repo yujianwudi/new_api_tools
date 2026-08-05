@@ -6,35 +6,44 @@ type InvoiceStatus string
 
 type InvoiceDocumentKind string
 
+type InvoiceRelationState string
+
 const (
 	InvoiceIssued InvoiceStatus       = "issued"
 	InvoiceVoided InvoiceStatus       = "voided"
 	InvoiceBlue   InvoiceDocumentKind = "blue"
 	InvoiceRed    InvoiceDocumentKind = "red"
+
+	InvoiceRelationNotApplicable InvoiceRelationState = "not_applicable"
+	InvoiceRelationVerified      InvoiceRelationState = "verified"
+	InvoiceRelationUnreconciled  InvoiceRelationState = "unreconciled"
 )
 
 type InvoiceDocument struct {
-	ID                   int64               `json:"id"`
-	InvoiceNumber        string              `json:"invoice_number"`
-	SellerEntity         string              `json:"seller_entity"`
-	BuyerName            string              `json:"buyer_name"`
-	BuyerTaxID           string              `json:"buyer_tax_id"`
-	DocumentKind         InvoiceDocumentKind `json:"document_kind"`
-	RelatedInvoiceNumber string              `json:"related_invoice_number"`
-	Currency             string              `json:"currency"`
-	AmountMinor          int64               `json:"amount_minor"`
-	TaxAmountMinor       int64               `json:"tax_amount_minor"`
-	MinorUnitScale       int                 `json:"minor_unit_scale"`
-	Status               InvoiceStatus       `json:"status"`
-	Source               string              `json:"source"`
-	IdempotencyKey       string              `json:"-"`
-	RequestFingerprint   string              `json:"-"`
-	IssuedAt             time.Time           `json:"issued_at"`
-	VoidedAt             *time.Time          `json:"voided_at"`
-	VoidReason           string              `json:"void_reason"`
-	CreatedBy            string              `json:"created_by"`
-	CreatedAt            time.Time           `json:"created_at"`
-	UpdatedAt            time.Time           `json:"updated_at"`
+	ID                   int64                `json:"id"`
+	InvoiceNumber        string               `json:"invoice_number"`
+	SellerEntity         string               `json:"seller_entity"`
+	BuyerName            string               `json:"buyer_name"`
+	BuyerTaxID           string               `json:"buyer_tax_id"`
+	DocumentKind         InvoiceDocumentKind  `json:"document_kind"`
+	RelatedInvoiceNumber string               `json:"related_invoice_number"`
+	RelatedInvoiceID     *int64               `json:"related_invoice_id"`
+	RelationState        InvoiceRelationState `json:"relation_state"`
+	RelationReason       string               `json:"relation_reason,omitempty"`
+	Currency             string               `json:"currency"`
+	AmountMinor          int64                `json:"amount_minor"`
+	TaxAmountMinor       int64                `json:"tax_amount_minor"`
+	MinorUnitScale       int                  `json:"minor_unit_scale"`
+	Status               InvoiceStatus        `json:"status"`
+	Source               string               `json:"source"`
+	IdempotencyKey       string               `json:"-"`
+	RequestFingerprint   string               `json:"-"`
+	IssuedAt             time.Time            `json:"issued_at"`
+	VoidedAt             *time.Time           `json:"voided_at"`
+	VoidReason           string               `json:"void_reason"`
+	CreatedBy            string               `json:"created_by"`
+	CreatedAt            time.Time            `json:"created_at"`
+	UpdatedAt            time.Time            `json:"updated_at"`
 }
 
 type InvoiceDocumentInput struct {
@@ -44,6 +53,7 @@ type InvoiceDocumentInput struct {
 	BuyerTaxID           string
 	DocumentKind         InvoiceDocumentKind
 	RelatedInvoiceNumber string
+	RelatedInvoiceID     *int64
 	Currency             string
 	AmountMinor          int64
 	TaxAmountMinor       int64
@@ -100,21 +110,27 @@ type InvoiceSummaryFilter struct {
 }
 
 type InvoiceSummaryGroup struct {
-	Currency        string `json:"currency"`
-	MinorUnitScale  int    `json:"minor_unit_scale"`
-	BlueIssuedMinor string `json:"blue_issued_minor"`
-	RedIssuedMinor  string `json:"red_issued_minor"`
-	VoidedBlueMinor string `json:"voided_blue_minor"`
-	VoidedRedMinor  string `json:"voided_red_minor"`
-	VoidedMinor     string `json:"voided_minor"`
-	NetIssuedMinor  string `json:"net_issued_minor"`
-	EffectiveCount  int64  `json:"effective_count"`
-	VoidedCount     int64  `json:"voided_count"`
+	Currency          string  `json:"currency"`
+	MinorUnitScale    int     `json:"minor_unit_scale"`
+	BlueIssuedMinor   string  `json:"blue_issued_minor"`
+	RedIssuedMinor    string  `json:"red_issued_minor"`
+	VoidedBlueMinor   string  `json:"voided_blue_minor"`
+	VoidedRedMinor    string  `json:"voided_red_minor"`
+	VoidedMinor       string  `json:"voided_minor"`
+	NetIssuedMinor    *string `json:"net_issued_minor"`
+	EffectiveCount    int64   `json:"effective_count"`
+	VoidedCount       int64   `json:"voided_count"`
+	SourceHealth      string  `json:"source_health"`
+	UnreconciledCount int64   `json:"unreconciled_count"`
+	AnomalyCount      int64   `json:"anomaly_count"`
 }
 
 type InvoiceSummary struct {
-	Groups      []InvoiceSummaryGroup `json:"groups"`
-	GeneratedAt time.Time             `json:"generated_at"`
+	Groups            []InvoiceSummaryGroup `json:"groups"`
+	GeneratedAt       time.Time             `json:"generated_at"`
+	SourceHealth      string                `json:"source_health"`
+	UnreconciledCount int64                 `json:"unreconciled_count"`
+	AnomalyCount      int64                 `json:"anomaly_count"`
 }
 
 type InvoiceImportResult struct {

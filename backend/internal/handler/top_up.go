@@ -39,15 +39,16 @@ func exportLockKey(c *gin.Context) string {
 // RegisterTopUpRoutes registers /api/top-ups endpoints
 func RegisterTopUpRoutes(r *gin.RouterGroup, store *toolstore.Store) {
 	g := r.Group("/top-ups")
+	operator := auth.RequireRole(auth.RoleOperator)
 	{
-		g.GET("", ListTopUps)
-		g.GET("/statistics", GetTopUpStatistics)
+		g.GET("", operator, ListTopUps)
+		g.GET("/statistics", operator, GetTopUpStatistics)
 		g.GET("/payment-methods", GetPaymentMethods)
 		g.GET("/payment-providers", GetPaymentProviders)
 		g.GET("/export", auth.RequireRole(auth.RoleAdmin), func(c *gin.Context) {
 			exportTopUps(c, store)
 		})
-		g.GET("/:id", GetTopUpRecord)
+		g.GET("/:id", operator, GetTopUpRecord)
 	}
 }
 
@@ -100,7 +101,8 @@ func parseTopUpFilters(c *gin.Context) (service.ListTopUpParams, error) {
 		params.UserID = &uid
 	}
 
-	// Parse optional inviter_id (用于邀请返利统计行展开)
+	// Parse optional inviter_id for generic invite-attribution filtering.
+	// The invite top-up analysis UI uses its dedicated detail endpoint instead.
 	if inviterIDStr := c.Query("inviter_id"); inviterIDStr != "" {
 		iid, err := strconv.ParseInt(inviterIDStr, 10, 64)
 		if err != nil || iid <= 0 {

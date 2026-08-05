@@ -63,8 +63,8 @@ func TestInvoiceSummarySubtractsEffectiveRedDocumentsAndReversesVoidedRed(t *tes
 		t.Fatalf("summary = %+v err=%v", summary, err)
 	}
 	group := summary.Groups[0]
-	if group.BlueIssuedMinor != "10000" || group.RedIssuedMinor != "2500" || group.NetIssuedMinor != "7500" ||
-		group.EffectiveCount != 2 || group.VoidedCount != 0 {
+	if group.BlueIssuedMinor != "10000" || group.RedIssuedMinor != "2500" || group.NetIssuedMinor == nil || *group.NetIssuedMinor != "7500" ||
+		group.EffectiveCount != 2 || group.VoidedCount != 0 || group.AnomalyCount != 0 || summary.AnomalyCount != 0 {
 		t.Fatalf("effective summary = %+v", group)
 	}
 
@@ -83,7 +83,7 @@ func TestInvoiceSummarySubtractsEffectiveRedDocumentsAndReversesVoidedRed(t *tes
 	}
 	group = summary.Groups[0]
 	if group.BlueIssuedMinor != "10000" || group.RedIssuedMinor != "0" || group.VoidedRedMinor != "2500" ||
-		group.VoidedMinor != "2500" || group.NetIssuedMinor != "10000" || group.EffectiveCount != 1 || group.VoidedCount != 1 {
+		group.VoidedMinor != "2500" || group.NetIssuedMinor == nil || *group.NetIssuedMinor != "10000" || group.EffectiveCount != 1 || group.VoidedCount != 1 {
 		t.Fatalf("summary after red void = %+v", group)
 	}
 	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
@@ -303,7 +303,7 @@ func TestInvoiceSummaryUsesExactBigIntegersBeyondSQLiteSumRange(t *testing.T) {
 	group := summary.Groups[0]
 	if group.BlueIssuedMinor != "18446744073709551614" || group.RedIssuedMinor != "9223372036854775807" ||
 		group.VoidedBlueMinor != "9223372036854775807" || group.VoidedMinor != "9223372036854775807" ||
-		group.NetIssuedMinor != "9223372036854775807" || group.EffectiveCount != 3 || group.VoidedCount != 1 {
+		group.NetIssuedMinor == nil || *group.NetIssuedMinor != "9223372036854775807" || group.EffectiveCount != 3 || group.VoidedCount != 1 {
 		t.Fatalf("large exact summary = %+v", group)
 	}
 }
@@ -416,6 +416,215 @@ func TestInvoiceCreateAndImportMapCrossStoreContentionToConflict(t *testing.T) {
 				t.Fatalf("cross-store contention error = %v, want ErrConflict", err)
 			}
 		})
+	}
+}
+
+func TestRedInvoiceRequiresVerifiedOriginalAndEnforcesExactCumulativeLimit(t *testing.T) {
+	store, _ := newTestStore(t)
+	blue := createTestInvoice(t, store, testInvoiceInput("red-rules-blue", "BLUE-RULES", InvoiceBlue, 100))
+	blueID := blue.ID
+
+	tests := []struct {
+		name  string
+		input InvoiceDocumentInput
+	}{
+		{name: "orphan number", input: func() InvoiceDocumentInput {
+			item := testInvoiceInput("red-orphan", "RED-ORPHAN", InvoiceRed, 10)
+			item.RelatedInvoiceNumber = "MISSING-BLUE"
+			return item
+		}()},
+		{name: "cross seller", input: func() InvoiceDocumentInput {
+			item := testInvoiceInput("red-cross-seller", "RED-SELLER", InvoiceRed, 10)
+			item.SellerEntity = "Different Seller"
+			item.RelatedInvoiceID = &blueID
+			return item
+		}()},
+		{name: "cross currency", input: func() InvoiceDocumentInput {
+			item := testInvoiceInput("red-cross-currency", "RED-CURRENCY", InvoiceRed, 10)
+			item.Currency = "USD"
+			item.RelatedInvoiceID = &blueID
+			return item
+		}()},
+		{name: "cross precision", input: func() InvoiceDocumentInput {
+			item := testInvoiceInput("red-cross-scale", "RED-SCALE", InvoiceRed, 10)
+			item.MinorUnitScale = 3
+			item.RelatedInvoiceID = &blueID
+			return item
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			audit := testMutationAudit(actionInvoiceCreate)
+			audit.IdempotencyKey = tt.input.IdempotencyKey
+			if _, _, err := store.CreateInvoiceAudited(context.Background(), tt.input, audit); !errors.Is(err, ErrConflict) {
+				t.Fatalf("CreateInvoiceAudited() error = %v, want ErrConflict", err)
+			}
+		})
+	}
+
+	first := testInvoiceInput("red-exact-first", "RED-EXACT-60", InvoiceRed, 60)
+	first.RelatedInvoiceNumber = blue.InvoiceNumber
+	firstDoc := createTestInvoice(t, store, first)
+	if firstDoc.RelatedInvoiceID == nil || *firstDoc.RelatedInvoiceID != blue.ID ||
+		firstDoc.RelationState != InvoiceRelationVerified {
+		t.Fatalf("first red relation = %+v", firstDoc)
+	}
+	second := testInvoiceInput("red-exact-second", "RED-EXACT-40", InvoiceRed, 40)
+	second.RelatedInvoiceID = &blueID
+	secondDoc := createTestInvoice(t, store, second)
+	if secondDoc.RelatedInvoiceID == nil || *secondDoc.RelatedInvoiceID != blue.ID {
+		t.Fatalf("second red relation = %+v", secondDoc)
+	}
+
+	redID := firstDoc.ID
+	redToRed := testInvoiceInput("red-points-red", "RED-POINTS-RED", InvoiceRed, 1)
+	redToRed.RelatedInvoiceID = &redID
+	redAudit := testMutationAudit(actionInvoiceCreate)
+	redAudit.IdempotencyKey = redToRed.IdempotencyKey
+	if _, _, err := store.CreateInvoiceAudited(context.Background(), redToRed, redAudit); !errors.Is(err, ErrConflict) {
+		t.Fatalf("red-to-red error = %v, want ErrConflict", err)
+	}
+
+	overage := testInvoiceInput("red-over-one", "RED-OVER-ONE", InvoiceRed, 1)
+	overage.RelatedInvoiceID = &blueID
+	overageAudit := testMutationAudit(actionInvoiceCreate)
+	overageAudit.IdempotencyKey = overage.IdempotencyKey
+	if _, _, err := store.CreateInvoiceAudited(context.Background(), overage, overageAudit); !errors.Is(err, ErrConflict) {
+		t.Fatalf("one-minor-unit overage error = %v, want ErrConflict", err)
+	}
+
+	summary, err := store.InvoiceSummary(context.Background(), InvoiceSummaryFilter{})
+	if err != nil || len(summary.Groups) != 1 {
+		t.Fatalf("summary = %+v, %v", summary, err)
+	}
+	group := summary.Groups[0]
+	if group.NetIssuedMinor == nil || *group.NetIssuedMinor != "0" || group.SourceHealth != "ok" ||
+		group.RedIssuedMinor != "100" || group.AnomalyCount != 0 || summary.SourceHealth != "ok" || summary.AnomalyCount != 0 {
+		t.Fatalf("exact cumulative summary = %+v overall=%+v", group, summary)
+	}
+}
+
+func TestVoidingOriginalBlueInvalidatesRelationsAndMakesNetUnreconciled(t *testing.T) {
+	store, _ := newTestStore(t)
+	blue := createTestInvoice(t, store, testInvoiceInput("void-original-blue", "BLUE-VOID-REL", InvoiceBlue, 100))
+	red := testInvoiceInput("void-original-red", "RED-VOID-REL", InvoiceRed, 20)
+	red.RelatedInvoiceNumber = blue.InvoiceNumber
+	redDoc := createTestInvoice(t, store, red)
+
+	voidAudit := testMutationAudit(actionInvoiceVoid)
+	voidAudit.IdempotencyKey = "void-original-operation"
+	if _, _, err := store.VoidInvoiceAudited(context.Background(), InvoiceVoidInput{
+		ID: blue.ID, Reason: "original blue invoice was voided", IdempotencyKey: voidAudit.IdempotencyKey,
+		Actor: "finance@example.com",
+	}, voidAudit); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := store.GetInvoice(context.Background(), redDoc.ID)
+	if err != nil || reloaded.Document.RelationState != InvoiceRelationUnreconciled ||
+		reloaded.Document.RelationReason != "original_voided" {
+		t.Fatalf("invalidated red relation = %+v, %v", reloaded, err)
+	}
+	summary, err := store.InvoiceSummary(context.Background(), InvoiceSummaryFilter{})
+	if err != nil || len(summary.Groups) != 1 {
+		t.Fatalf("summary after original void = %+v, %v", summary, err)
+	}
+	group := summary.Groups[0]
+	if group.NetIssuedMinor != nil || group.SourceHealth != "unreconciled" || group.UnreconciledCount != 1 ||
+		group.AnomalyCount != 1 || group.VoidedBlueMinor != "100" || group.RedIssuedMinor != "20" ||
+		summary.SourceHealth != "unreconciled" || summary.AnomalyCount != 1 {
+		t.Fatalf("unreconciled original-void summary = %+v overall=%+v", group, summary)
+	}
+}
+
+func TestVoidedRedRelationMismatchDoesNotMakeNetUnreconciled(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+	blue := createTestInvoice(t, store, testInvoiceInput("void-red-first-blue", "BLUE-VOID-RED-FIRST", InvoiceBlue, 100))
+	redInput := testInvoiceInput("void-red-first-red", "RED-VOID-RED-FIRST", InvoiceRed, 20)
+	redInput.RelatedInvoiceNumber = blue.InvoiceNumber
+	red := createTestInvoice(t, store, redInput)
+
+	redVoidAudit := testMutationAudit(actionInvoiceVoid)
+	redVoidAudit.IdempotencyKey = "void-red-first-red-operation"
+	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: red.ID, Reason: "red invoice was voided first", IdempotencyKey: redVoidAudit.IdempotencyKey,
+	}, redVoidAudit); err != nil {
+		t.Fatalf("void red invoice: %v", err)
+	}
+	blueVoidAudit := testMutationAudit(actionInvoiceVoid)
+	blueVoidAudit.IdempotencyKey = "void-red-first-blue-operation"
+	if _, _, err := store.VoidInvoiceAudited(ctx, InvoiceVoidInput{
+		ID: blue.ID, Reason: "blue invoice was voided after its red invoice", IdempotencyKey: blueVoidAudit.IdempotencyKey,
+	}, blueVoidAudit); err != nil {
+		t.Fatalf("void blue invoice: %v", err)
+	}
+
+	reloaded, err := store.GetInvoice(ctx, red.ID)
+	if err != nil || reloaded.Document.RelationState != InvoiceRelationUnreconciled {
+		t.Fatalf("voided red relation = %+v, %v", reloaded, err)
+	}
+	summary, err := store.InvoiceSummary(ctx, InvoiceSummaryFilter{})
+	if err != nil || len(summary.Groups) != 1 {
+		t.Fatalf("summary after both voids = %+v, %v", summary, err)
+	}
+	group := summary.Groups[0]
+	if group.NetIssuedMinor == nil || *group.NetIssuedMinor != "0" || group.SourceHealth != "ok" ||
+		group.UnreconciledCount != 0 || group.AnomalyCount != 0 || group.EffectiveCount != 0 ||
+		group.VoidedCount != 2 || group.VoidedBlueMinor != "100" || group.VoidedRedMinor != "20" ||
+		summary.SourceHealth != "ok" || summary.UnreconciledCount != 0 || summary.AnomalyCount != 0 {
+		t.Fatalf("voided-only relation mismatch corrupted net trust: group=%+v overall=%+v", group, summary)
+	}
+}
+
+func TestConcurrentRedInvoicesAcrossStoresCannotExceedOriginal(t *testing.T) {
+	first, path := newTestStore(t)
+	second, err := Init(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	blue := createTestInvoice(t, first, testInvoiceInput("concurrent-red-blue", "BLUE-CONCURRENT-RED", InvoiceBlue, 100))
+
+	stores := []*Store{first, second}
+	keys := []string{"concurrent-red-a", "concurrent-red-b"}
+	numbers := []string{"RED-CONCURRENT-A", "RED-CONCURRENT-B"}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wait sync.WaitGroup
+	for index := range stores {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			input := testInvoiceInput(keys[index], numbers[index], InvoiceRed, 60)
+			input.RelatedInvoiceNumber = blue.InvoiceNumber
+			audit := testMutationAudit(actionInvoiceCreate)
+			audit.IdempotencyKey = input.IdempotencyKey
+			_, _, callErr := stores[index].CreateInvoiceAudited(context.Background(), input, audit)
+			results <- callErr
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	succeeded, rejected := 0, 0
+	for callErr := range results {
+		switch {
+		case callErr == nil:
+			succeeded++
+		case errors.Is(callErr, ErrConflict):
+			rejected++
+		default:
+			t.Fatalf("concurrent red error = %v", callErr)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("concurrent red succeeded=%d rejected=%d", succeeded, rejected)
+	}
+	summary, err := first.InvoiceSummary(context.Background(), InvoiceSummaryFilter{})
+	if err != nil || len(summary.Groups) != 1 || summary.Groups[0].NetIssuedMinor == nil ||
+		*summary.Groups[0].NetIssuedMinor != "40" || summary.Groups[0].RedIssuedMinor != "60" {
+		t.Fatalf("concurrent red summary = %+v, %v", summary, err)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+var ErrModelProbeBudgetExceeded = errors.New("toolstore: model probe daily budget exceeded")
+
 type ModelProbeRun struct {
 	ID                 int64      `json:"id"`
 	RunKey             string     `json:"run_key"`
@@ -72,6 +74,7 @@ type ModelProbeAttempt struct {
 }
 
 type ModelProbeAttemptInput struct {
+	LifecycleID         int64
 	RunID               int64
 	ModelName           string
 	Capability          string
@@ -88,6 +91,35 @@ type ModelProbeAttemptInput struct {
 	ResponseSHA256      string
 	StartedAt           time.Time
 	FinishedAt          time.Time
+}
+
+// ModelProbeAttemptPlan is the durable pre-flight decision for one requested
+// model. Supported capabilities reserve budget; unsupported capabilities are
+// recorded as skipped without consuming the network budget.
+type ModelProbeAttemptPlan struct {
+	ModelName  string
+	Capability string
+}
+
+// ModelProbeAttemptLifecycle is the durable source of truth for whether a
+// probe could have consumed upstream budget. Terminal uncertain rows continue
+// to consume budget because the process cannot prove that no request was sent.
+type ModelProbeAttemptLifecycle struct {
+	ID             int64      `json:"id"`
+	RunID          int64      `json:"run_id"`
+	AttemptIndex   int        `json:"attempt_index"`
+	ModelName      string     `json:"model_name"`
+	Capability     string     `json:"capability"`
+	LifecycleState string     `json:"lifecycle_state"`
+	BudgetDay      time.Time  `json:"budget_day"`
+	ReservedAt     *time.Time `json:"reserved_at,omitempty"`
+	SentAt         *time.Time `json:"sent_at,omitempty"`
+	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+	AttemptID      *int64     `json:"attempt_id,omitempty"`
+	ErrorCode      string     `json:"error_code,omitempty"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 type ModelProbeSummary struct {
@@ -142,6 +174,159 @@ func (s *Store) CreateModelProbeRun(ctx context.Context, input ModelProbeRunInpu
 	}
 	created, err := s.getModelProbeRun(ctx, id)
 	return created, false, err
+}
+
+// CreateModelProbeRunWithBudget atomically checks the UTC-day budget, creates
+// the run, and persists one lifecycle row per requested model. BEGIN IMMEDIATE
+// is intentional: independent Store instances must serialize the budget read
+// with the reservation writes instead of racing through deferred transactions.
+func (s *Store) CreateModelProbeRunWithBudget(
+	ctx context.Context,
+	input ModelProbeRunInput,
+	plans []ModelProbeAttemptPlan,
+	budgetDay time.Time,
+	dailyBudget int,
+) (ModelProbeRun, []ModelProbeAttemptLifecycle, bool, error) {
+	if s == nil || s.db == nil {
+		return ModelProbeRun{}, nil, false, ErrStoreClosed
+	}
+	input.RunKey = strings.TrimSpace(input.RunKey)
+	input.RequestFingerprint = strings.ToLower(strings.TrimSpace(input.RequestFingerprint))
+	input.TriggerKind = strings.TrimSpace(input.TriggerKind)
+	input.Actor = strings.TrimSpace(input.Actor)
+	if input.StartedAt.IsZero() {
+		input.StartedAt = s.clock()
+	}
+	if len(input.RunKey) < 8 || len(input.RunKey) > 256 || !validSHA256(input.RequestFingerprint) ||
+		(input.TriggerKind != "scheduled" && input.TriggerKind != "manual") ||
+		input.Actor == "" || len(input.Actor) > 256 || input.RequestedCount < 0 ||
+		len(plans) != input.RequestedCount || dailyBudget < 0 {
+		return ModelProbeRun{}, nil, false, ErrInvalid
+	}
+	for index := range plans {
+		plans[index].ModelName = strings.TrimSpace(plans[index].ModelName)
+		plans[index].Capability = strings.TrimSpace(plans[index].Capability)
+		if plans[index].ModelName == "" || len(plans[index].ModelName) > 256 ||
+			!validProbeCapability(plans[index].Capability) {
+			return ModelProbeRun{}, nil, false, ErrInvalid
+		}
+	}
+	startedBudgetDay := startOfProbeBudgetDay(input.StartedAt)
+	budgetDay = startOfProbeBudgetDay(budgetDay)
+	if budgetDay.IsZero() {
+		budgetDay = startedBudgetDay
+	}
+	if !budgetDay.Equal(startedBudgetDay) {
+		return ModelProbeRun{}, nil, false, ErrInvalid
+	}
+	networkBound := 0
+	for _, plan := range plans {
+		if plan.Capability != "unsupported" {
+			networkBound++
+		}
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("acquire model probe budget connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("begin immediate model probe budget reservation: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	var existingID int64
+	var existingFingerprint, existingTrigger, existingActor string
+	var existingRequested int
+	err = conn.QueryRowContext(ctx, `SELECT id, request_fingerprint, trigger_kind, actor, requested_count
+		FROM model_probe_runs WHERE run_key = ?`, input.RunKey).
+		Scan(&existingID, &existingFingerprint, &existingTrigger, &existingActor, &existingRequested)
+	if err == nil {
+		if existingFingerprint != input.RequestFingerprint || existingTrigger != input.TriggerKind ||
+			existingActor != input.Actor || existingRequested != input.RequestedCount {
+			return ModelProbeRun{}, nil, false, ErrConflict
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return ModelProbeRun{}, nil, false, fmt.Errorf("commit replayed model probe budget reservation: %w", err)
+		}
+		committed = true
+		if err := conn.Close(); err != nil {
+			return ModelProbeRun{}, nil, false, fmt.Errorf("release replayed model probe budget connection: %w", err)
+		}
+		run, getErr := s.getModelProbeRun(ctx, existingID)
+		if getErr != nil {
+			return ModelProbeRun{}, nil, false, getErr
+		}
+		lifecycles, getErr := s.ListModelProbeAttemptLifecycles(ctx, existingID)
+		return run, lifecycles, true, getErr
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("inspect model probe budget replay: %w", err)
+	}
+
+	var used int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_probe_attempt_lifecycles
+		WHERE budget_day = ? AND lifecycle_state IN ('reserved', 'sent', 'settled', 'uncertain')`,
+		dbTime(budgetDay)).Scan(&used); err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("count model probe budget reservations: %w", err)
+	}
+	if used+networkBound > dailyBudget {
+		return ModelProbeRun{}, nil, false, ErrModelProbeBudgetExceeded
+	}
+
+	now := s.clock()
+	result, err := conn.ExecContext(ctx, `INSERT INTO model_probe_runs(
+		run_key, request_fingerprint, trigger_kind, actor, status, requested_count,
+		started_at, created_at, updated_at
+	) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
+		input.RunKey, input.RequestFingerprint, input.TriggerKind, input.Actor,
+		input.RequestedCount, dbTime(input.StartedAt), dbTime(now), dbTime(now))
+	if err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("create budgeted model probe run: %w", err)
+	}
+	runID, err := result.LastInsertId()
+	if err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("read budgeted model probe run id: %w", err)
+	}
+	for index, plan := range plans {
+		state := "reserved"
+		var reservedAt, finishedAt any = dbTime(input.StartedAt), nil
+		errorCode, errorMessage := "", ""
+		if plan.Capability == "unsupported" {
+			state = "skipped"
+			reservedAt = nil
+			finishedAt = dbTime(input.StartedAt)
+			errorCode = "unsupported_capability"
+			errorMessage = "Model capability is intentionally not probed"
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO model_probe_attempt_lifecycles(
+			run_id, attempt_index, model_name, capability, lifecycle_state, budget_day,
+			reserved_at, sent_at, finished_at, error_code, error_message, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+			runID, index, plan.ModelName, plan.Capability, state, dbTime(budgetDay),
+			reservedAt, finishedAt, errorCode, errorMessage, dbTime(now), dbTime(now)); err != nil {
+			return ModelProbeRun{}, nil, false, fmt.Errorf("reserve model probe attempt %d: %w", index, err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("commit model probe budget reservation: %w", err)
+	}
+	committed = true
+	if err := conn.Close(); err != nil {
+		return ModelProbeRun{}, nil, false, fmt.Errorf("release model probe budget connection: %w", err)
+	}
+	run, err := s.getModelProbeRun(ctx, runID)
+	if err != nil {
+		return ModelProbeRun{}, nil, false, err
+	}
+	lifecycles, err := s.ListModelProbeAttemptLifecycles(ctx, runID)
+	return run, lifecycles, false, err
 }
 
 func (s *Store) GetModelProbeRunByKey(ctx context.Context, runKey string) (ModelProbeRun, error) {
@@ -206,6 +391,159 @@ func (s *Store) getModelProbeRun(ctx context.Context, id int64) (ModelProbeRun, 
 	return run, nil
 }
 
+func (s *Store) ListModelProbeAttemptLifecycles(ctx context.Context, runID int64) ([]ModelProbeAttemptLifecycle, error) {
+	if s == nil || s.db == nil {
+		return nil, ErrStoreClosed
+	}
+	if runID <= 0 {
+		return nil, ErrInvalid
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, run_id, attempt_index, model_name, capability,
+		lifecycle_state, budget_day, reserved_at, sent_at, finished_at, attempt_id,
+		error_code, error_message, created_at, updated_at
+		FROM model_probe_attempt_lifecycles WHERE run_id = ? ORDER BY attempt_index`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list model probe attempt lifecycles: %w", err)
+	}
+	defer rows.Close()
+	result := make([]ModelProbeAttemptLifecycle, 0)
+	for rows.Next() {
+		item, err := scanModelProbeAttemptLifecycle(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate model probe attempt lifecycles: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) getModelProbeAttemptLifecycle(ctx context.Context, id int64) (ModelProbeAttemptLifecycle, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, run_id, attempt_index, model_name, capability,
+		lifecycle_state, budget_day, reserved_at, sent_at, finished_at, attempt_id,
+		error_code, error_message, created_at, updated_at
+		FROM model_probe_attempt_lifecycles WHERE id = ?`, id)
+	item, err := scanModelProbeAttemptLifecycle(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ModelProbeAttemptLifecycle{}, ErrNotFound
+	}
+	return item, err
+}
+
+// MarkModelProbeAttemptSent is the final durable gate before network I/O. A
+// caller must not send when this transition fails.
+func (s *Store) MarkModelProbeAttemptSent(ctx context.Context, id int64, sentAt time.Time) (ModelProbeAttemptLifecycle, error) {
+	if s == nil || s.db == nil {
+		return ModelProbeAttemptLifecycle{}, ErrStoreClosed
+	}
+	if id <= 0 {
+		return ModelProbeAttemptLifecycle{}, ErrInvalid
+	}
+	if sentAt.IsZero() {
+		sentAt = s.clock()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+		lifecycle_state = 'sent', sent_at = MAX(?, reserved_at), updated_at = MAX(?, updated_at)
+		WHERE id = ? AND lifecycle_state = 'reserved'`, dbTime(sentAt), dbTime(s.clock()), id)
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("mark model probe attempt sent: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("read sent model probe attempt count: %w", err)
+	}
+	if rows != 1 {
+		return ModelProbeAttemptLifecycle{}, ErrConflict
+	}
+	return s.getModelProbeAttemptLifecycle(ctx, id)
+}
+
+// SkipReservedModelProbeAttempt releases budget only while the attempt is
+// provably pre-send. A sent attempt can never transition to skipped.
+func (s *Store) SkipReservedModelProbeAttempt(ctx context.Context, id int64, code, message string, finishedAt time.Time) (ModelProbeAttemptLifecycle, error) {
+	if s == nil || s.db == nil {
+		return ModelProbeAttemptLifecycle{}, ErrStoreClosed
+	}
+	code = strings.TrimSpace(code)
+	message = truncateText(message, 512)
+	if id <= 0 || len(code) > 64 {
+		return ModelProbeAttemptLifecycle{}, ErrInvalid
+	}
+	if finishedAt.IsZero() {
+		finishedAt = s.clock()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+		lifecycle_state = 'skipped', finished_at = MAX(?, reserved_at),
+		error_code = ?, error_message = ?, updated_at = MAX(?, updated_at)
+		WHERE id = ? AND lifecycle_state = 'reserved'`,
+		dbTime(finishedAt), code, message, dbTime(s.clock()), id)
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("skip reserved model probe attempt: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("read skipped model probe attempt count: %w", err)
+	}
+	if rows != 1 {
+		return ModelProbeAttemptLifecycle{}, ErrConflict
+	}
+	return s.getModelProbeAttemptLifecycle(ctx, id)
+}
+
+// MarkModelProbeAttemptUncertain conservatively consumes budget when the
+// caller cannot prove whether a reserved/sent request completed.
+func (s *Store) MarkModelProbeAttemptUncertain(ctx context.Context, id int64, code, message string, finishedAt time.Time) (ModelProbeAttemptLifecycle, error) {
+	if s == nil || s.db == nil {
+		return ModelProbeAttemptLifecycle{}, ErrStoreClosed
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		code = "probe_result_uncertain"
+	}
+	message = truncateText(message, 512)
+	if id <= 0 || len(code) > 64 {
+		return ModelProbeAttemptLifecycle{}, ErrInvalid
+	}
+	if finishedAt.IsZero() {
+		finishedAt = s.clock()
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+		lifecycle_state = 'uncertain', finished_at = MAX(?, COALESCE(sent_at, reserved_at)),
+		error_code = ?, error_message = ?, updated_at = MAX(?, updated_at)
+		WHERE id = ? AND lifecycle_state IN ('reserved', 'sent')`,
+		dbTime(finishedAt), code, message, dbTime(s.clock()), id)
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("mark model probe attempt uncertain: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("read uncertain model probe attempt count: %w", err)
+	}
+	if rows != 1 {
+		return ModelProbeAttemptLifecycle{}, ErrConflict
+	}
+	return s.getModelProbeAttemptLifecycle(ctx, id)
+}
+
+func (s *Store) CountModelProbeBudgetUsed(ctx context.Context, budgetDay time.Time) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, ErrStoreClosed
+	}
+	budgetDay = startOfProbeBudgetDay(budgetDay)
+	if budgetDay.IsZero() {
+		return 0, ErrInvalid
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_probe_attempt_lifecycles
+		WHERE budget_day = ? AND lifecycle_state IN ('reserved', 'sent', 'settled', 'uncertain')`,
+		dbTime(budgetDay)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count model probe budget used: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) FinishModelProbeRun(ctx context.Context, input ModelProbeRunFinish) (ModelProbeRun, error) {
 	if s == nil || s.db == nil {
 		return ModelProbeRun{}, ErrStoreClosed
@@ -238,23 +576,39 @@ func (s *Store) FinishModelProbeRun(ctx context.Context, input ModelProbeRunFini
 	return s.getModelProbeRun(ctx, input.ID)
 }
 
-// CancelInterruptedModelProbeRuns reconciles runs left in the running state by
-// a previous process. The caller must pass the current process start time so a
-// run created by this process can never be selected. v0.6 only supports one
-// active scheduler instance; a distributed lease is required before enabling
-// active probes in more than one process.
-func (s *Store) CancelInterruptedModelProbeRuns(ctx context.Context, processStartedAt time.Time) (int64, error) {
+// CancelInterruptedModelProbeRuns reconciles runs older than staleBefore. The
+// caller must choose a cutoff that exceeds the maximum legitimate run duration
+// so starting a second live instance cannot cancel the first instance's work.
+// Every reserved/sent row becomes terminal uncertain before the run is
+// cancelled, so delayed crash recovery never releases possibly consumed budget.
+func (s *Store) CancelInterruptedModelProbeRuns(ctx context.Context, staleBefore time.Time) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, ErrStoreClosed
 	}
-	if processStartedAt.IsZero() {
+	if staleBefore.IsZero() {
 		return 0, ErrInvalid
 	}
 	finishedAt := s.clock()
-	if finishedAt.Before(processStartedAt) {
-		finishedAt = processStartedAt
+	if finishedAt.Before(staleBefore) {
+		finishedAt = staleBefore
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE model_probe_runs SET
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin interrupted model probe recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+		lifecycle_state = 'uncertain',
+		finished_at = MAX(?, COALESCE(sent_at, reserved_at)),
+		error_code = 'process_restarted',
+		error_message = 'Probe attempt state was uncertain after process restart',
+		updated_at = MAX(?, updated_at)
+		WHERE lifecycle_state IN ('reserved', 'sent') AND run_id IN (
+			SELECT id FROM model_probe_runs WHERE status = 'running' AND started_at < ?
+		)`, dbTime(finishedAt), dbTime(finishedAt), dbTime(staleBefore)); err != nil {
+		return 0, fmt.Errorf("reconcile interrupted model probe attempts: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE model_probe_runs SET
 		status = 'cancelled',
 		attempted_count = (SELECT COUNT(*) FROM model_probe_attempts WHERE run_id = model_probe_runs.id),
 		success_count = (SELECT COUNT(*) FROM model_probe_attempts WHERE run_id = model_probe_runs.id AND outcome = 'success'),
@@ -264,13 +618,16 @@ func (s *Store) CancelInterruptedModelProbeRuns(ctx context.Context, processStar
 		error_message = 'Probe run was interrupted before the current process started',
 		finished_at = ?, updated_at = ?
 		WHERE status = 'running' AND started_at < ?`,
-		dbTime(finishedAt), dbTime(finishedAt), dbTime(processStartedAt))
+		dbTime(finishedAt), dbTime(finishedAt), dbTime(staleBefore))
 	if err != nil {
 		return 0, fmt.Errorf("cancel interrupted model probe runs: %w", err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("read interrupted model probe run count: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit interrupted model probe recovery: %w", err)
 	}
 	return count, nil
 }
@@ -286,7 +643,7 @@ func (s *Store) AppendModelProbeAttempt(ctx context.Context, input ModelProbeAtt
 	input.ErrorCode = strings.TrimSpace(input.ErrorCode)
 	input.ErrorMessage = truncateText(input.ErrorMessage, 512)
 	input.ResponseSHA256 = strings.ToLower(strings.TrimSpace(input.ResponseSHA256))
-	if input.RunID <= 0 || input.ModelName == "" || len(input.ModelName) > 256 ||
+	if input.LifecycleID < 0 || input.RunID <= 0 || input.ModelName == "" || len(input.ModelName) > 256 ||
 		!validProbeCapability(input.Capability) || len(input.Endpoint) > 128 ||
 		!validProbeOutcome(input.Outcome) || input.HTTPStatus < 0 || input.HTTPStatus > 599 ||
 		input.TotalLatencyMS < 0 || len(input.ErrorCode) > 64 ||
@@ -306,6 +663,27 @@ func (s *Store) AppendModelProbeAttempt(ctx context.Context, input ModelProbeAtt
 		return ModelProbeAttempt{}, fmt.Errorf("begin model probe attempt: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if input.LifecycleID > 0 {
+		var lifecycleRunID int64
+		var lifecycleModel, lifecycleCapability, lifecycleState string
+		var existingAttempt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT run_id, model_name, capability, lifecycle_state, attempt_id
+			FROM model_probe_attempt_lifecycles WHERE id = ?`, input.LifecycleID).
+			Scan(&lifecycleRunID, &lifecycleModel, &lifecycleCapability, &lifecycleState, &existingAttempt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ModelProbeAttempt{}, ErrNotFound
+			}
+			return ModelProbeAttempt{}, fmt.Errorf("read model probe attempt lifecycle: %w", err)
+		}
+		wantedState := "sent"
+		if input.Outcome == "skipped" {
+			wantedState = "skipped"
+		}
+		if lifecycleRunID != input.RunID || lifecycleModel != input.ModelName ||
+			lifecycleCapability != input.Capability || lifecycleState != wantedState || existingAttempt.Valid {
+			return ModelProbeAttempt{}, ErrConflict
+		}
+	}
 	now := s.clock()
 	result, err := tx.ExecContext(ctx, `INSERT INTO model_probe_attempts(
 		run_id, model_name, capability, endpoint, outcome, protocol_success, semantic_success,
@@ -364,6 +742,32 @@ func (s *Store) AppendModelProbeAttempt(ctx context.Context, input ModelProbeAtt
 	if err != nil {
 		return ModelProbeAttempt{}, fmt.Errorf("roll up model probe attempt: %w", err)
 	}
+	if input.LifecycleID > 0 {
+		var lifecycleResult sql.Result
+		if input.Outcome == "skipped" {
+			lifecycleResult, err = tx.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+				attempt_id = ?, updated_at = MAX(?, updated_at)
+				WHERE id = ? AND lifecycle_state = 'skipped' AND attempt_id IS NULL`,
+				id, dbTime(now), input.LifecycleID)
+		} else {
+			lifecycleResult, err = tx.ExecContext(ctx, `UPDATE model_probe_attempt_lifecycles SET
+				lifecycle_state = 'settled', finished_at = ?, attempt_id = ?,
+				error_code = ?, error_message = ?, updated_at = MAX(?, updated_at)
+				WHERE id = ? AND lifecycle_state = 'sent' AND attempt_id IS NULL`,
+				dbTime(input.FinishedAt), id, input.ErrorCode, input.ErrorMessage,
+				dbTime(now), input.LifecycleID)
+		}
+		if err != nil {
+			return ModelProbeAttempt{}, fmt.Errorf("settle model probe attempt lifecycle: %w", err)
+		}
+		rows, err := lifecycleResult.RowsAffected()
+		if err != nil {
+			return ModelProbeAttempt{}, fmt.Errorf("read settled model probe attempt lifecycle count: %w", err)
+		}
+		if rows != 1 {
+			return ModelProbeAttempt{}, ErrConflict
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return ModelProbeAttempt{}, fmt.Errorf("commit model probe attempt: %w", err)
 	}
@@ -415,7 +819,11 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan model probe summary: %w", err)
 		}
-		item := summaries[model]
+		item, err := modelProbeSummaryFor(summaries, model)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
 		item.AttemptCount, item.SuccessCount, item.FailureCount, item.SkippedCount = attempts, successes, failures, skipped
 		item.AverageHeaderLatencyMS = averageInt64(headerSum, headerSamples)
 		item.AverageFirstTokenMS = averageInt64(firstSum, firstSamples)
@@ -448,7 +856,12 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 			_ = latestRows.Close()
 			return nil, err
 		}
-		summaries[attempt.ModelName].Latest = &attempt
+		item, err := modelProbeSummaryFor(summaries, attempt.ModelName)
+		if err != nil {
+			_ = latestRows.Close()
+			return nil, err
+		}
+		item.Latest = &attempt
 	}
 	if err := latestRows.Close(); err != nil {
 		return nil, fmt.Errorf("close latest model probe rows: %w", err)
@@ -459,9 +872,21 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 
 	result := make([]ModelProbeSummary, 0, len(models))
 	for _, model := range models {
-		result = append(result, *summaries[model])
+		item, err := modelProbeSummaryFor(summaries, model)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *item)
 	}
 	return result, nil
+}
+
+func modelProbeSummaryFor(summaries map[string]*ModelProbeSummary, model string) (*ModelProbeSummary, error) {
+	item, exists := summaries[model]
+	if !exists || item == nil {
+		return nil, fmt.Errorf("model probe summary query returned unexpected model %q", model)
+	}
+	return item, nil
 }
 
 func (s *Store) ListModelProbeHistory(ctx context.Context, model string, limit int) ([]ModelProbeAttempt, error) {
@@ -571,6 +996,39 @@ func scanModelProbeAttempt(scanner modelProbeScanner) (ModelProbeAttempt, error)
 	return attempt, nil
 }
 
+func scanModelProbeAttemptLifecycle(scanner modelProbeScanner) (ModelProbeAttemptLifecycle, error) {
+	var item ModelProbeAttemptLifecycle
+	var budgetDay, createdAt, updatedAt int64
+	var reservedAt, sentAt, finishedAt, attemptID sql.NullInt64
+	if err := scanner.Scan(
+		&item.ID, &item.RunID, &item.AttemptIndex, &item.ModelName, &item.Capability,
+		&item.LifecycleState, &budgetDay, &reservedAt, &sentAt, &finishedAt, &attemptID,
+		&item.ErrorCode, &item.ErrorMessage, &createdAt, &updatedAt,
+	); err != nil {
+		return ModelProbeAttemptLifecycle{}, fmt.Errorf("scan model probe attempt lifecycle: %w", err)
+	}
+	item.BudgetDay = fromDBTime(budgetDay)
+	item.CreatedAt = fromDBTime(createdAt)
+	item.UpdatedAt = fromDBTime(updatedAt)
+	if reservedAt.Valid {
+		value := fromDBTime(reservedAt.Int64)
+		item.ReservedAt = &value
+	}
+	if sentAt.Valid {
+		value := fromDBTime(sentAt.Int64)
+		item.SentAt = &value
+	}
+	if finishedAt.Valid {
+		value := fromDBTime(finishedAt.Int64)
+		item.FinishedAt = &value
+	}
+	if attemptID.Valid {
+		value := attemptID.Int64
+		item.AttemptID = &value
+	}
+	return item, nil
+}
+
 func validProbeRunStatus(value string) bool {
 	switch value {
 	case "running", "succeeded", "partial", "failed", "skipped", "cancelled":
@@ -662,4 +1120,12 @@ func uniqueProbeModels(values []string) []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+func startOfProbeBudgetDay(value time.Time) time.Time {
+	if value.IsZero() {
+		return time.Time{}
+	}
+	year, month, day := value.UTC().Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 }

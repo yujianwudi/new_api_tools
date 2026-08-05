@@ -45,11 +45,14 @@ import {
   invoiceErrorMessage,
   invoiceFilterParams,
   InvoiceApiError,
+  isTrustworthyInvoiceSummaryGroup,
   sha256Utf8,
   sourceFreshness,
+  trustworthyNetIssuedMinor,
   validateInvoiceFilters,
   type InvoiceFilters,
   type InvoiceSummaryGroup,
+  type InvoiceSummarySourceHealth,
   type MinorAmount,
 } from '../lib/invoices'
 import { cn } from '../lib/utils'
@@ -75,6 +78,9 @@ interface InvoiceDocument {
   invoice_number: string
   document_kind: 'blue' | 'red'
   related_invoice_number?: string | null
+  related_invoice_id?: number | null
+  relation_state?: 'not_applicable' | 'verified' | 'unreconciled' | string
+  relation_reason?: string | null
   seller_entity: string
   buyer_name: string
   buyer_tax_id?: string | null
@@ -115,7 +121,7 @@ interface InvoiceCapabilities {
 interface SummaryData {
   groups: InvoiceSummaryGroup[]
   generated_at: string
-  source_health?: { status?: string; message?: string }
+  source_health?: InvoiceSummarySourceHealth & { message?: string }
   capabilities?: InvoiceCapabilities
 }
 
@@ -173,6 +179,7 @@ const EMPTY_MANUAL_FORM = {
   invoice_number: '',
   document_kind: 'blue' as 'blue' | 'red',
   related_invoice_number: '',
+  related_invoice_id: '',
   seller_entity: '',
   buyer_name: '',
   buyer_tax_id: '',
@@ -640,9 +647,11 @@ export function Invoices() {
       }
       if (!manualForm.issued_at) throw new Error('请选择开票时间')
       if (!manualForm.reason.trim()) throw new Error('登记原因不能为空')
-      if (manualForm.document_kind === 'red' && !manualForm.related_invoice_number.trim()) throw new Error('红字发票必须填写关联原票号')
-      if (manualForm.document_kind === 'blue' && manualForm.related_invoice_number.trim()) throw new Error('蓝票不能填写关联原票号')
+      if (manualForm.document_kind === 'red' && !manualForm.related_invoice_number.trim() && !manualForm.related_invoice_id.trim()) throw new Error('红字发票必须填写关联原票 ID 或原票号')
+      if (manualForm.document_kind === 'blue' && (manualForm.related_invoice_number.trim() || manualForm.related_invoice_id.trim())) throw new Error('蓝票不能填写关联原票')
       if (manualForm.related_invoice_number.trim() === manualForm.invoice_number.trim()) throw new Error('关联原票号不能与当前发票号相同')
+      const relatedInvoiceID = manualForm.related_invoice_id.trim() ? Number(manualForm.related_invoice_id.trim()) : undefined
+      if (relatedInvoiceID !== undefined && (!Number.isSafeInteger(relatedInvoiceID) || relatedInvoiceID < 1)) throw new Error('关联原票 ID 必须是正整数')
       if (!/^[A-Za-z]{3}$/.test(manualForm.currency.trim())) throw new Error('币种必须是 3 位字母代码，例如 CNY')
       const scale = Number(manualForm.minor_unit_scale)
       if (!Number.isInteger(scale) || scale < 0 || scale > 9) throw new Error('小数位必须是 0–9 的整数')
@@ -653,6 +662,7 @@ export function Invoices() {
         invoice_number: manualForm.invoice_number.trim(),
         document_kind: manualForm.document_kind,
         related_invoice_number: manualForm.document_kind === 'red' ? manualForm.related_invoice_number.trim() : undefined,
+        related_invoice_id: manualForm.document_kind === 'red' ? relatedInvoiceID : undefined,
         seller_entity: manualForm.seller_entity.trim(),
         buyer_name: manualForm.buyer_name.trim(),
         buyer_tax_id: manualForm.buyer_tax_id.trim() || undefined,
@@ -915,22 +925,26 @@ export function Invoices() {
         <Card><CardContent className="py-14 text-center"><ReceiptText className="mx-auto mb-3 h-9 w-9 text-muted-foreground" /><p className="font-medium">暂无发票统计</p><p className="mt-1 text-sm text-muted-foreground">数据源可用，但当前筛选范围没有发票记录。</p></CardContent></Card>
       ) : (
         <div className="space-y-5">
-          {summary?.groups.map(group => (
-            <section key={`${group.currency}-${group.minor_unit_scale}`} className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Badge variant="outline" className="font-mono">{group.currency}</Badge>
-                <span className="text-xs text-muted-foreground">所有金额均来自后端最小货币单位，未在浏览器浮点汇总</span>
-              </div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                <StatCard title="蓝票开具金额" value={formatMinorAmount(group.blue_issued_minor, group.currency, group.minor_unit_scale)} subValue="当前有效蓝票金额" icon={FileText} color="blue" />
-                <StatCard title="红字发票金额" value={formatMinorAmount(group.red_issued_minor, group.currency, group.minor_unit_scale)} subValue="当前有效红票冲减金额" icon={RotateCcw} color="rose" />
-                <StatCard title="作废金额" value={formatMinorAmount(group.voided_minor, group.currency, group.minor_unit_scale)} subValue={`${group.voided_count} 张已作废`} icon={Ban} color="orange" />
-                <StatCard title="净已开票金额" value={formatMinorAmount(group.net_issued_minor, group.currency, group.minor_unit_scale)} subValue="蓝票扣除作废/冲减后的后端口径" icon={CircleDollarSign} color="emerald" />
-                <StatCard title="有效发票张数" value={effectiveInvoiceCount(group) === null ? '未提供' : `${effectiveInvoiceCount(group)} 张`} subValue="不包含已作废记录" icon={BadgeCheck} color="green" />
-                <StatCard title="异常记录" value={group.anomaly_count === undefined ? '未提供' : `${group.anomaly_count} 条`} subValue={group.anomaly_count === undefined ? '等待对账模块提供异常口径' : '需要人工核对'} icon={AlertTriangle} color="amber" />
-              </div>
-            </section>
-          ))}
+          {summary?.groups.map(group => {
+            const netIssuedTrustworthy = isTrustworthyInvoiceSummaryGroup(group, summary.source_health)
+            const unreconciledCount = group.unreconciled_count ?? summary.source_health?.unreconciled_count
+            return (
+              <section key={`${group.currency}-${group.minor_unit_scale}`} className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="font-mono">{group.currency}</Badge>
+                  <span className="text-xs text-muted-foreground">所有金额均来自后端最小货币单位，未在浏览器浮点汇总</span>
+                </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                  <StatCard title="蓝票开具金额" value={formatMinorAmount(group.blue_issued_minor, group.currency, group.minor_unit_scale)} subValue="当前有效蓝票金额" icon={FileText} color="blue" />
+                  <StatCard title="红字发票金额" value={formatMinorAmount(group.red_issued_minor, group.currency, group.minor_unit_scale)} subValue="当前有效红票冲减金额" icon={RotateCcw} color="rose" />
+                  <StatCard title="作废金额" value={formatMinorAmount(group.voided_minor, group.currency, group.minor_unit_scale)} subValue={`${group.voided_count} 张已作废`} icon={Ban} color="orange" />
+                  <StatCard title="净已开票金额" value={formatMinorAmount(trustworthyNetIssuedMinor(group, summary.source_health), group.currency, group.minor_unit_scale)} subValue={netIssuedTrustworthy ? '蓝票扣除作废/冲减后的后端口径' : `未对账或证据异常${Number.isSafeInteger(unreconciledCount) && (unreconciledCount as number) > 0 ? `，${unreconciledCount} 条关系待核验` : ''}`} icon={CircleDollarSign} color={netIssuedTrustworthy ? 'emerald' : 'amber'} />
+                  <StatCard title="有效发票张数" value={effectiveInvoiceCount(group) === null ? '未提供' : `${effectiveInvoiceCount(group)} 张`} subValue="不包含已作废记录" icon={BadgeCheck} color="green" />
+                  <StatCard title="异常记录" value={group.anomaly_count === undefined ? '未提供' : `${group.anomaly_count} 条`} subValue={group.anomaly_count === undefined ? '等待对账模块提供异常口径' : '需要人工核对'} icon={AlertTriangle} color="amber" />
+                </div>
+              </section>
+            )
+          })}
         </div>
       )}
 
@@ -977,14 +991,14 @@ export function Invoices() {
       <Dialog open={detailOpen} onOpenChange={open => { if (!open) closeDetail() }}><DialogContent className="max-w-3xl"><DialogHeader><DialogTitle>发票详情</DialogTitle><DialogDescription>敏感税号默认脱敏，完整值不写入前端日志。</DialogDescription></DialogHeader>
         {detailLoading && <div className="flex justify-center py-10" role="status" aria-live="polite"><Loader2 className="h-7 w-7 animate-spin" /><span className="sr-only">正在加载发票详情</span></div>}
         {detailError && <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{detailError}</div>}
-        {detail?.document && <div className="space-y-5"><div className="grid grid-cols-1 gap-3 rounded-xl border bg-muted/20 p-4 sm:grid-cols-2"><div><p className="text-xs text-muted-foreground">发票号</p><p className="font-mono font-medium">{detail.document.invoice_number}</p></div><div><p className="text-xs text-muted-foreground">类型 / 状态</p><div className="flex gap-2"><Badge variant={detail.document.document_kind === 'red' ? 'destructive' : 'outline'}>{detail.document.document_kind === 'red' ? '红票' : '蓝票'}</Badge><Badge variant={statusVariant(detail.document.status)}>{statusLabel(detail.document.status)}</Badge></div></div>{detail.document.related_invoice_number && <div className="sm:col-span-2"><p className="text-xs text-muted-foreground">关联原票号</p><p className="font-mono">{detail.document.related_invoice_number}</p></div>}<div><p className="text-xs text-muted-foreground">销售方</p><p>{detail.document.seller_entity}</p></div><div><p className="text-xs text-muted-foreground">购方</p><p>{detail.document.buyer_name}</p><p className="font-mono text-xs text-muted-foreground">{maskTaxId(detail.document.buyer_tax_id)}</p></div><div><p className="text-xs text-muted-foreground">含税金额</p><p className="font-mono font-semibold">{formatMinorAmount(detail.document.amount_minor, detail.document.currency, detail.document.minor_unit_scale)}</p></div><div><p className="text-xs text-muted-foreground">税额</p><p className="font-mono">{formatMinorAmount(detail.document.tax_amount_minor, detail.document.currency, detail.document.minor_unit_scale)}</p></div><div><p className="text-xs text-muted-foreground">开票时间</p><p>{formatInvoiceTime(detail.document.issued_at)}</p></div><div><p className="text-xs text-muted-foreground">来源</p><p>{detail.document.source || '-'}</p></div>{detail.document.void_reason && <div className="sm:col-span-2"><p className="text-xs text-muted-foreground">作废原因</p><p className="text-destructive">{detail.document.void_reason}</p></div>}</div>
+        {detail?.document && <div className="space-y-5"><div className="grid grid-cols-1 gap-3 rounded-xl border bg-muted/20 p-4 sm:grid-cols-2"><div><p className="text-xs text-muted-foreground">发票号</p><p className="font-mono font-medium">{detail.document.invoice_number}</p></div><div><p className="text-xs text-muted-foreground">类型 / 状态</p><div className="flex gap-2"><Badge variant={detail.document.document_kind === 'red' ? 'destructive' : 'outline'}>{detail.document.document_kind === 'red' ? '红票' : '蓝票'}</Badge><Badge variant={statusVariant(detail.document.status)}>{statusLabel(detail.document.status)}</Badge></div></div>{detail.document.document_kind === 'red' && <div className="sm:col-span-2"><p className="text-xs text-muted-foreground">关联原票</p><p className="font-mono">ID {detail.document.related_invoice_id ?? '未核验'}{detail.document.related_invoice_number ? ` · ${detail.document.related_invoice_number}` : ''}</p><p className="mt-1 text-xs text-muted-foreground">关系状态：{detail.document.relation_state || 'unreconciled'}{detail.document.relation_reason ? ` · ${detail.document.relation_reason}` : ''}</p></div>}<div><p className="text-xs text-muted-foreground">销售方</p><p>{detail.document.seller_entity}</p></div><div><p className="text-xs text-muted-foreground">购方</p><p>{detail.document.buyer_name}</p><p className="font-mono text-xs text-muted-foreground">{maskTaxId(detail.document.buyer_tax_id)}</p></div><div><p className="text-xs text-muted-foreground">含税金额</p><p className="font-mono font-semibold">{formatMinorAmount(detail.document.amount_minor, detail.document.currency, detail.document.minor_unit_scale)}</p></div><div><p className="text-xs text-muted-foreground">税额</p><p className="font-mono">{formatMinorAmount(detail.document.tax_amount_minor, detail.document.currency, detail.document.minor_unit_scale)}</p></div><div><p className="text-xs text-muted-foreground">开票时间</p><p>{formatInvoiceTime(detail.document.issued_at)}</p></div><div><p className="text-xs text-muted-foreground">来源</p><p>{detail.document.source || '-'}</p></div>{detail.document.void_reason && <div className="sm:col-span-2"><p className="text-xs text-muted-foreground">作废原因</p><p className="text-destructive">{detail.document.void_reason}</p></div>}</div>
           <div><h3 className="mb-2 text-sm font-semibold">事件记录</h3>{detail.events.length === 0 ? <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">暂无事件或事件仍在加载。</p> : <div className="space-y-2">{detail.events.map((event, index) => <div key={event.id ?? index} className="flex items-start justify-between gap-4 rounded-lg border p-3 text-sm"><div><p className="font-medium">{event.event_type || event.type || '事件'}</p><p className="text-muted-foreground">{event.reason || '无附加原因'}{event.actor ? ` · ${event.actor}` : ''}</p>{event.details && <div className="mt-2 flex flex-wrap gap-1">{Object.entries(event.details).map(([key, value]) => <Badge key={key} variant="outline" className="font-normal">{key}: {String(value)}</Badge>)}</div>}</div><span className="whitespace-nowrap text-xs text-muted-foreground">{formatInvoiceTime(event.occurred_at || event.created_at)}</span></div>)}</div>}</div>
           {detail.document.status === 'issued' && can('void') && <div className="flex justify-end"><Button variant="destructive" disabled={Boolean(pendingVoid)} onClick={() => setVoidOpen(true)}><Ban className="mr-2 h-4 w-4" />{pendingVoid ? '作废操作待对账' : '作废发票'}</Button></div>}
         </div>}
       </DialogContent></Dialog>
 
       <Dialog open={manualOpen} onOpenChange={open => { setManualOpen(open); if (!open && !pendingCreate) setManualForm(EMPTY_MANUAL_FORM) }}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>手工登记发票</DialogTitle><DialogDescription>金额以最小货币单位录入，例如 CNY 123.45 元填 12345；提交由服务端再次校验。</DialogDescription></DialogHeader><fieldset disabled={Boolean(pendingCreate) || manualSubmitting} className="grid grid-cols-1 gap-4 disabled:opacity-70 sm:grid-cols-2">
-        <label className="text-sm">发票号<Input className="mt-1" value={manualForm.invoice_number} onChange={event => setManualForm(form => ({ ...form, invoice_number: event.target.value }))} /></label><label className="text-sm">发票类型<Select className="mt-1" value={manualForm.document_kind} onChange={event => setManualForm(form => ({ ...form, document_kind: event.target.value as 'blue' | 'red', related_invoice_number: '' }))}><option value="blue">蓝票</option><option value="red">红字发票</option></Select></label>{manualForm.document_kind === 'red' && <label className="text-sm sm:col-span-2">关联原票号<Input className="mt-1 font-mono" value={manualForm.related_invoice_number} onChange={event => setManualForm(form => ({ ...form, related_invoice_number: event.target.value }))} /></label>}<label className="text-sm">销售方主体<Input className="mt-1" value={manualForm.seller_entity} onChange={event => setManualForm(form => ({ ...form, seller_entity: event.target.value }))} /></label><label className="text-sm">购方名称<Input className="mt-1" value={manualForm.buyer_name} onChange={event => setManualForm(form => ({ ...form, buyer_name: event.target.value }))} /></label><label className="text-sm">购方税号（可选）<Input className="mt-1" value={manualForm.buyer_tax_id} onChange={event => setManualForm(form => ({ ...form, buyer_tax_id: event.target.value }))} autoComplete="off" /></label><label className="text-sm">币种<Input className="mt-1 uppercase" value={manualForm.currency} onChange={event => setManualForm(form => ({ ...form, currency: event.target.value }))} maxLength={3} /></label><label className="text-sm">小数位<Select className="mt-1" value={manualForm.minor_unit_scale} onChange={event => setManualForm(form => ({ ...form, minor_unit_scale: event.target.value }))}>{Array.from({ length: 10 }, (_, scale) => <option key={scale} value={scale}>{scale}</option>)}</Select></label><label className="text-sm">含税金额（最小单位）<Input className="mt-1 font-mono" inputMode="numeric" value={manualForm.amount_minor} onChange={event => setManualForm(form => ({ ...form, amount_minor: event.target.value }))} /></label><label className="text-sm">税额（最小单位）<Input className="mt-1 font-mono" inputMode="numeric" value={manualForm.tax_amount_minor} onChange={event => setManualForm(form => ({ ...form, tax_amount_minor: event.target.value }))} /></label><label className="text-sm">开票时间（Asia/Shanghai）<Input type="datetime-local" className="mt-1" value={manualForm.issued_at} onChange={event => setManualForm(form => ({ ...form, issued_at: event.target.value }))} /></label><label className="text-sm">登记原因（必填）<Input className="mt-1" value={manualForm.reason} onChange={event => setManualForm(form => ({ ...form, reason: event.target.value }))} placeholder="人工补录、历史迁移等" /></label>
+        <label className="text-sm">发票号<Input className="mt-1" value={manualForm.invoice_number} onChange={event => setManualForm(form => ({ ...form, invoice_number: event.target.value }))} /></label><label className="text-sm">发票类型<Select className="mt-1" value={manualForm.document_kind} onChange={event => setManualForm(form => ({ ...form, document_kind: event.target.value as 'blue' | 'red', related_invoice_number: '', related_invoice_id: '' }))}><option value="blue">蓝票</option><option value="red">红字发票</option></Select></label>{manualForm.document_kind === 'red' && <><label className="text-sm">关联原票 ID（推荐）<Input className="mt-1 font-mono" inputMode="numeric" value={manualForm.related_invoice_id} onChange={event => setManualForm(form => ({ ...form, related_invoice_id: event.target.value }))} /></label><label className="text-sm">关联原票号（兼容）<Input className="mt-1 font-mono" value={manualForm.related_invoice_number} onChange={event => setManualForm(form => ({ ...form, related_invoice_number: event.target.value }))} /></label></>}<label className="text-sm">销售方主体<Input className="mt-1" value={manualForm.seller_entity} onChange={event => setManualForm(form => ({ ...form, seller_entity: event.target.value }))} /></label><label className="text-sm">购方名称<Input className="mt-1" value={manualForm.buyer_name} onChange={event => setManualForm(form => ({ ...form, buyer_name: event.target.value }))} /></label><label className="text-sm">购方税号（可选）<Input className="mt-1" value={manualForm.buyer_tax_id} onChange={event => setManualForm(form => ({ ...form, buyer_tax_id: event.target.value }))} autoComplete="off" /></label><label className="text-sm">币种<Input className="mt-1 uppercase" value={manualForm.currency} onChange={event => setManualForm(form => ({ ...form, currency: event.target.value }))} maxLength={3} /></label><label className="text-sm">小数位<Select className="mt-1" value={manualForm.minor_unit_scale} onChange={event => setManualForm(form => ({ ...form, minor_unit_scale: event.target.value }))}>{Array.from({ length: 10 }, (_, scale) => <option key={scale} value={scale}>{scale}</option>)}</Select></label><label className="text-sm">含税金额（最小单位）<Input className="mt-1 font-mono" inputMode="numeric" value={manualForm.amount_minor} onChange={event => setManualForm(form => ({ ...form, amount_minor: event.target.value }))} /></label><label className="text-sm">税额（最小单位）<Input className="mt-1 font-mono" inputMode="numeric" value={manualForm.tax_amount_minor} onChange={event => setManualForm(form => ({ ...form, tax_amount_minor: event.target.value }))} /></label><label className="text-sm">开票时间（Asia/Shanghai）<Input type="datetime-local" className="mt-1" value={manualForm.issued_at} onChange={event => setManualForm(form => ({ ...form, issued_at: event.target.value }))} /></label><label className="text-sm">登记原因（必填）<Input className="mt-1" value={manualForm.reason} onChange={event => setManualForm(form => ({ ...form, reason: event.target.value }))} placeholder="人工补录、历史迁移等" /></label>
       </fieldset><DialogFooter><Button variant="outline" onClick={() => { setManualOpen(false); if (!pendingCreate) setManualForm(EMPTY_MANUAL_FORM) }} disabled={manualSubmitting}>取消</Button><Button onClick={() => void submitManual()} disabled={manualSubmitting || Boolean(pendingCreate)}>{manualSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <CheckCircle2 className="mr-2 h-4 w-4" />}{pendingCreate ? '等待对账' : '确认登记'}</Button></DialogFooter></DialogContent></Dialog>
 
       <Dialog open={importOpen} onOpenChange={open => { setImportOpen(open); if (!open && !pendingImport) { updateCsvText(''); setImportReason('') } }}><DialogContent className="max-w-4xl"><DialogHeader><DialogTitle>CSV 导入发票</DialogTitle><DialogDescription>先预览校验，只有当前 UTF-8 内容与完整有效预览逐字节一致时才能确认；预览不会写入台账。</DialogDescription></DialogHeader><div className="space-y-4"><Input type="file" accept=".csv,text/csv" aria-label="选择 UTF-8 CSV 文件" disabled={Boolean(pendingImport) || previewing || importing} onChange={event => { const file = event.target.files?.[0]; if (file) void readCsvFile(file); event.target.value = '' }} /><textarea value={csvText} onChange={event => updateCsvText(event.target.value)} aria-label="CSV 文本内容" disabled={Boolean(pendingImport) || importing} placeholder="也可以在此粘贴 UTF-8 CSV 内容" className="min-h-36 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60" /><label className="text-sm">导入原因<Input className="mt-1" value={importReason} disabled={Boolean(pendingImport) || importing} onChange={event => setImportReason(event.target.value)} placeholder="批量补录、历史迁移等" /></label>

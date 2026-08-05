@@ -123,6 +123,48 @@ func TestModelProbeConfigurationIsOptInAndBounded(t *testing.T) {
 	}
 }
 
+func TestValidateSecurityRejectsCredentialReuseAcrossTrustBoundaries(t *testing.T) {
+	base := &Config{
+		APIKey: "viewer-key", AdminPassword: "admin-password", JWTSecretKey: "jwt-secret",
+		NewAPIAdminAccessToken: "newapi-admin", ModelProbeAPIKey: "probe-key", ObservabilityToken: "metrics-key",
+	}
+	if err := base.ValidateSecurity(); err != nil {
+		t.Fatalf("distinct credentials rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		left   string
+		right  string
+	}{
+		{name: "viewer key becomes admin password", mutate: func(c *Config) { c.AdminPassword = c.APIKey }, left: "API_KEY", right: "ADMIN_PASSWORD"},
+		{name: "probe reuses NewAPI admin", mutate: func(c *Config) { c.ModelProbeAPIKey = c.NewAPIAdminAccessToken }, left: "NEWAPI_ADMIN_ACCESS_TOKEN", right: "MODEL_PROBE_API_KEY"},
+		{name: "JWT secret reused for metrics", mutate: func(c *Config) { c.ObservabilityToken = c.JWTSecretKey }, left: "JWT_SECRET_KEY", right: "OBSERVABILITY_TOKEN"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			copy := *base
+			test.mutate(&copy)
+			err := copy.ValidateSecurity()
+			if err == nil || !strings.Contains(err.Error(), test.left) || !strings.Contains(err.Error(), test.right) {
+				t.Fatalf("reuse error = %v, want names %s/%s", err, test.left, test.right)
+			}
+			for _, secret := range []string{copy.APIKey, copy.AdminPassword, copy.JWTSecretKey, copy.NewAPIAdminAccessToken, copy.ModelProbeAPIKey, copy.ObservabilityToken} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error leaked credential value: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateSecurityIgnoresUnsetCredentials(t *testing.T) {
+	if err := (&Config{JWTSecretKey: "generated-jwt-secret"}).ValidateSecurity(); err != nil {
+		t.Fatalf("unset optional credentials rejected: %v", err)
+	}
+}
+
 func TestNormalizeMySQLURLDSNPreservesCredentialsAndOptions(t *testing.T) {
 	raw := "mysql://user:p%40ss@[2001:db8::1]:3307/prod%2Ddb?parseTime=true&tls=preferred&timeout=5s&loc=Asia%2FShanghai"
 	normalized := normalizeMySQLURLDSN(raw)
