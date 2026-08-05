@@ -151,6 +151,33 @@ describe('UserManagement request ownership', () => {
     expect(screen.getByRole('button', { name: '预览从未请求 (1)' })).toBeEnabled()
   })
 
+  it('clamps deletion counters at zero after deleting a stale-classified user', async () => {
+    server.use(
+      http.get('*/api/users/stats', () => jsonResponse({
+        success: true,
+        data: { total_users: 0, active_users: 0, inactive_users: 0, very_inactive_users: 0, never_requested: 0, source_state: 'fresh' },
+      })),
+      http.get('*/api/users/soft-deleted/count', () => jsonResponse({ success: true, data: { count: 0 } })),
+      http.get('*/api/auto-group/groups', () => jsonResponse({ success: true, data: { items: [], total: 0 } })),
+      http.get('*/api/users', () => jsonResponse(userPayload(1, 'stale-never-user', 'never'))),
+      http.delete('*/api/users/:userID', () => jsonResponse({ success: true, message: '用户已注销' })),
+    )
+
+    const actor = userEvent.setup()
+    render(<UserManagement />)
+    await screen.findByText('stale-never-user')
+    expect(screen.getByRole('button', { name: /^从未请求 0/ })).toBeVisible()
+
+    await actor.click(screen.getByRole('button', { name: '删除用户 stale-never-user' }))
+    await actor.type(screen.getByPlaceholderText('例如：用户主动申请注销'), '测试注销原因')
+    await actor.type(screen.getByPlaceholderText('请输入 注销用户'), '注销用户')
+    await actor.click(screen.getByRole('button', { name: '确认注销' }))
+
+    await waitFor(() => expect(screen.queryByText('stale-never-user')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /^从未请求 0/ })).toBeVisible()
+    expect(screen.queryByText('-1')).not.toBeInTheDocument()
+  })
+
   it('prevents an aborted older statistics response from overwriting a newer refresh', async () => {
     const olderFull = deferredResponse()
     let fullCalls = 0

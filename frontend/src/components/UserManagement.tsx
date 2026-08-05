@@ -695,11 +695,11 @@ export function UserManagement() {
         if (stats) {
           setStats(prev => prev ? {
             ...prev,
-            total_users: prev.total_users - 1,
+            total_users: Math.max(0, prev.total_users - 1),
             active_users: pending.payload.activityLevel === 'active' && prev.active_users !== null ? Math.max(0, prev.active_users - 1) : prev.active_users,
             inactive_users: pending.payload.activityLevel === 'inactive' && prev.inactive_users !== null ? Math.max(0, prev.inactive_users - 1) : prev.inactive_users,
             very_inactive_users: pending.payload.activityLevel === 'very_inactive' && prev.very_inactive_users !== null ? Math.max(0, prev.very_inactive_users - 1) : prev.very_inactive_users,
-            never_requested: pending.payload.activityLevel === 'never' ? prev.never_requested - 1 : prev.never_requested,
+            never_requested: pending.payload.activityLevel === 'never' ? Math.max(0, prev.never_requested - 1) : prev.never_requested,
           } : null)
         }
         // 如果是软删除，更新软删除计数

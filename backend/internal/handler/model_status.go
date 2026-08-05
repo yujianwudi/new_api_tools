@@ -346,17 +346,23 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 		modelStatusQueryError(c, "public all models query", err)
 		return
 	}
-	available := catalog.Models
 	maxModels := config.Get().PublicModelMaxBatch
 	names := make([]string, 0, maxModels)
-	for _, item := range available {
-		name, ok := item["model_name"].(string)
-		if !ok || strings.TrimSpace(name) == "" {
+	seen := make(map[string]struct{}, maxModels)
+	totalModels := 0
+	for _, item := range catalog.Models {
+		rawName, ok := item["model_name"].(string)
+		name := strings.TrimSpace(rawName)
+		if !ok || name == "" {
 			continue
 		}
-		names = append(names, name)
-		if len(names) >= maxModels {
-			break
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		totalModels++
+		if len(names) < maxModels {
+			names = append(names, name)
 		}
 	}
 	data, err := svc.GetMultipleModelsStatus(names, window)
@@ -370,10 +376,10 @@ func GetPublicAllModelsStatusHandler(c *gin.Context) {
 		"time_window":  window,
 		"cache_ttl":    60,
 		"source_state": catalog.SourceState,
-		"total_models": len(available),
+		"total_models": totalModels,
 		"returned":     len(data),
 		"limit":        maxModels,
-		"truncated":    len(available) > len(names),
+		"truncated":    totalModels > len(data),
 	})
 }
 

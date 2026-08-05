@@ -93,3 +93,14 @@
     @apply bg-muted-foreground/40;
   }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  [data-model-status-surface],
+  [data-model-status-surface] *,
+  [data-model-status-portal],
+  [data-model-status-portal] * {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -136,7 +136,9 @@ toolstore_txn_root() {
 }
 
 toolstore_txn_active_record_path() {
-  printf '%s/active.env\n' "$(toolstore_txn_root "$1")"
+  local root
+  root="$(toolstore_txn_root "$1")" || return 1
+  printf '%s/active.env\n' "$root"
 }
 
 toolstore_txn_assert_under() {

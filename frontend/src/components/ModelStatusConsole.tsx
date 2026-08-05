@@ -146,6 +146,31 @@ interface TokenGroup {
   models: string[]
 }
 
+function isModelNameList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0)
+}
+
+function isAvailableModel(value: unknown): value is AvailableModel {
+  if (typeof value !== 'object' || value === null) return false
+  const model = value as Record<string, unknown>
+  return typeof model.model_name === 'string'
+    && model.model_name.trim().length > 0
+    && typeof model.request_count_24h === 'number'
+    && Number.isSafeInteger(model.request_count_24h)
+    && model.request_count_24h >= 0
+}
+
+function isTokenGroup(value: unknown): value is TokenGroup {
+  if (typeof value !== 'object' || value === null) return false
+  const group = value as Record<string, unknown>
+  return typeof group.group_name === 'string'
+    && group.group_name.trim().length > 0
+    && typeof group.model_count === 'number'
+    && Number.isSafeInteger(group.model_count)
+    && group.model_count >= 0
+    && isModelNameList(group.models)
+}
+
 interface ModelRow {
   modelName: string
   traffic?: TrafficStatus
@@ -240,6 +265,10 @@ function formatPercent(value?: number | null) {
   return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(value >= 99.9 ? 2 : 1)}%` : '—'
 }
 
+function freshTrafficSuccessRate(status?: TrafficStatus) {
+  return sourceStateOf(status) === 'fresh' ? status?.success_rate : null
+}
+
 function formatLatency(value?: number | null) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
   return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`
@@ -284,6 +313,7 @@ export function ModelStatusConsole() {
   const [probeSnapshot, setProbeSnapshot] = useState<SourceSnapshot<ProbeSummary | null>>({
     data: null, state: 'unavailable', window: '', fetchedAt: null, error: '',
   })
+  const [foundationReady, setFoundationReady] = useState(false)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [runningProbe, setRunningProbe] = useState(false)
@@ -300,6 +330,7 @@ export function ModelStatusConsole() {
   const [detailModel, setDetailModel] = useState<string | null>(null)
   const [probeHistory, setProbeHistory] = useState<ProbeAttempt[]>([])
   const [historyLoading, setHistoryLoading] = useState(false)
+  const foundationController = useRef<AbortController | null>(null)
   const refreshController = useRef<AbortController | null>(null)
   const refreshRequestId = useRef(0)
   const selectorTriggerRef = useRef<HTMLElement | null>(null)
@@ -332,19 +363,62 @@ export function ModelStatusConsole() {
     const [modelsPayload, configPayload, groupsPayload] = await Promise.all([
       modelsResponse.json(), configResponse.json(), groupsResponse.json(),
     ])
-    const models = parseEnvelope<AvailableModel[]>(modelsPayload)
-    if (typeof configPayload !== 'object' || configPayload === null || configPayload.success !== true) throw new Error('模型监测配置不可用')
-    const groups = parseEnvelope<TokenGroup[]>(groupsPayload)
-    const configData = 'data' in configPayload && Array.isArray(configPayload.data) ? configPayload.data.filter((item: unknown): item is string => typeof item === 'string') : []
-    setAvailableModels(Array.isArray(models) ? models : [])
+    if (!modelsResponse.ok || !configResponse.ok || !groupsResponse.ok) throw new Error('模型监测基础配置不可用')
+    const models = parseEnvelope<unknown>(modelsPayload)
+    const groups = parseEnvelope<unknown>(groupsPayload)
+    if (typeof configPayload !== 'object' || configPayload === null || configPayload.success !== true || !('data' in configPayload)) {
+      throw new Error('模型监测配置不可用')
+    }
+    const configData = configPayload.data
+    if (!Array.isArray(models) || !models.every(isAvailableModel)
+      || !isModelNameList(configData)
+      || !Array.isArray(groups) || !groups.every(isTokenGroup)) {
+      throw new Error('模型监测基础配置响应结构无效')
+    }
+    setAvailableModels(models)
     setSelectedModels(configData)
     setSelectorDraft(configData)
     setMaxBatch(typeof configPayload.max_batch === 'number' ? Math.max(1, Math.min(200, configPayload.max_batch)) : 200)
     if (typeof configPayload.time_window === 'string' && WINDOW_OPTIONS.some(item => item.value === configPayload.time_window)) {
       setTimeWindow(configPayload.time_window)
     }
-    setTokenGroups(Array.isArray(groups) ? groups : [])
+    setTokenGroups(groups)
   }, [apiUrl, headers])
+
+  const requestFoundation = useCallback(async (showSpinner = false) => {
+    foundationController.current?.abort()
+    refreshController.current?.abort()
+    const controller = new AbortController()
+    foundationController.current = controller
+    setFoundationReady(false)
+    setError('')
+    if (showSpinner) setRefreshing(true)
+    else setLoading(true)
+
+    try {
+      await loadFoundation(controller.signal)
+      if (!controller.signal.aborted) setFoundationReady(true)
+    } catch (foundationError) {
+      if (controller.signal.aborted) return
+      const message = requestErrorMessage(foundationError, '模型监测初始化失败')
+      refreshRequestId.current += 1
+      setAvailableModels([])
+      setSelectedModels([])
+      setSelectorDraft([])
+      setTokenGroups([])
+      setTrafficSnapshot({ data: [], state: 'unavailable', window: '', fetchedAt: null, error: message })
+      setProbeSnapshot({ data: null, state: 'unavailable', window: '', fetchedAt: null, error: message })
+      setDetailModel(null)
+      setError(message)
+      if (showSpinner) showToast('error', message)
+    } finally {
+      if (foundationController.current === controller) {
+        foundationController.current = null
+        setLoading(false)
+        setRefreshing(false)
+      }
+    }
+  }, [loadFoundation, showToast])
 
   const loadStatuses = useCallback(async (models: string[], window: string, signal: AbortSignal) => {
     const requestId = ++refreshRequestId.current
@@ -395,6 +469,7 @@ export function ModelStatusConsole() {
   }, [apiUrl, headers, maxBatch])
 
   const refresh = useCallback(async (showSpinner = true) => {
+    if (!foundationReady) return
     refreshController.current?.abort()
     const controller = new AbortController()
     refreshController.current = controller
@@ -419,31 +494,24 @@ export function ModelStatusConsole() {
         setRefreshing(false)
       }
     }
-  }, [loadStatuses, monitorModels, showToast, timeWindow])
+  }, [foundationReady, loadStatuses, monitorModels, showToast, timeWindow])
 
   useEffect(() => {
-    const controller = new AbortController()
-    setLoading(true)
-    setError('')
-    void loadFoundation(controller.signal)
-      .catch(foundationError => {
-        if (!controller.signal.aborted) setError(foundationError instanceof Error ? foundationError.message : '模型监测初始化失败')
-      })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
-    return () => controller.abort()
-  }, [loadFoundation])
+    void requestFoundation(false)
+    return () => foundationController.current?.abort()
+  }, [requestFoundation])
 
   useEffect(() => {
-    if (loading) return
+    if (loading || !foundationReady) return
     void refresh(false)
     return () => refreshController.current?.abort()
-  }, [loading, refresh])
+  }, [foundationReady, loading, refresh])
 
   useEffect(() => {
-    if (loading) return
+    if (loading || !foundationReady) return
     const interval = window.setInterval(() => { void refresh(false) }, 60_000)
     return () => window.clearInterval(interval)
-  }, [loading, refresh])
+  }, [foundationReady, loading, refresh])
 
   useEffect(() => {
     if (!detailModel) {
@@ -564,11 +632,36 @@ export function ModelStatusConsole() {
   }, [apiUrl, headers, monitorModels, probeSummary, refresh, showToast])
 
   if (loading) {
-    return <div className="min-h-[520px] flex items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>
+    return (
+      <div data-model-status-surface className="min-h-[520px] flex items-center justify-center" role="status" aria-live="polite" aria-label="正在加载模型监测基础配置">
+        <Loader2 aria-hidden="true" className="h-8 w-8 animate-spin text-primary" />
+        <span className="sr-only">正在加载模型监测基础配置</span>
+      </div>
+    )
+  }
+
+  if (!foundationReady) {
+    return (
+      <div data-model-status-surface className="min-h-[520px] flex items-center justify-center px-4">
+        <div className="w-full max-w-xl rounded-2xl border border-rose-200 bg-rose-50 p-6 text-rose-900 shadow-sm dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-100" role="alert">
+          <div className="flex items-start gap-3">
+            <ShieldAlert aria-hidden="true" className="mt-0.5 h-5 w-5 shrink-0" />
+            <div className="min-w-0 flex-1">
+              <h2 className="font-semibold">模型监测基础配置暂不可用</h2>
+              <p className="mt-1 text-sm opacity-80">{error || '无法确认模型、监控范围或密钥分组，当前不会请求或展示模型状态。'}</p>
+              <Button className="mt-4" variant="outline" onClick={() => void requestFoundation(true)} disabled={refreshing} aria-label={refreshing ? '正在重试加载模型监测基础配置' : '重试加载模型监测基础配置'}>
+                <RefreshCw aria-hidden="true" className={cn('mr-2 h-4 w-4', refreshing && 'animate-spin')} />
+                {refreshing ? '正在重试' : '重新加载'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
-    <div className="space-y-5">
+    <div data-model-status-surface className="space-y-5">
       <section className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-sm">
         <div className="flex flex-col gap-5 border-b border-border/60 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 px-5 py-6 text-white sm:px-7 lg:flex-row lg:items-center lg:justify-between">
           <div className="max-w-3xl">
@@ -582,11 +675,11 @@ export function ModelStatusConsole() {
             <Button variant="outline" onClick={openSelector} className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white">
               <Settings2 className="mr-2 h-4 w-4" /> 监控范围
             </Button>
-            <Button variant="outline" onClick={() => void refresh(true)} disabled={refreshing} className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white">
-              <RefreshCw className={cn('mr-2 h-4 w-4', refreshing && 'animate-spin')} /> 刷新
+            <Button variant="outline" onClick={() => void refresh(true)} disabled={refreshing} aria-label={refreshing ? '正在刷新模型状态' : '刷新模型状态'} className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white">
+              <RefreshCw aria-hidden="true" className={cn('mr-2 h-4 w-4', refreshing && 'animate-spin')} /> 刷新
             </Button>
-            <Button onClick={() => void runProbe()} disabled={runningProbe || !probeSummary?.config.configured || probeSummary.config.running || probeSummary.config.state === 'budget_exhausted'} className="bg-sky-400 text-slate-950 hover:bg-sky-300">
-              {runningProbe || probeSummary?.config.running ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />} 立即探测
+            <Button onClick={() => void runProbe()} disabled={runningProbe || !probeSummary?.config.configured || probeSummary.config.running || probeSummary.config.state === 'budget_exhausted'} aria-label={runningProbe || probeSummary?.config.running ? '正在运行主动探测' : '立即运行主动探测'} className="bg-sky-400 text-slate-950 hover:bg-sky-300">
+              {runningProbe || probeSummary?.config.running ? <Loader2 aria-hidden="true" className="mr-2 h-4 w-4 animate-spin" /> : <Play aria-hidden="true" className="mr-2 h-4 w-4" />} 立即探测
             </Button>
           </div>
         </div>
@@ -594,8 +687,8 @@ export function ModelStatusConsole() {
       </section>
 
       {error && (
-        <div className="flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200">
-          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" /><div><div className="font-medium">监测数据加载不完整</div><div className="mt-0.5 opacity-80">{error}</div></div>
+        <div className="flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200" role="alert">
+          <ShieldAlert aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" /><div><div className="font-medium">监测数据加载不完整</div><div className="mt-0.5 opacity-80">{error}</div></div>
         </div>
       )}
 
@@ -710,7 +803,7 @@ function TrafficCell({ status }: { status?: TrafficStatus }) {
   const health = trafficHealthOf(status)
   const source = sourceStateOf(status)
   const tone = health === 'healthy' ? 'text-emerald-600' : health === 'degraded' ? 'text-amber-600' : health === 'unhealthy' ? 'text-rose-600' : 'text-muted-foreground'
-  return <div><div className={cn('font-medium tabular-nums', tone)}>{formatPercent(status?.success_rate)}</div><div className="text-xs text-muted-foreground">{source === 'fresh' ? `${status?.total_requests ?? 0} 次请求` : source === 'stale' ? '数据过期' : '无真实流量'}</div></div>
+  return <div><div className={cn('font-medium tabular-nums', tone)}>{formatPercent(freshTrafficSuccessRate(status))}</div><div className="text-xs text-muted-foreground">{source === 'fresh' ? `${status?.total_requests ?? 0} 次请求` : source === 'stale' ? '数据过期' : '无真实流量'}</div></div>
 }
 
 function ProbeCell({ probe }: { probe?: ProbeItem }) {
@@ -745,7 +838,7 @@ function ModelTableRow({ row, onOpen }: { row: ModelRow; onOpen: () => void }) {
 }
 
 function ModelMobileRow({ row, onOpen }: { row: ModelRow; onOpen: () => void }) {
-  return <button onClick={onOpen} className="w-full p-4 text-left"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><div className="truncate font-medium">{row.modelName}</div><div className="mt-1 text-xs text-muted-foreground">{row.reasons[0]}</div></div><CombinedBadge health={row.combined} /></div><div className="mt-4 grid grid-cols-3 gap-2 rounded-xl bg-muted/30 p-3 text-xs"><div><div className="text-muted-foreground">真实流量</div><div className="mt-1 font-medium">{formatPercent(row.traffic?.success_rate)}</div></div><div><div className="text-muted-foreground">主动探测</div><div className="mt-1 font-medium">{probeStateLabel[row.probe?.probe_health ?? 'unavailable']}</div></div><div><div className="text-muted-foreground">首字延迟</div><div className="mt-1 font-medium">{formatLatency(row.probe?.latest?.first_token_latency_ms)}</div></div></div></button>
+  return <button onClick={onOpen} className="w-full p-4 text-left"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><div className="truncate font-medium">{row.modelName}</div><div className="mt-1 text-xs text-muted-foreground">{row.reasons[0]}</div></div><CombinedBadge health={row.combined} /></div><div className="mt-4 grid grid-cols-3 gap-2 rounded-xl bg-muted/30 p-3 text-xs"><div><div className="text-muted-foreground">真实流量</div><div className="mt-1 font-medium">{formatPercent(freshTrafficSuccessRate(row.traffic))}</div></div><div><div className="text-muted-foreground">主动探测</div><div className="mt-1 font-medium">{probeStateLabel[row.probe?.probe_health ?? 'unavailable']}</div></div><div><div className="text-muted-foreground">首字延迟</div><div className="mt-1 font-medium">{formatLatency(row.probe?.latest?.first_token_latency_ms)}</div></div></div></button>
 }
 
 function ModelSelector({ available, selected, search, max, onSearch, onChange, onClose, onSave, onCloseAutoFocus }: { available: AvailableModel[]; selected: string[]; search: string; max: number; onSearch: (value: string) => void; onChange: (value: string[]) => void; onClose: () => void; onSave: () => void; onCloseAutoFocus: (event: Event) => void }) {
@@ -757,7 +850,7 @@ function ModelSelector({ available, selected, search, max, onSearch, onChange, o
     else if (selected.length < max) onChange([...selected, model])
   }
   return (
-    <DialogContent className="max-w-2xl gap-0 overflow-hidden p-0" onCloseAutoFocus={onCloseAutoFocus}>
+    <DialogContent data-model-status-portal className="max-w-2xl gap-0 overflow-hidden p-0" onCloseAutoFocus={onCloseAutoFocus}>
       <DialogHeader className="border-b p-4 pr-12">
         <DialogTitle>监控范围</DialogTitle>
         <DialogDescription>已选择 {selected.length}/{max}；清空后自动展示流量最高的模型。</DialogDescription>
@@ -787,6 +880,7 @@ function ModelSelector({ available, selected, search, max, onSearch, onChange, o
 function ModelDetailDrawer({ row, history, historyLoading, onClose, onCloseAutoFocus }: { row: ModelRow; history: ProbeAttempt[]; historyLoading: boolean; onClose: () => void; onCloseAutoFocus: (event: Event) => void }) {
   return (
     <DialogContent
+      data-model-status-portal
       className="bottom-0 left-auto right-0 top-0 h-dvh max-h-none w-full max-w-xl translate-x-0 translate-y-0 gap-0 rounded-none border-y-0 border-r-0 p-0 max-sm:top-0 max-sm:rounded-none"
       onEscapeKeyDown={() => onClose()}
       onCloseAutoFocus={onCloseAutoFocus}
@@ -798,7 +892,7 @@ function ModelDetailDrawer({ row, history, historyLoading, onClose, onCloseAutoF
       </DialogHeader>
       <div className="space-y-5 overflow-y-auto p-5">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <DiagnosticCard label="真实流量可用率" value={formatPercent(row.traffic?.success_rate)} detail={`${row.traffic?.total_requests ?? 0} 次请求 · ${sourceStateOf(row.traffic)}`} />
+          <DiagnosticCard label="真实流量可用率" value={formatPercent(freshTrafficSuccessRate(row.traffic))} detail={`${row.traffic?.total_requests ?? 0} 次请求 · ${sourceStateOf(row.traffic)}`} />
           <DiagnosticCard label="主动探测可用率" value={formatPercent(row.probe?.availability_24h)} detail={`${row.probe?.attempt_count_24h ?? 0} 次探测 · ${row.probe?.capability ?? '未识别'}`} />
           <DiagnosticCard label="首字延迟" value={formatLatency(row.probe?.latest?.first_token_latency_ms ?? row.probe?.average_first_token_latency_ms)} detail={`响应头 ${formatLatency(row.probe?.latest?.header_latency_ms ?? row.probe?.average_header_latency_ms)}`} />
           <DiagnosticCard label="总延迟" value={formatLatency(row.probe?.latest?.total_latency_ms ?? row.probe?.average_total_latency_ms)} detail={`最近 ${relativeTime(row.probe?.latest?.finished_at)}`} />
@@ -820,7 +914,7 @@ function ModelDetailDrawer({ row, history, historyLoading, onClose, onCloseAutoF
         <div>
           <h4 className="mb-2 text-sm font-semibold">最近主动探测</h4>
           {historyLoading ? (
-            <div className="flex justify-center py-8" role="status" aria-label="正在加载主动探测历史"><Loader2 className="h-5 w-5 animate-spin" /></div>
+            <div className="flex justify-center py-8" role="status" aria-live="polite" aria-label="正在加载主动探测历史"><Loader2 aria-hidden="true" className="h-5 w-5 animate-spin" /></div>
           ) : history.length === 0 ? (
             <div className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">尚无主动探测记录</div>
           ) : (

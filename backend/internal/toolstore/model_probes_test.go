@@ -80,6 +80,23 @@ func TestModelProbeRunAttemptSummaryAndReplay(t *testing.T) {
 	}
 }
 
+func TestModelProbeSummaryForRejectsMissingOrNilEntries(t *testing.T) {
+	valid := &ModelProbeSummary{ModelName: "gpt-test"}
+	if item, err := modelProbeSummaryFor(map[string]*ModelProbeSummary{"gpt-test": valid}, "gpt-test"); err != nil || item != valid {
+		t.Fatalf("valid summary lookup = %+v, %v", item, err)
+	}
+	for name, summaries := range map[string]map[string]*ModelProbeSummary{
+		"missing": {},
+		"nil":     {"gpt-test": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := modelProbeSummaryFor(summaries, "gpt-test"); err == nil || !strings.Contains(err.Error(), "unexpected model") {
+				t.Fatalf("modelProbeSummaryFor() error = %v, want unexpected-model error", err)
+			}
+		})
+	}
+}
+
 func TestModelProbeRetentionDeletesOnlyExpiredTelemetry(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()

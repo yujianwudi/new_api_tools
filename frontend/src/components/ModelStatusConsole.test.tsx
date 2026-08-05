@@ -80,6 +80,103 @@ function installModelStatusHandlers() {
 }
 
 describe('ModelStatusConsole keyboard and dialog lifecycle', () => {
+  it.each(['model catalog', 'selected config', 'token groups'] as const)(
+    'fails closed on a malformed successful %s payload',
+    async malformedSource => {
+      let statusRequests = 0
+      const modelsData = malformedSource === 'model catalog'
+        ? {}
+        : [{ model_name: 'model-a', request_count_24h: 12 }]
+      const selectedData = malformedSource === 'selected config' ? {} : ['model-a']
+      const groupsData = malformedSource === 'token groups'
+        ? [{ group_name: 'broken-group', model_count: 1, models: [null] }]
+        : []
+
+      server.use(
+        http.get('*/api/model-status/models', () => response(modelsData)),
+        http.get('*/api/model-status/config/selected', () => Response.json({
+          success: true,
+          data: selectedData,
+          max_batch: 50,
+          time_window: '24h',
+        })),
+        http.get('*/api/model-status/token-groups', () => response(groupsData)),
+        http.post('*/api/model-status/status/batch', () => {
+          statusRequests += 1
+          return response([])
+        }),
+        http.post('*/api/model-status/probes/summary', () => {
+          statusRequests += 1
+          return response({ items: [] })
+        }),
+      )
+
+      render(<ModelStatusConsole />)
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('模型监测基础配置暂不可用')
+      expect(screen.queryByText('没有符合当前筛选条件的模型')).not.toBeInTheDocument()
+      expect(statusRequests).toBe(0)
+    },
+  )
+
+  it('keeps a failed foundation unavailable and retries it before requesting statuses', async () => {
+    let foundationUnavailable = true
+    let statusRequests = 0
+    server.use(
+      http.get('*/api/model-status/models', () => foundationUnavailable
+        ? Response.json({ success: false, message: 'foundation unavailable' }, { status: 503 })
+        : response([{ model_name: 'model-a', request_count_24h: 12 }])),
+      http.get('*/api/model-status/config/selected', () => Response.json({
+        success: true,
+        data: ['model-a'],
+        max_batch: 50,
+        time_window: '24h',
+      })),
+      http.get('*/api/model-status/token-groups', () => response([])),
+      http.post('*/api/model-status/status/batch', () => {
+        statusRequests += 1
+        return response([{
+          model_name: 'model-a',
+          time_window: '24h',
+          total_requests: 12,
+          success_count: 12,
+          failure_count: 0,
+          success_rate: 100,
+          current_status: 'green',
+          traffic_health: 'healthy',
+          source_state: 'fresh',
+          slot_data: [],
+        }])
+      }),
+      http.post('*/api/model-status/probes/summary', () => {
+        statusRequests += 1
+        return response({
+          config: {
+            enabled: false,
+            configured: false,
+            running: false,
+            state: 'disabled',
+            allowed_models: [],
+          },
+          items: [],
+        })
+      }),
+    )
+
+    const actor = userEvent.setup()
+    render(<ModelStatusConsole />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('模型监测基础配置暂不可用')
+    expect(screen.queryByText('没有符合当前筛选条件的模型')).not.toBeInTheDocument()
+    expect(statusRequests).toBe(0)
+
+    foundationUnavailable = false
+    await actor.click(screen.getByRole('button', { name: '重试加载模型监测基础配置' }))
+
+    expect(await screen.findByRole('button', { name: '打开模型 model-a 诊断详情' })).toBeVisible()
+    await waitFor(() => expect(statusRequests).toBe(2))
+  })
+
   it('opens the desktop detail from a native button and restores focus after Escape', async () => {
     installModelStatusHandlers()
     const actor = userEvent.setup()
@@ -158,13 +255,14 @@ describe('ModelStatusConsole keyboard and dialog lifecycle', () => {
 
   it('does not describe a stale traffic snapshot as a degraded numeric rate', async () => {
     installModelStatusHandlers()
+    const actor = userEvent.setup()
     server.use(http.post('*/api/model-status/status/batch', () => response([{
       model_name: 'model-a',
       time_window: '24h',
       total_requests: 12,
       success_count: 10,
       failure_count: 2,
-      success_rate: null,
+      success_rate: 87.5,
       current_status: 'yellow',
       traffic_health: 'degraded',
       source_state: 'stale',
@@ -175,5 +273,31 @@ describe('ModelStatusConsole keyboard and dialog lifecycle', () => {
 
     expect((await screen.findAllByText('真实流量证据已过期')).length).toBeGreaterThan(0)
     expect(screen.queryByText(/真实流量成功率下降至/)).not.toBeInTheDocument()
+    expect(screen.queryByText('87.5%')).not.toBeInTheDocument()
+
+    await actor.click(screen.getByRole('button', { name: '打开模型 model-a 诊断详情' }))
+    const trafficRateLabel = await screen.findByText('真实流量可用率')
+    expect(trafficRateLabel.nextElementSibling).toHaveTextContent('—')
+  })
+
+  it('does not render an empty traffic snapshot as a numeric zero rate', async () => {
+    installModelStatusHandlers()
+    server.use(http.post('*/api/model-status/status/batch', () => response([{
+      model_name: 'model-a',
+      time_window: '24h',
+      total_requests: 0,
+      success_count: 0,
+      failure_count: 0,
+      success_rate: 0,
+      current_status: 'unknown',
+      traffic_health: 'unknown',
+      source_state: 'empty',
+      slot_data: [],
+    }])))
+
+    render(<ModelStatusConsole />)
+
+    expect((await screen.findAllByText('当前窗口没有真实调用')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('0.0%')).not.toBeInTheDocument()
   })
 })

@@ -2709,7 +2709,7 @@ func (s *UserManagementService) GetInvitedUsers(userID int64, page, pageSize int
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tx, err := s.db.DB.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	tx, err := s.db.DB.BeginTxx(ctx, userManagementReadTxOptions(s.db))
 	if err != nil {
 		return InvitedUsersResult{}, fmt.Errorf("begin invited-user snapshot: %w", err)
 	}

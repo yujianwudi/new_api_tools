@@ -819,7 +819,11 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan model probe summary: %w", err)
 		}
-		item := summaries[model]
+		item, err := modelProbeSummaryFor(summaries, model)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
 		item.AttemptCount, item.SuccessCount, item.FailureCount, item.SkippedCount = attempts, successes, failures, skipped
 		item.AverageHeaderLatencyMS = averageInt64(headerSum, headerSamples)
 		item.AverageFirstTokenMS = averageInt64(firstSum, firstSamples)
@@ -852,7 +856,12 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 			_ = latestRows.Close()
 			return nil, err
 		}
-		summaries[attempt.ModelName].Latest = &attempt
+		item, err := modelProbeSummaryFor(summaries, attempt.ModelName)
+		if err != nil {
+			_ = latestRows.Close()
+			return nil, err
+		}
+		item.Latest = &attempt
 	}
 	if err := latestRows.Close(); err != nil {
 		return nil, fmt.Errorf("close latest model probe rows: %w", err)
@@ -863,9 +872,21 @@ func (s *Store) ListModelProbeSummaries(ctx context.Context, models []string, si
 
 	result := make([]ModelProbeSummary, 0, len(models))
 	for _, model := range models {
-		result = append(result, *summaries[model])
+		item, err := modelProbeSummaryFor(summaries, model)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *item)
 	}
 	return result, nil
+}
+
+func modelProbeSummaryFor(summaries map[string]*ModelProbeSummary, model string) (*ModelProbeSummary, error) {
+	item, exists := summaries[model]
+	if !exists || item == nil {
+		return nil, fmt.Errorf("model probe summary query returned unexpected model %q", model)
+	}
+	return item, nil
 }
 
 func (s *Store) ListModelProbeHistory(ctx context.Context, model string, limit int) ([]ModelProbeAttempt, error) {

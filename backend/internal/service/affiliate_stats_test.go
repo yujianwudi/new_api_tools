@@ -275,7 +275,7 @@ func TestInviteTopUpDetailRejectsChangedParentTotal(t *testing.T) {
 	}
 }
 
-func TestInviteTopUpDetailRejectsSameCountEvidenceMutation(t *testing.T) {
+func TestInviteTopUpDetailRejectsSameCountEvidenceMutationOutsideRequestedPage(t *testing.T) {
 	withInviteTopUpTestTimezone(t)
 	installInviteTopUpFixture(t)
 	params := AffiliateStatsParams{
@@ -300,6 +300,9 @@ func TestInviteTopUpDetailRejectsSameCountEvidenceMutation(t *testing.T) {
 	// content under the old aggregate row.
 	database.Get().DB.MustExec(`UPDATE top_ups SET amount = amount + 1 WHERE id = 1`)
 	detailParams := params
+	// ID 1 sorts outside the requested first detail page. The evidence hash
+	// must still cover it instead of hashing only the displayed page.
+	detailParams.PageSize = 1
 	detailParams.ExpectedFingerprint = parent.QueryFingerprint
 	detailParams.ExpectedDetailTotal = int64Pointer(row.SuccessTopUpCount)
 	detailParams.ExpectedDetailEvidenceHash = row.DetailEvidenceHash

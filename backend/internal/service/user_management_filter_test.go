@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -69,6 +70,7 @@ func installUserQueryFixture(t *testing.T, includeLinuxDO bool) (*sqlx.DB, *sqlx
 	})
 	t.Cleanup(func() {
 		database.SetForTesting(nil)
+		database.SetLogForTesting(nil, database.LogSourceStatus{Mode: database.LogSourceModeUnknown})
 		_ = logDB.Close()
 		_ = mainDB.Close()
 	})
@@ -417,6 +419,9 @@ func TestGetUsersFailsClosedWhenLogQueryFails(t *testing.T) {
 
 func TestGetInvitedUsersUsesFullPopulationStatisticsAndUserIDContract(t *testing.T) {
 	mainDB, _, svc := installUserQueryFixture(t, true)
+	if options := userManagementReadTxOptions(svc.db); options.Isolation != sql.LevelSerializable || !options.ReadOnly {
+		t.Fatalf("SQLite invited-user read options = %+v, want serializable read-only", options)
+	}
 	mainDB.MustExec(`INSERT INTO users
 		(id, username, display_name, aff_code, aff_count, aff_quota, aff_history)
 		VALUES (100, 'inviter', 'Inviter', 'AFF', 25, 50, 60)`)
@@ -448,7 +453,8 @@ func TestGetInvitedUsersUsesFullPopulationStatisticsAndUserIDContract(t *testing
 			if result.AsOf <= 0 || decodeErr != nil || len(decoded) != 32 || strings.ToLower(result.QueryFingerprint) != result.QueryFingerprint {
 				t.Fatalf("invalid first-page snapshot identity: as_of=%d fingerprint=%q err=%v", result.AsOf, result.QueryFingerprint, decodeErr)
 			}
-		} else if result.Stats.TotalRequests != firstStats.TotalRequests || *result.Stats.TotalUsedQuota != *firstStats.TotalUsedQuota {
+		} else if result.Stats.TotalUsedQuota == nil || firstStats.TotalUsedQuota == nil ||
+			result.Stats.TotalRequests != firstStats.TotalRequests || *result.Stats.TotalUsedQuota != *firstStats.TotalUsedQuota {
 			t.Fatalf("stats changed across pages: first=%+v page%d=%+v", firstStats, page, result.Stats)
 		}
 		if identity != nil && (result.AsOf != identity.AsOf || result.QueryFingerprint != identity.QueryFingerprint) {

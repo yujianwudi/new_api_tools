@@ -462,6 +462,11 @@ real_project="$(new_project unsafe-dir-link-target)"
 linked_project="${TEST_TMP}/unsafe-project-link"
 ln -s "$real_project" "$linked_project"
 if toolstore_txn_project_path "$linked_project" >/dev/null; then fail 'OPS05 project symlink accepted'; fi
+active_record_output=''
+if active_record_output="$(toolstore_txn_active_record_path "$linked_project")"; then
+  fail 'OPS05 active-record path accepted an unsafe project root'
+fi
+[[ -z "$active_record_output" ]] || fail 'OPS05 failed active-record lookup emitted a root-level path'
 
 # Core row drift must block commit even when readiness happened to return green.
 project="$(new_project count-drift)"

@@ -441,6 +441,8 @@ resolve_install_image() {
 
   local image=""
   if [[ -n "$requested_image" ]]; then
+    [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 仅用于严格发行标签；开发 ref 必须从 Git checkout 派生短 SHA 镜像"
     is_immutable_newapi_tools_image "$requested_image" ||
       die "显式 NEWAPI_TOOLS_IMAGE 必须使用发行页核验过的 repo@sha256:<digest>"
     [[ "$(image_repository_without_tag "$requested_image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
@@ -448,10 +450,8 @@ resolve_install_image() {
     image="$requested_image"
   elif [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     die "发行版本 ${ref} 必须同时提供发行页中的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
-  elif [[ "$ref" == "main" ]]; then
-    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
   else
-    die "自定义 NEWAPI_TOOLS_REF=${ref} 必须同时显式设置不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
+    image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:${commit:0:7}"
   fi
 
   validate_newapi_tools_image "$image"
@@ -467,6 +467,26 @@ validate_install_ref() {
     [[ ! "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     die "发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式"
   fi
+}
+
+install_release_tag_at_commit() {
+  local commit="$1" tags tag release_tag=""
+  tags="$(git tag --points-at "$commit")" ||
+    die "无法枚举安装 commit ${commit} 上的 Git tag"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+      [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      die "安装 commit 上的发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式: ${tag}"
+    fi
+    [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] ||
+      die "发行标签必须是 annotated tag: ${tag}"
+    [[ -z "$release_tag" ]] ||
+      die "同一安装 commit 不能同时关联多个发行标签: ${release_tag}, ${tag}"
+    release_tag="$tag"
+  done <<< "$tags"
+  printf '%s\n' "$release_tag"
 }
 
 verify_install_origin() {
@@ -510,12 +530,25 @@ checkout_install_ref() {
   local commit
   commit="$(git rev-parse --verify "${target}^{commit}")" ||
     die "无法解析安装版本 ${INSTALL_REF}"
+  local commit_release_tag
+  if ! commit_release_tag="$(install_release_tag_at_commit "$commit")"; then
+    die "无法安全解析安装 commit ${commit} 的发行标签身份"
+  fi
+  if [[ -n "$commit_release_tag" && "$INSTALL_REF" != "$commit_release_tag" ]]; then
+    die "安装 ref ${INSTALL_REF} 指向发行 commit ${commit_release_tag}；必须改用该发行标签及其签名镜像"
+  fi
+  if [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
+        "$commit_release_tag" != "$INSTALL_REF" ]]; then
+    die "发行 ref ${INSTALL_REF} 未解析到同名 annotated tag"
+  fi
 
   if [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
         -z "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
     die "发行版本 ${INSTALL_REF} 必须使用发行页提供的不可变 NEWAPI_TOOLS_IMAGE digest 和 NEWAPI_TOOLS_EXPECTED_REVISION"
   fi
   if [[ -n "$REQUESTED_NEWAPI_TOOLS_IMAGE" ]]; then
+    [[ "$INSTALL_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE 仅用于严格发行标签；开发 ref 必须从 Git checkout 派生短 SHA 镜像"
     is_immutable_newapi_tools_image "$REQUESTED_NEWAPI_TOOLS_IMAGE" ||
       die "显式 NEWAPI_TOOLS_IMAGE 必须使用 repo@sha256:<64 位小写十六进制>"
     [[ "$(image_repository_without_tag "$REQUESTED_NEWAPI_TOOLS_IMAGE")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] ||
@@ -826,13 +859,14 @@ clear_install_toolstore_compose_sources() {
 }
 
 discard_install_rollback_compose_bundle() {
-  local env_file="$1" marker name snapshot_file
+  local env_file="$1" marker name snapshot_file cleanup_ok=true
   marker="$(install_rollback_compose_marker_path "$env_file")"
-  durable_remove_install_file "$marker" || return 1
   while IFS= read -r name; do
     snapshot_file="$(install_rollback_compose_snapshot_path "$env_file" "$name")"
-    durable_remove_install_file "$snapshot_file" || return 1
+    durable_remove_install_file "$snapshot_file" || cleanup_ok=false
   done < <(install_rollback_compose_files)
+  durable_remove_install_file "$marker" || cleanup_ok=false
+  [[ "$cleanup_ok" == "true" ]]
 }
 
 persist_install_rollback_compose_bundle() {
@@ -932,17 +966,75 @@ remove_install_rollback_snapshot() {
 }
 
 commit_install_rollback_transaction() {
-  local env_file="$1"
-  remove_install_rollback_snapshot "$env_file" || return 1
-  INSTALL_ROLLBACK_ENV_AVAILABLE=false
-  INSTALL_ROLLBACK_ENV_CONTENT=""
-  INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
-  if ! discard_install_rollback_compose_bundle "$env_file"; then
-    # The authoritative .env rollback marker is already durably gone, so a
-    # leftover mode-600 Compose copy is inert. Do not roll back a healthy
-    # candidate after its commit point; the next transaction will replace it.
-    log_warn "部署已提交，但无法清理非活动 Compose 回滚副本"
+  local env_file="$1" snapshot_file cleanup_ok=true
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" != "true" ||
+      -z "$INSTALL_ROLLBACK_ENV_CONTENT" ]]; then
+      cleanup_ok=false
+    elif remove_install_rollback_snapshot "$env_file"; then
+      INSTALL_ROLLBACK_ENV_AVAILABLE=false
+      INSTALL_ROLLBACK_ENV_CONTENT=""
+      INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
+    else
+      cleanup_ok=false
+    fi
+  else
+    INSTALL_ROLLBACK_ENV_AVAILABLE=false
+    INSTALL_ROLLBACK_ENV_CONTENT=""
+    INSTALL_ROLLBACK_SNAPSHOT_PREEXISTING=false
   fi
+  if ! discard_install_rollback_compose_bundle "$env_file"; then
+    cleanup_ok=false
+  fi
+  [[ "$cleanup_ok" == "true" ]]
+}
+
+start_and_finalize_committed_install_candidate() {
+  local env_file="$1" project_dir="$2" candidate_image="$3"
+  shift 3
+  local snapshot_file rollback_content cleanup_ok=true
+  snapshot_file="$(install_rollback_snapshot_path "$env_file")"
+
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    if rollback_content="$(load_install_rollback_snapshot "$env_file")"; then
+      INSTALL_ROLLBACK_ENV_CONTENT="$rollback_content"
+      INSTALL_ROLLBACK_ENV_AVAILABLE=true
+    else
+      INSTALL_ROLLBACK_ENV_CONTENT=""
+      INSTALL_ROLLBACK_ENV_AVAILABLE=false
+      cleanup_ok=false
+      log_warn "Tool Store 已提交；旧安装回滚快照不可读，已保留该文件和提交证据，仍将启动正式候选"
+    fi
+  else
+    INSTALL_ROLLBACK_ENV_CONTENT=""
+    INSTALL_ROLLBACK_ENV_AVAILABLE=false
+  fi
+
+  if ! commit_install_rollback_transaction "$env_file"; then
+    cleanup_ok=false
+    log_warn "Tool Store 已提交；旧安装或 Compose 回滚快照未完全清理，仍将启动正式候选，禁止恢复旧 schema"
+  fi
+
+  if ! start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" "$@"; then
+    log_error "Tool Store 已提交且不能安全回滚；正式候选启动失败，提交证据与未清理文件均已保留"
+    return 1
+  fi
+
+  if [[ "$cleanup_ok" == "true" ]]; then
+    if ! toolstore_txn_finish_committed "$project_dir"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据清理返回失败"
+    elif toolstore_txn_has_active "$project_dir"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据仍处于活动状态"
+    fi
+  fi
+
+  if [[ "$cleanup_ok" != "true" ]]; then
+    log_warn "正式候选已健康并保持运行；已保留 active.env 与未删除快照，下次运行 install.sh 将幂等重试清理，请勿手工恢复旧数据库、配置或镜像"
+  fi
+  log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
 }
 
 durable_remove_install_tree() {
@@ -1277,18 +1369,11 @@ recover_active_install_toolstore_transaction() {
   if [[ "$state" == "committed" ]]; then
     candidate_image="$(toolstore_txn_env_value "$content" CANDIDATE_IMAGE)"
     (migrate_image_env_file "${project_dir}/.env" "$candidate_image" true) || return 1
-    if [[ -e "$(install_rollback_snapshot_path "${project_dir}/.env")" ||
-      -L "$(install_rollback_snapshot_path "${project_dir}/.env")" ]]; then
-      INSTALL_ROLLBACK_ENV_CONTENT="$(load_install_rollback_snapshot "${project_dir}/.env")" || return 1
-      INSTALL_ROLLBACK_ENV_AVAILABLE=true
-      commit_install_rollback_transaction "${project_dir}/.env" || return 1
-    fi
     setup_compose_files "$project_dir"
     build_install_compose_args "${project_dir}/.env" "$project_dir" compose_args
-    start_install_services_and_wait "${project_dir}/.env" "$project_dir" candidate \
-      "$candidate_image" "${compose_args[@]}" || return 1
-    toolstore_txn_finish_committed "$project_dir" || return 1
-    return 0
+    start_and_finalize_committed_install_candidate \
+      "${project_dir}/.env" "$project_dir" "$candidate_image" "${compose_args[@]}"
+    return $?
   fi
   rollback_image="$(toolstore_txn_env_value "$content" OLD_IMAGE)"
   toolstore_txn_restore_files "$project_dir" || return 1
@@ -1508,6 +1593,7 @@ restart_install_services_transactionally() {
   local candidate_image="$NEWAPI_TOOLS_IMAGE" rollback_image container_names project_name=""
   local rollback_env_file="$env_file"
   local rollback_content="" rollback_config_restored=true candidate_healthy=false rollback_healthy=false
+  local toolstore_commit_succeeded=false
   local -a candidate_compose_args=() rollback_compose_args=()
   if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
     rollback_content="$(load_install_rollback_snapshot "$env_file")" ||
@@ -1647,10 +1733,13 @@ restart_install_services_transactionally() {
         candidate_healthy=false
         log_error "候选服务健康，但 Tool Store schema/核心表计数验证失败，将执行数据库与镜像回滚"
       elif [[ "$INSTALL_TOOLSTORE_TXN_LOADED" == "true" ]] &&
-        toolstore_txn_has_active "$project_dir" &&
-        ! toolstore_txn_commit "$project_dir"; then
-        candidate_healthy=false
-        log_error "候选服务已健康，但 Tool Store 回滚事务无法提交，将执行回滚"
+        toolstore_txn_has_active "$project_dir"; then
+        if toolstore_txn_commit "$project_dir"; then
+          toolstore_commit_succeeded=true
+        else
+          candidate_healthy=false
+          log_error "候选服务已健康，但 Tool Store 提交结果未确认；将读取持久事务状态后决定恢复方向"
+        fi
       elif [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]] &&
         ! commit_install_rollback_transaction "$env_file"; then
         candidate_healthy=false
@@ -1663,7 +1752,7 @@ restart_install_services_transactionally() {
         fi
       fi
     fi
-    [[ "$candidate_healthy" == "false" ]] ||
+    [[ "$candidate_healthy" == "false" || "$toolstore_commit_succeeded" == "true" ]] ||
       log_error "候选服务已健康，但无法提交其镜像配置，将执行回滚"
   fi
 
@@ -1674,15 +1763,8 @@ restart_install_services_transactionally() {
       die "无法读取候选晋升事务状态；拒绝猜测是否可回滚"
     committed_state="$(toolstore_txn_env_value "$committed_content" STATE)"
     if [[ "$committed_state" == "committed" ]]; then
-      if [[ "$INSTALL_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
-        commit_install_rollback_transaction "$env_file" ||
-          die "Tool Store 已提交；旧安装快照清理失败，事务证据已保留供重试，禁止回滚旧 schema"
-      fi
-      if start_install_services_and_wait "$env_file" "$project_dir" candidate "$candidate_image" \
-        "${candidate_compose_args[@]}"; then
-        toolstore_txn_finish_committed "$project_dir" ||
-          die "正式候选已健康，但无法完成 Tool Store 提交证据清理"
-        log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
+      if start_and_finalize_committed_install_candidate \
+        "$env_file" "$project_dir" "$candidate_image" "${candidate_compose_args[@]}"; then
         return 0
       fi
       die "Tool Store 已提交且不能安全回滚；正式候选启动失败，事务证据已保留供下次继续晋升"
@@ -2136,6 +2218,7 @@ show_initial_env_detection() {
 #######################################
 check_existing_installation() {
   local target_dir="${INSTALL_DIR}/${PROJECT_NAME}" target_abs transaction_root active_record
+  local committed_cleanup_pending=false recovery_content recovery_state
 
   target_abs="$(realpath -m -s -- "$target_dir" 2>/dev/null)" ||
     die "无法解析安装目标路径"
@@ -2151,6 +2234,14 @@ check_existing_installation() {
       die "无法加载 mode-600 外置 Tool Store 恢复库"
     recover_active_install_toolstore_transaction "$target_dir" ||
       die "项目树缺失或不完整时，外置 Tool Store 事务无法安全恢复"
+    if toolstore_txn_has_active "$target_dir"; then
+      recovery_content="$(toolstore_txn_load_record "$target_dir")" ||
+        die "正式候选恢复后无法读取保留的 Tool Store 提交证据"
+      recovery_state="$(toolstore_txn_env_value "$recovery_content" STATE)"
+      [[ "$recovery_state" == "committed" ]] ||
+        die "Tool Store 恢复返回成功但仍保留非 committed 活动事务"
+      committed_cleanup_pending=true
+    fi
   fi
   cleanup_install_clone_staging "$target_dir" ||
     die "无法安全清理上次中断的临时 clone 目录"
@@ -2178,14 +2269,29 @@ check_existing_installation() {
   if [[ -f "${target_dir}/scripts/toolstore_transaction.sh" ]]; then
     load_install_toolstore_transaction_library "$target_dir" ||
       die "Tool Store 事务库不安全或不可读取"
-    if toolstore_txn_has_active "$target_dir"; then
+    if [[ "$committed_cleanup_pending" != "true" ]] &&
+      toolstore_txn_has_active "$target_dir"; then
       recover_active_install_toolstore_transaction "$target_dir" ||
         die "未完成的 Tool Store 事务无法安全恢复；拒绝进入管理菜单"
+      if toolstore_txn_has_active "$target_dir"; then
+        recovery_content="$(toolstore_txn_load_record "$target_dir")" ||
+          die "正式候选恢复后无法读取保留的 Tool Store 提交证据"
+        recovery_state="$(toolstore_txn_env_value "$recovery_content" STATE)"
+        [[ "$recovery_state" == "committed" ]] ||
+          die "Tool Store 恢复返回成功但仍保留非 committed 活动事务"
+        committed_cleanup_pending=true
+      fi
     fi
   fi
 
   # Recover an interrupted update before exposing restart/start actions in the
   # management menu. The snapshot remains active until a later update commits.
+  if [[ "$committed_cleanup_pending" == "true" ]]; then
+    log_warn "Tool Store 已提交且正式候选健康；旧快照仅为待清理证据，本次不进入变更菜单，也不按其恢复旧配置、旧镜像或旧 schema"
+    log_success "当前候选服务可用；下次运行 install.sh 将幂等重试快照与提交证据清理"
+    exit 0
+  fi
+
   local rollback_snapshot="${target_dir}/.env.rollback"
   if [[ -e "$rollback_snapshot" || -L "$rollback_snapshot" ]]; then
     capture_install_rollback_env "${target_dir}/.env"
@@ -3571,7 +3677,7 @@ NewAPI Middleware Tool - 安装管理脚本
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
   NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.6.1；main 会锁定本次 commit 的短 SHA 镜像）
-  NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；发行/自定义 ref 必填
+  NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；严格发行标签必填，开发 ref 禁止显式设置
   NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 
 更多信息: https://github.com/yujianwudi/new_api_tools

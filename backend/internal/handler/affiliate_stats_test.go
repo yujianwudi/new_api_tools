@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
@@ -141,6 +142,34 @@ func TestInviteTopUpAnalysisDatabaseFailureIsUnavailable(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, "INVITE_TOPUP_ANALYSIS_UNAVAILABLE") || strings.Contains(strings.ToLower(body), "database is closed") {
 		t.Fatalf("unsafe or ambiguous unavailable response: %s", body)
+	}
+}
+
+func TestInviteTopUpAnalysisScaleExceededIsExplicitAndReturnsNoEvidence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := installInviteTopUpHandlerFixture(t)
+	if err := service.ConfigureAffiliateStatsGuardrails(1, 5*time.Second, 2); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := service.ConfigureAffiliateStatsGuardrails(20_000, 5*time.Second, 2); err != nil {
+			t.Fatalf("restore affiliate guardrails: %v", err)
+		}
+	})
+	db.MustExec(`INSERT INTO top_ups VALUES (2, 10, 20, 2.0, 'success', 2, 3)`)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/users/invite-topup-analysis?as_of=10", nil)
+	ListAffiliateStats(ctx)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "INVITE_TOPUP_EVIDENCE_SCALE_EXCEEDED") ||
+		strings.Contains(body, "detail_evidence_hash") || strings.Contains(body, `"data"`) {
+		t.Fatalf("scale response returned ambiguous or partial evidence: %s", body)
 	}
 }
 

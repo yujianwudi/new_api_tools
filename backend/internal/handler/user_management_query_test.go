@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -145,6 +146,41 @@ func TestGetInvitedUsersViewerResponseRedactsPIIAndUsesUserID(t *testing.T) {
 	}
 }
 
+func TestGetInvitedUsersRejectsInvalidPaginationParameters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/api/users/:user_id/invited", GetInvitedUsers)
+	validFingerprint := strings.Repeat("a", 64)
+	tests := []struct {
+		name   string
+		target string
+	}{
+		{name: "invalid page", target: "/api/users/1/invited?page=invalid"},
+		{name: "zero page", target: "/api/users/1/invited?page=0"},
+		{name: "invalid page size", target: "/api/users/1/invited?page_size=invalid"},
+		{name: "oversized page", target: "/api/users/1/invited?page_size=101"},
+		{name: "zero user id", target: "/api/users/0/invited"},
+		{name: "negative user id", target: "/api/users/-1/invited"},
+		{name: "malformed as of", target: "/api/users/1/invited?as_of=invalid&query_fingerprint=" + validFingerprint},
+		{name: "nonpositive as of", target: "/api/users/1/invited?as_of=0&query_fingerprint=" + validFingerprint},
+		{name: "missing fingerprint", target: "/api/users/1/invited?as_of=10"},
+		{name: "missing as of", target: "/api/users/1/invited?query_fingerprint=" + validFingerprint},
+		{name: "short fingerprint", target: "/api/users/1/invited?as_of=10&query_fingerprint=abc"},
+		{name: "nonhex fingerprint", target: "/api/users/1/invited?as_of=10&query_fingerprint=" + strings.Repeat("z", 64)},
+		{name: "uppercase fingerprint", target: "/api/users/1/invited?as_of=10&query_fingerprint=" + strings.Repeat("A", 64)},
+		{name: "missing cross-page identity", target: "/api/users/1/invited?page=2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.target, nil))
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"INVALID_PARAMS"`) {
+				t.Fatalf("status = %d, want 400 INVALID_PARAMS; body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestGetInvitedUsersEnforcesCrossPageSnapshotIdentity(t *testing.T) {
 	db := installHandlerUserQueryDB(t)
 	db.MustExec(`INSERT INTO users (id, username, display_name) VALUES (1, 'inviter', 'Inviter')`)
@@ -181,8 +217,8 @@ func TestGetInvitedUsersEnforcesCrossPageSnapshotIdentity(t *testing.T) {
 	}
 
 	asOfOnly := request(fmt.Sprintf("/api/users/1/invited?page=2&page_size=10&as_of=%d", payload.Data.AsOf))
-	if asOfOnly.Code != http.StatusConflict {
-		t.Fatalf("as_of-only status = %d, want 409; body=%s", asOfOnly.Code, asOfOnly.Body.String())
+	if asOfOnly.Code != http.StatusBadRequest || !strings.Contains(asOfOnly.Body.String(), `"code":"INVALID_PARAMS"`) {
+		t.Fatalf("as_of-only status = %d, want 400 INVALID_PARAMS; body=%s", asOfOnly.Code, asOfOnly.Body.String())
 	}
 	wrongFingerprint := fmt.Sprintf("%064x", 1)
 	if wrongFingerprint == payload.Data.QueryFingerprint {

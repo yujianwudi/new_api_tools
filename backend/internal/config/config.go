@@ -25,6 +25,16 @@ const (
 
 	defaultRedemptionMaxQuotaPerCode int64 = 50_000_000
 	defaultRedemptionMaxTotalQuota   int64 = 500_000_000
+
+	defaultAffiliateEvidenceRowCap      int64 = 20_000
+	minimumAffiliateEvidenceRowCap      int64 = 1
+	maximumAffiliateEvidenceRowCap      int64 = 100_000
+	defaultAffiliateQueryTimeout              = 5 * time.Second
+	minimumAffiliateQueryTimeout              = time.Second
+	maximumAffiliateQueryTimeout              = time.Minute
+	defaultAffiliateQueryMaxConcurrency       = 2
+	minimumAffiliateQueryMaxConcurrency       = 1
+	maximumAffiliateQueryMaxConcurrency       = 16
 )
 
 // Config holds all application configuration
@@ -69,6 +79,13 @@ type Config struct {
 	PublicModelMaxBatch          int   `json:"public_model_max_batch"`
 	PublicModelMaxBodyBytes      int64 `json:"public_model_max_body_bytes"`
 	PublicModelRequestsPerMinute int   `json:"public_model_requests_per_minute"`
+
+	// Invite top-up evidence reads are full-content hashes and therefore use
+	// independent fail-closed scale, deadline, and per-instance concurrency
+	// limits rather than consuming the database pool without bounds.
+	AffiliateEvidenceRowCap      int64         `json:"affiliate_evidence_row_cap"`
+	AffiliateQueryTimeout        time.Duration `json:"affiliate_query_timeout"`
+	AffiliateQueryMaxConcurrency int           `json:"affiliate_query_max_concurrency"`
 
 	// Active model probes are deliberately opt-in and use a dedicated model
 	// token. The allowlist and request budget prevent a catalog sync from
@@ -147,6 +164,34 @@ func (c *Config) ValidateSecurity() error {
 	return nil
 }
 
+// ValidateAffiliateStatsGuardrails rejects unsafe or malformed limits during
+// startup. These controls must never silently fall back because an accidental
+// high value can turn one operator request into an unbounded evidence scan.
+func (c *Config) ValidateAffiliateStatsGuardrails() error {
+	if c == nil {
+		return fmt.Errorf("configuration is required")
+	}
+	if c.AffiliateEvidenceRowCap < minimumAffiliateEvidenceRowCap || c.AffiliateEvidenceRowCap > maximumAffiliateEvidenceRowCap {
+		return fmt.Errorf(
+			"AFFILIATE_EVIDENCE_ROW_CAP must be between %d and %d successful top-up rows",
+			minimumAffiliateEvidenceRowCap, maximumAffiliateEvidenceRowCap,
+		)
+	}
+	if c.AffiliateQueryTimeout < minimumAffiliateQueryTimeout || c.AffiliateQueryTimeout > maximumAffiliateQueryTimeout {
+		return fmt.Errorf(
+			"AFFILIATE_QUERY_TIMEOUT_SECONDS must be between %d and %d seconds",
+			int(minimumAffiliateQueryTimeout/time.Second), int(maximumAffiliateQueryTimeout/time.Second),
+		)
+	}
+	if c.AffiliateQueryMaxConcurrency < minimumAffiliateQueryMaxConcurrency || c.AffiliateQueryMaxConcurrency > maximumAffiliateQueryMaxConcurrency {
+		return fmt.Errorf(
+			"AFFILIATE_QUERY_MAX_CONCURRENCY must be between %d and %d",
+			minimumAffiliateQueryMaxConcurrency, maximumAffiliateQueryMaxConcurrency,
+		)
+	}
+	return nil
+}
+
 // Global config instance
 var cfg *Config
 
@@ -189,6 +234,13 @@ func Load() *Config {
 		PublicModelMaxBatch:          getEnvInt("PUBLIC_MODEL_MAX_BATCH", 50),
 		PublicModelMaxBodyBytes:      int64(getEnvInt("PUBLIC_MODEL_MAX_BODY_BYTES", 16*1024)),
 		PublicModelRequestsPerMinute: getEnvInt("PUBLIC_MODEL_REQUESTS_PER_MINUTE", 30),
+
+		// Full-content affiliate evidence guardrails are strict: malformed or
+		// out-of-range values survive as invalid sentinels and stop startup in
+		// ValidateAffiliateStatsGuardrails instead of silently widening limits.
+		AffiliateEvidenceRowCap:      getEnvInt64Strict("AFFILIATE_EVIDENCE_ROW_CAP", defaultAffiliateEvidenceRowCap),
+		AffiliateQueryTimeout:        getEnvSecondsStrict("AFFILIATE_QUERY_TIMEOUT_SECONDS", defaultAffiliateQueryTimeout),
+		AffiliateQueryMaxConcurrency: getEnvIntStrict("AFFILIATE_QUERY_MAX_CONCURRENCY", defaultAffiliateQueryMaxConcurrency),
 
 		// Active probes are disabled until an operator explicitly supplies a
 		// dedicated token and an allowlist. The prompt and payload are fixed in
@@ -539,6 +591,18 @@ func getEnvInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
+func getEnvIntStrict(key string, defaultVal int) int {
+	raw, supplied := os.LookupEnv(key)
+	if !supplied || strings.TrimSpace(raw) == "" {
+		return defaultVal
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return -1
+	}
+	return value
+}
+
 func getEnvInt64(key string, defaultVal int64) int64 {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
@@ -546,6 +610,30 @@ func getEnvInt64(key string, defaultVal int64) int64 {
 		}
 	}
 	return defaultVal
+}
+
+func getEnvInt64Strict(key string, defaultVal int64) int64 {
+	raw, supplied := os.LookupEnv(key)
+	if !supplied || strings.TrimSpace(raw) == "" {
+		return defaultVal
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return value
+}
+
+func getEnvSecondsStrict(key string, defaultVal time.Duration) time.Duration {
+	raw, supplied := os.LookupEnv(key)
+	if !supplied || strings.TrimSpace(raw) == "" {
+		return defaultVal
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || seconds < int64(minimumAffiliateQueryTimeout/time.Second) || seconds > int64(maximumAffiliateQueryTimeout/time.Second) {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func getEnvBool(key string, defaultVal bool) bool {

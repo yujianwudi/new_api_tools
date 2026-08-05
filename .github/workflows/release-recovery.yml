@@ -121,6 +121,31 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: new_api_tools_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d new_api_tools_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mysql:
+        image: mysql:8.4.6@sha256:869218921e61d6c3c89820955d63cca42971f0e3e6c1e2792247bbd944ebc6e9
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: new_api_tools_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
 
     steps:
       - name: Checkout validated release commit
@@ -166,6 +191,14 @@ jobs:
       - name: Run Go tests
         working-directory: backend
         run: go test ./...
+
+      - name: Verify affiliate evidence across SQLite, MySQL, and PostgreSQL
+        working-directory: backend
+        env:
+          AFFILIATE_CROSS_ENGINE: '1'
+          AFFILIATE_TEST_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/new_api_tools_test?parseTime=true
+          AFFILIATE_TEST_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/new_api_tools_test?sslmode=disable
+        run: go test ./internal/service -run '^TestAffiliateEvidenceCrossEngineAcceptance$' -count=1 -v
 
       - name: Run all release performance acceptance gates
         working-directory: backend

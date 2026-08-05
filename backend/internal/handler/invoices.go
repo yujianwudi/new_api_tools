@@ -467,12 +467,12 @@ func maskInvoiceName(value string) string {
 }
 
 func maskInvoiceTaxID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) == 0 {
 		return ""
 	}
-	if len(value) <= 4 {
+	if len(runes) <= 4 {
 		return "****"
 	}
-	return "****" + value[len(value)-4:]
+	return "****" + string(runes[len(runes)-4:])
 }

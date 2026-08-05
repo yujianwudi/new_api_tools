@@ -34,6 +34,16 @@ func main() {
 	if err := cfg.ValidateSecurity(); err != nil {
 		logger.L.Fatal("安全配置校验失败: " + err.Error())
 	}
+	if err := cfg.ValidateAffiliateStatsGuardrails(); err != nil {
+		logger.L.Fatal("affiliate query guardrail validation failed: " + err.Error())
+	}
+	if err := service.ConfigureAffiliateStatsGuardrails(
+		cfg.AffiliateEvidenceRowCap,
+		cfg.AffiliateQueryTimeout,
+		cfg.AffiliateQueryMaxConcurrency,
+	); err != nil {
+		logger.L.Fatal("affiliate query guardrail initialization failed: " + err.Error())
+	}
 	logger.L.Banner("🚀 NewAPI Middleware Tool - Go Backend")
 	logger.L.System(fmt.Sprintf("服务器地址: %s", cfg.ServerAddr()))
 	logger.L.System(fmt.Sprintf("数据库引擎: %s", cfg.DatabaseEngine))

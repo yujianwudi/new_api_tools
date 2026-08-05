@@ -105,6 +105,21 @@ func respondAffiliateServiceError(c *gin.Context, operation string, err error) {
 		c.JSON(http.StatusConflict, models.ErrorResp("QUERY_SNAPSHOT_CHANGED", "Invite top-up detail evidence changed; refresh the parent query", ""))
 		return
 	}
+	if errors.Is(err, service.ErrAffiliateEvidenceScaleExceeded) {
+		c.JSON(http.StatusUnprocessableEntity, models.ErrorResp(
+			"INVITE_TOPUP_EVIDENCE_SCALE_EXCEEDED",
+			"Invite top-up evidence exceeds the configured safe row limit; narrow the query window",
+			"",
+		))
+		return
+	}
+	if errors.Is(err, service.ErrAffiliateStatsUnavailable) {
+		respondHandlerError(
+			c, http.StatusServiceUnavailable, "INVITE_TOPUP_ANALYSIS_UNAVAILABLE",
+			"Invite top-up analysis is temporarily unavailable", operation, err,
+		)
+		return
+	}
 	respondHandlerError(
 		c, http.StatusServiceUnavailable, "INVITE_TOPUP_ANALYSIS_UNAVAILABLE",
 		"Invite top-up analysis is temporarily unavailable", operation, err,

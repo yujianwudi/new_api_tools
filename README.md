@@ -79,7 +79,7 @@ flowchart LR
 
 ## 发票证据与已开票统计
 
-v0.5.2 的发票模块是控制台自己的证据台账，不是 NewAPI 余额字段，也不是税控开票系统。所有记录只写入 Tool Store：
+自 v0.5.2 引入的发票模块是控制台自己的证据台账，不是 NewAPI 余额字段，也不是税控开票系统。所有记录只写入 Tool Store：
 
 - `invoice_documents` 保存蓝票/红票类型、发票号、关联原票号、购方快照、币种、最小货币单位金额、税额、状态和开票时间；状态只允许从 `issued` 转为 `voided`，文档不可删除；
 - `invoice_events` 以只追加方式记录创建、导入和作废等事实；
@@ -205,7 +205,7 @@ curl -fsS \
 
 登记、导入和作废理由属于可审计自由文本，可能出现在 `viewer` 可读的通用操作审计或 `operator` 可读的发票事件中，禁止填写购方姓名、税号等 PII。作废请求体只能包含非空 `reason`；`voided_at` 由服务端 Tool Store clock 生成，客户端不能指定或回填作废时间。创建或导入的 `issued_at` 不得晚于服务端时钟，未来开票时间会在 CSV preview 和最终写入边界被拒绝。
 
-除只读 preview 外，所有发票写入都要求 `Idempotency-Key`，并在同一个 Tool Store 事务中写入文档/事件和操作审计。金额响应为十进制字符串；CSV 必须是 UTF-8、最多 1 MiB/500 行，并先 preview 再 confirm，非法金额、币种、日期、重复票号和公式前缀会被明确拒绝。v0.5.2 不提供发票导出 API。
+除只读 preview 外，所有发票写入都要求 `Idempotency-Key`，并在同一个 Tool Store 事务中写入文档/事件和操作审计。金额响应为十进制字符串；CSV 必须是 UTF-8、最多 1 MiB/500 行，并先 preview 再 confirm，非法金额、币种、日期、重复票号和公式前缀会被明确拒绝。v0.6.1 仍不提供发票导出 API。
 
 单张创建、CSV 确认导入和作废会以原始幂等键写入 `cp:<raw-idempotency-key>:intent/outcome` 审计链。浏览器只持久化不含购方信息、金额或 CSV 内容的 pending marker；遇到断网、超时或未知结果时，必须先通过 `GET /api/control-plane/operations/:idempotency_key` 对账。在旧操作终态可证明前，不能修改负载或换新键绕过锁后再次提交。
 
@@ -222,15 +222,15 @@ Tool Store 及其备份会包含购方名称和可选税号快照，必须按财
 
 上述受支持写请求必须带 `Idempotency-Key`，并在 JSON 请求体中提供理由。该键标识当前认证主体的一次逻辑写操作：仅在重试同一路由/动作、同一目标和同一请求体时复用；变更目标或负载必须生成新键，冲突复用返回 `409`。永久删除还要求 `admin` 角色和上游版本能力通过。
 
-v0.5.2 遇到网络中断、上游超时或审计尾部失败时，不会根据页面当前状态猜测结果，也不会盲目重放原请求。浏览器会保留无敏感负载的 pending marker，并通过 `GET /api/control-plane/operations/:idempotency_key` 读取与当前 actor、认证方式、动作和目标绑定的完整 intent/outcome 链；只有可证明的终态才能释放本地提交锁，损坏或孤立审计链返回 `503` 并继续失败关闭。
+v0.6.1 遇到网络中断、上游超时或审计尾部失败时，不会根据页面当前状态猜测结果，也不会盲目重放原请求。浏览器会保留无敏感负载的 pending marker，并通过 `GET /api/control-plane/operations/:idempotency_key` 读取与当前 actor、认证方式、动作和目标绑定的完整 intent/outcome 链；只有可证明的终态才能释放本地提交锁，损坏或孤立审计链返回 `503` 并继续失败关闭。
 
 兑换码创建要求 `admin`。创建的 `count` 和批量删除的 `ids` 均限制为每次请求 `1..100`；单码额度和单次总额度还分别受 `REDEMPTION_MAX_QUOTA_PER_CODE`、`REDEMPTION_MAX_TOTAL_QUOTA` 限制，默认约为 US$100/码和 US$1000/次。所有限制都在写入 intent 和调用 NewAPI 前执行；服务端不会自动拆分。安全重试由 `Idempotency-Key`、请求绑定和 intent/outcome 审计共同保证，而不是由批次大小保证。
 
 ## 已禁用或降级的危险旧功能
 
-v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的自动风控：
+v0.6.1 继续缩小自动化写入面。下面的旧能力不得视为可用的自动风控：
 
-| 旧能力 | v0.5.2 状态 |
+| 旧能力 | v0.6.1 状态 |
 |---|---|
 | Abuse Broadcast sidecar 表和后台写入器 | 不挂载；由 Tool Store 风险案件替代 |
 | AI 自动评估、自动扫描、连接测试 | 返回 `501 NOT_IMPLEMENTED` |
@@ -239,7 +239,7 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 | 批量永久清理 | 仅预览或禁用 |
 | Token 批量变更 | 无版本化适配器，返回 501 |
 | 批量开启 IP 记录 | 返回 501 |
-| Storage 通用配置入口（GET/POST/DELETE） | 全部返回 501；v0.5.2 不提供通用配置读取或写入 |
+| Storage 通用配置入口（GET/POST/DELETE） | 全部返回 501；v0.6.1 不提供通用配置读取或写入 |
 | 自动创建数据库索引 | 禁用，只列出建议 |
 | 缓存 warmup 状态 | 返回 501；请使用健康接口 |
 | 解封后批量恢复 Token | 不执行，避免复活已泄漏凭据 |
@@ -250,8 +250,8 @@ v0.5.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 
 ```bash
 # TEMPLATE ONLY - replace every REPLACE_WITH_* value from the v0.6.1 Release
-INSTALLER_COMMIT_SHA=f7f614193b1595dca7f581dfda6db18533fdb5e6
-INSTALL_SCRIPT_SHA256=d09949cceebaf9016b9d282c47041cdfeec60ff76d9a5471282775e1a961da1a
+INSTALLER_COMMIT_SHA=REPLACE_WITH_40_HEX_INSTALLER_COMMIT
+INSTALL_SCRIPT_SHA256=REPLACE_WITH_64_HEX_INSTALL_SCRIPT_SHA256
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -286,9 +286,10 @@ v0.6.1 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本；旧�
 git clone --branch v0.6.1 --depth 1 https://github.com/yujianwudi/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
-# 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下两个真实值：
+# 填写 .env 中的 NewAPI/认证配置后，从发行页复制以下三个真实值：
 NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST> \
 NEWAPI_TOOLS_EXPECTED_REVISION=<RELEASE_COMMIT_SHA> \
+NEWAPI_TOOLS_RELEASE_TAG=v0.6.1 \
 bash ./deploy.sh
 ```
 
@@ -306,6 +307,7 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 |---|---|---|
 | `NEWAPI_TOOLS_IMAGE` | 部署镜像；手动部署必须使用 `repo@sha256:digest` | 无默认值；安装/部署脚本自动解析并持久化 digest |
 | `NEWAPI_TOOLS_EXPECTED_REVISION` | 镜像必须匹配的 40 位 Git commit | 显式镜像时必填；从发行页复制 |
+| `NEWAPI_TOOLS_RELEASE_TAG` | 镜像签名与 provenance 必须匹配的严格发行标签 | 显式发行 digest 时必填，如 `v0.6.1` |
 | `SQL_DSN` | NewAPI 主库 DSN | 必填 |
 | `LOG_SQL_DSN` | 可选日志分库 DSN；留空回落主库 | 可选 |
 | `NEWAPI_BASEURL` | NewAPI 内部基地址 | 如 `http://new-api:3000` |
@@ -313,6 +315,9 @@ NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<MANIFEST_DIGEST>
 | `NEWAPI_ADMIN_USER_ID` | 管理员用户 ID | 写操作必填 |
 | `REDEMPTION_MAX_QUOTA_PER_CODE` | 单个兑换码最大 quota | `50000000`（约 US$100） |
 | `REDEMPTION_MAX_TOTAL_QUOTA` | 单次生成最大总 quota | `500000000`（约 US$1000） |
+| `AFFILIATE_EVIDENCE_ROW_CAP` | 单次邀请充值证据哈希允许读取的成功充值行数；超限返回 422，不生成截断哈希 | `20000`；合法范围 `1-100000` |
+| `AFFILIATE_QUERY_TIMEOUT_SECONDS` | 邀请充值 list/summary/detail 整次服务端 deadline；更早的调用方 deadline 优先 | `5`；合法范围 `1-60` |
+| `AFFILIATE_QUERY_MAX_CONCURRENCY` | 每实例同时运行的邀请充值重查询上限；排队受 context/deadline 约束 | `2`；合法范围 `1-16` |
 | `TOOL_STORE_PATH` | 独立 Tool Store 路径 | `DATA_DIR/control-plane.db` |
 | `ADMIN_PASSWORD` | 控制台登录密码 | 必填，安装器生成 |
 | `API_KEY` | 控制台 API Key | 必填，安装器生成 |

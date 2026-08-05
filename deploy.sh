@@ -387,6 +387,55 @@ remove_deploy_rollback_snapshot() {
   fi
 }
 
+start_and_finalize_committed_deploy_candidate() {
+  local candidate_image="$1" snapshot_file rollback_content cleanup_ok=true
+  snapshot_file="$(deploy_rollback_snapshot_path)"
+
+  if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+    if rollback_content="$(load_deploy_rollback_snapshot)"; then
+      DEPLOY_ROLLBACK_ENV_CONTENT="$rollback_content"
+      DEPLOY_ROLLBACK_ENV_AVAILABLE=true
+      if remove_deploy_rollback_snapshot; then
+        DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+        DEPLOY_ROLLBACK_ENV_CONTENT=""
+        DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+      else
+        cleanup_ok=false
+        log_warn "Tool Store 已提交；旧部署回滚快照未清理，仍将启动正式候选，禁止恢复旧 schema"
+      fi
+    else
+      DEPLOY_ROLLBACK_ENV_CONTENT=""
+      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+      cleanup_ok=false
+      log_warn "Tool Store 已提交；旧部署回滚快照不可读，已保留该文件和提交证据，仍将启动正式候选"
+    fi
+  else
+    DEPLOY_ROLLBACK_ENV_AVAILABLE=false
+    DEPLOY_ROLLBACK_ENV_CONTENT=""
+    DEPLOY_ROLLBACK_SNAPSHOT_PREEXISTING=false
+  fi
+
+  if ! start_deploy_services_and_wait candidate "$candidate_image"; then
+    log_error "Tool Store 已提交且不能安全回滚；正式候选启动失败，提交证据与未清理文件均已保留"
+    return 1
+  fi
+
+  if [[ "$cleanup_ok" == "true" ]]; then
+    if ! toolstore_txn_finish_committed "$SCRIPT_DIR"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据清理返回失败"
+    elif toolstore_txn_has_active "$SCRIPT_DIR"; then
+      cleanup_ok=false
+      log_warn "正式候选已健康，但 Tool Store 提交证据仍处于活动状态"
+    fi
+  fi
+
+  if [[ "$cleanup_ok" != "true" ]]; then
+    log_warn "正式候选已健康并保持运行；已保留 active.env 与未删除快照，下次运行 deploy.sh 将幂等重试清理，请勿手工恢复旧数据库、配置或镜像"
+  fi
+  log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
+}
+
 durable_remove_deploy_file() {
   local target="$1" parent removed=false
   parent="$(dirname "$target")"
@@ -634,9 +683,32 @@ pin_deploy_image_after_pull() {
     log_error "候选发行镜像的 Sigstore 身份、标签、commit、注解或 subject digest 验证失败；现有服务保持不变"
     return 1
   fi
+  if [[ -z "$NEWAPI_TOOLS_RELEASE_TAG" ]]; then
+    log_warn "开发部署仅验证 OCI revision，未执行发行 tag 的签名与 provenance 校验"
+  fi
   NEWAPI_TOOLS_IMAGE="$resolved"
   export NEWAPI_TOOLS_IMAGE
   log_success "候选部署镜像已验证并固定为 ${resolved}"
+}
+
+deploy_release_tag_at_commit() {
+  local commit="$1" tags tag release_tag=""
+  tags="$(git -C "$SCRIPT_DIR" tag --points-at "$commit")" ||
+    die "无法枚举部署 commit ${commit} 上的 Git tag"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+      [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+      die "部署 commit 上的发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式: ${tag}"
+    fi
+    [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    [[ "$(git -C "$SCRIPT_DIR" cat-file -t "refs/tags/${tag}" 2>/dev/null)" == "tag" ]] ||
+      die "发行标签必须是 annotated tag: ${tag}"
+    [[ -z "$release_tag" ]] ||
+      die "同一部署 commit 不能同时关联多个发行标签: ${release_tag}, ${tag}"
+    release_tag="$tag"
+  done <<< "$tags"
+  printf '%s\n' "$release_tag"
 }
 
 resolve_deploy_image() {
@@ -657,10 +729,8 @@ resolve_deploy_image() {
     git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git_commit="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)" ||
       die "无法解析当前 Git commit"
-    resolved_exact_tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
-    if [[ "$resolved_exact_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
-      [[ ! "$resolved_exact_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-      die "当前发行标签必须使用无前导零的严格 vMAJOR.MINOR.PATCH 格式"
+    if ! resolved_exact_tag="$(deploy_release_tag_at_commit "$git_commit")"; then
+      die "无法安全解析部署 commit ${git_commit} 的发行标签身份"
     fi
   fi
 
@@ -683,6 +753,8 @@ resolve_deploy_image() {
         die "当前发行标签 commit 与 NEWAPI_TOOLS_EXPECTED_REVISION 不一致"
       NEWAPI_TOOLS_RELEASE_TAG="$resolved_exact_tag"
     fi
+    [[ -n "$NEWAPI_TOOLS_RELEASE_TAG" ]] ||
+      die "显式 NEWAPI_TOOLS_IMAGE digest 必须提供 NEWAPI_TOOLS_RELEASE_TAG；开发部署请从未打 tag 的 Git checkout 派生镜像"
   fi
 
   if [[ -z "$image" && -n "$git_commit" ]]; then
@@ -2212,19 +2284,11 @@ recover_active_deploy_toolstore_transaction() {
   if [[ "$state" == "committed" ]]; then
     candidate_image="$(toolstore_txn_env_value "$content" CANDIDATE_IMAGE)"
     persist_deploy_image_env "$ENV_FILE" "$candidate_image" || return 1
-    if [[ -e "$(deploy_rollback_snapshot_path)" || -L "$(deploy_rollback_snapshot_path)" ]]; then
-      DEPLOY_ROLLBACK_ENV_CONTENT="$(load_deploy_rollback_snapshot)" || return 1
-      DEPLOY_ROLLBACK_ENV_AVAILABLE=true
-      remove_deploy_rollback_snapshot || return 1
-      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
-      DEPLOY_ROLLBACK_ENV_CONTENT=""
-    fi
     NEWAPI_TOOLS_IMAGE="$candidate_image"
     export NEWAPI_TOOLS_IMAGE
     configure_deploy_context_from_env "$ENV_FILE" || return 1
-    start_deploy_services_and_wait candidate "$candidate_image" || return 1
-    toolstore_txn_finish_committed "$SCRIPT_DIR" || return 1
-    return 0
+    start_and_finalize_committed_deploy_candidate "$candidate_image"
+    return $?
   fi
   if [[ "$state" == "rolled_back" ]]; then
     toolstore_txn_restore_files "$SCRIPT_DIR" || return 1
@@ -2530,10 +2594,11 @@ start_services() {
         ! toolstore_txn_verify_candidate "$SCRIPT_DIR"; then
         candidate_healthy=false
         log_error "候选服务健康，但 Tool Store schema/核心表计数验证失败，将执行数据库与镜像回滚"
-      elif toolstore_txn_has_active "$SCRIPT_DIR" &&
-        ! toolstore_txn_commit "$SCRIPT_DIR"; then
-        candidate_healthy=false
-        log_error "候选服务已健康，但 Tool Store 回滚事务无法提交，将执行回滚"
+      elif toolstore_txn_has_active "$SCRIPT_DIR"; then
+        if ! toolstore_txn_commit "$SCRIPT_DIR"; then
+          candidate_healthy=false
+          log_error "候选服务已健康，但 Tool Store 提交结果未确认；将读取持久事务状态后决定恢复方向"
+        fi
       elif [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]] &&
         ! (remove_deploy_rollback_snapshot); then
         candidate_healthy=false
@@ -2555,17 +2620,8 @@ start_services() {
       die "无法读取候选晋升事务状态；拒绝猜测是否可回滚"
     committed_state="$(toolstore_txn_env_value "$committed_content" STATE)"
     if [[ "$committed_state" == "committed" ]]; then
-      if [[ "$DEPLOY_ROLLBACK_ENV_AVAILABLE" == "true" ]]; then
-        (remove_deploy_rollback_snapshot) ||
-          die "Tool Store 已提交；旧配置快照清理失败，事务证据已保留供重试，禁止回滚旧 schema"
-      fi
-      DEPLOY_ROLLBACK_ENV_AVAILABLE=false
-      DEPLOY_ROLLBACK_ENV_CONTENT=""
-      if start_deploy_services_and_wait candidate "$candidate_image"; then
-        toolstore_txn_finish_committed "$SCRIPT_DIR" ||
-          die "正式候选已健康，但无法完成 Tool Store 提交证据清理"
+      if start_and_finalize_committed_deploy_candidate "$candidate_image"; then
         candidate_healthy=true
-        log_success "隔离候选验证和正式晋升均已完成，部署镜像为 ${candidate_image}"
       else
         die "Tool Store 已提交且不能安全回滚；正式候选启动失败，事务证据已保留供下次继续晋升"
       fi
@@ -2738,14 +2794,16 @@ NewAPI Middleware Tool - 一键部署脚本
   API_KEY            后端 API Key (默认: 交互式输入或自动生成)
   NEWAPI_TOOLS_IMAGE 完整 repo@sha256:digest（发行/无 Git 部署必填）
   NEWAPI_TOOLS_EXPECTED_REVISION 与镜像匹配的 40 位 Git commit（显式镜像必填）
+  NEWAPI_TOOLS_RELEASE_TAG 与镜像签名/provenance 匹配的 vMAJOR.MINOR.PATCH（显式发行镜像必填）
   FRONTEND_PORT      前端端口 (默认: 1145)
   FRONTEND_BIND      前端端口绑定网卡 0.0.0.0/127.0.0.1 (默认: 交互式选择)
   TRUSTED_PROXY_CIDRS 允许解析其 XFF 的精确代理 IP/CIDR (默认: loopback)
 
 示例:
-  # 发行版基本部署（从 GitHub Release 复制两项值）
+  # 发行版基本部署（从 GitHub Release 复制三项值）
   NEWAPI_TOOLS_IMAGE=ghcr.io/yujianwudi/new_api_tools@sha256:<manifest-digest> \
-  NEWAPI_TOOLS_EXPECTED_REVISION=<release-commit> ./deploy.sh
+  NEWAPI_TOOLS_EXPECTED_REVISION=<release-commit> \
+  NEWAPI_TOOLS_RELEASE_TAG=v0.6.1 ./deploy.sh
 
   # 指定容器名部署
   NEWAPI_CONTAINER=my-newapi ./deploy.sh
@@ -2873,12 +2931,32 @@ main() {
     "")
       # 正常部署流程
       acquire_deploy_state_lock "$SCRIPT_DIR"
-      resolve_deploy_image
-      local resolved_candidate_image="$NEWAPI_TOOLS_IMAGE"
+      local recovery_initial_content="" recovery_initial_state=""
+      if toolstore_txn_has_active "$SCRIPT_DIR"; then
+        recovery_initial_content="$(toolstore_txn_load_record "$SCRIPT_DIR")" ||
+          die "无法在解析新候选前读取 durable Tool Store 活动事务"
+        recovery_initial_state="$(toolstore_txn_env_value "$recovery_initial_content" STATE)"
+        [[ -n "$recovery_initial_state" ]] ||
+          die "durable Tool Store 活动事务缺少有效状态"
+      fi
       recover_active_deploy_toolstore_transaction ||
         die "未完成的 Tool Store 事务无法安全恢复；拒绝生成或启动新候选配置"
-      NEWAPI_TOOLS_IMAGE="$resolved_candidate_image"
-      export NEWAPI_TOOLS_IMAGE
+      if [[ "$recovery_initial_state" == "committed" ]]; then
+        local recovery_content recovery_state
+        if toolstore_txn_has_active "$SCRIPT_DIR"; then
+          recovery_content="$(toolstore_txn_load_record "$SCRIPT_DIR")" ||
+            die "正式候选恢复后无法读取保留的 Tool Store 提交证据"
+          recovery_state="$(toolstore_txn_env_value "$recovery_content" STATE)"
+          [[ "$recovery_state" == "committed" ]] ||
+            die "committed 恢复返回成功但残留事务状态已改变"
+          log_warn "正式候选已恢复健康，但 committed 清理证据仍被保留；本次不生成新配置，也不读取旧回滚快照"
+        else
+          log_success "正式候选已恢复健康，committed 快照与提交证据已完成清理"
+        fi
+        log_success "当前候选服务可用；本次不解析或启动新的部署请求"
+        return 0
+      fi
+      resolve_deploy_image
       echo ""
       echo -e "${BLUE}========================================${NC}"
       echo -e "${BLUE}  NewAPI Middleware Tool 部署脚本${NC}"

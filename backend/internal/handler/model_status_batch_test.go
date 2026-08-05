@@ -108,3 +108,55 @@ func TestAllModelStatusCapsAt1000AndReportsTruncation(t *testing.T) {
 			response.Data[0].ModelName, response.Data[len(response.Data)-1].ModelName)
 	}
 }
+
+func TestPublicAllModelStatusCountsOnlyValidModelNames(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configurePublicModelStatusTest(t)
+	db := installEmptyHandlerDatabase(t)
+	db.SetMaxOpenConns(1)
+	db.MustExec(`CREATE TABLE logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		model_name TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		type INTEGER NOT NULL,
+		completion_tokens INTEGER NOT NULL
+	)`)
+
+	cache.Get().ClearLocal()
+	t.Cleanup(func() { cache.Get().ClearLocal() })
+	catalog := []map[string]interface{}{
+		{"model_name": "valid-a"},
+		{"model_name": " valid-a "},
+		{"model_name": "   "},
+		{"request_count_24h": int64(1)},
+		{"model_name": int64(7)},
+		{"model_name": "  valid-b  "},
+	}
+	if err := cache.Get().Set("model_status:available_models", catalog, time.Minute); err != nil {
+		t.Fatalf("cache malformed catalog fixture: %v", err)
+	}
+
+	router := gin.New()
+	router.GET("/status/all", GetPublicAllModelsStatusHandler)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/status/all?window=24h", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public status/all returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Data        []map[string]interface{} `json:"data"`
+		TotalModels int                      `json:"total_models"`
+		Returned    int                      `json:"returned"`
+		Truncated   bool                     `json:"truncated"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode public status/all response: %v", err)
+	}
+	if response.TotalModels != 2 || response.Returned != 2 || len(response.Data) != 2 || response.Truncated {
+		t.Fatalf("invalid catalog entries affected public metadata: total=%d returned=%d data=%d truncated=%v",
+			response.TotalModels, response.Returned, len(response.Data), response.Truncated)
+	}
+	if response.Data[0]["model_name"] != "valid-a" || response.Data[1]["model_name"] != "valid-b" {
+		t.Fatalf("public model names were not canonicalized/deduplicated: %#v", response.Data)
+	}
+}

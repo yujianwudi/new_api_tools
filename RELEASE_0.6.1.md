@@ -12,6 +12,7 @@
 - 邀请用户详情修复父子请求竞态、分页统计和不存在邀请人的错误语义；跨页请求绑定首屏 `as_of` 与全量内容 SHA-256 指纹，内容漂移返回 409。
 - 邀请充值父列表与详情统一 success/completed/1、完成时间、时区和半开日期区间。
 - 每个父行携带详情 SHA-256 证据哈希；详情请求同时绑定 query fingerprint、as_of、总数和内容哈希。即使记录数不变但金额、用户、状态或时间发生替换，也会返回 409，不展示旧证据。
+- 证据哈希默认最多完整读取 20,000 条成功充值记录，并为 list/summary/detail 统一设置 5 秒 deadline 和每实例 2 个重查询并发槽；超过上限返回 `422 INVITE_TOPUP_EVIDENCE_SCALE_EXCEEDED`，超时或排队取消返回 `503 INVITE_TOPUP_ANALYSIS_UNAVAILABLE`，绝不对截断数据生成哈希。
 - 充值来源没有可靠币种、精度和历史邀请关系时保持 `unreconciled`，金额为 `null`，不把上游原始和或未知值宣传成返利。
 
 ### 模型状态监测
@@ -59,8 +60,8 @@
 
 ```bash
 # TEMPLATE ONLY - DO NOT RUN UNTIL EVERY REPLACE_WITH_* VALUE IS REPLACED
-INSTALLER_COMMIT_SHA=f7f614193b1595dca7f581dfda6db18533fdb5e6
-INSTALL_SCRIPT_SHA256=d09949cceebaf9016b9d282c47041cdfeec60ff76d9a5471282775e1a961da1a
+INSTALLER_COMMIT_SHA=REPLACE_WITH_40_HEX_INSTALLER_COMMIT
+INSTALL_SCRIPT_SHA256=REPLACE_WITH_64_HEX_INSTALL_SCRIPT_SHA256
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \

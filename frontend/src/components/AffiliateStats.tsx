@@ -379,7 +379,7 @@ export function AffiliateStats() {
       if (controller.signal.aborted || detailControllerRef.current !== controller) return
       if (!response.ok || !body.success) throw new Error(body.error?.message || '逐笔源记录不可用')
       const result = body.data as PaginatedDetails
-      if (result.inviter_id !== inviterId || result.query_fingerprint !== listMetadata.query_fingerprint || !isSha256Hex(result.detail_evidence_hash) || result.detail_evidence_hash !== expectedEvidenceHash || result.as_of !== asOf || result.page !== requestedPage || result.page_size !== 10 || result.total !== expectedTotal) {
+      if (result.inviter_id !== inviterId || !equalSha256Hex(result.query_fingerprint, listMetadata.query_fingerprint) || !equalSha256Hex(result.detail_evidence_hash, expectedEvidenceHash) || result.as_of !== asOf || result.page !== requestedPage || result.page_size !== 10 || result.total !== expectedTotal) {
         throw new Error('详情响应与当前父查询不一致')
       }
       setDetailData(result)

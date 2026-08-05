@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -426,7 +428,7 @@ func DisableToken(c *gin.Context) {
 // GET /api/users/:user_id/invited
 func GetInvitedUsers(c *gin.Context) {
 	userID, err := strconv.ParseInt(c.Param("user_id"), 10, 64)
-	if err != nil {
+	if err != nil || userID <= 0 {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid user ID", ""))
 		return
 	}
@@ -434,7 +436,7 @@ func GetInvitedUsers(c *gin.Context) {
 	page, pageErr := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, pageSizeErr := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if pageErr != nil || pageSizeErr != nil || page < 1 || pageSize < 1 || pageSize > 100 {
-		c.JSON(http.StatusConflict, models.ErrorResp("INVITED_SNAPSHOT_MISMATCH", "Invitation snapshot pagination contract is invalid", ""))
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid invitation pagination parameters", ""))
 		return
 	}
 
@@ -443,11 +445,14 @@ func GetInvitedUsers(c *gin.Context) {
 	var identity *service.InvitedUsersSnapshotIdentity
 	if asOfRaw != "" || fingerprint != "" {
 		asOf, parseErr := strconv.ParseInt(asOfRaw, 10, 64)
-		if parseErr != nil || fingerprint == "" {
-			c.JSON(http.StatusConflict, models.ErrorResp("INVITED_SNAPSHOT_MISMATCH", "Invitation snapshot identity is invalid", ""))
+		if parseErr != nil || asOf <= 0 || !validInvitedUsersSnapshotFingerprint(fingerprint) {
+			c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid invitation snapshot identity", ""))
 			return
 		}
 		identity = &service.InvitedUsersSnapshotIdentity{AsOf: asOf, QueryFingerprint: fingerprint}
+	} else if page > 1 {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invitation snapshot identity is required after page one", ""))
+		return
 	}
 
 	svc := service.NewUserManagementService()
@@ -468,4 +473,12 @@ func GetInvitedUsers(c *gin.Context) {
 		data = data.RedactForViewer()
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func validInvitedUsersSnapshotFingerprint(value string) bool {
+	if len(value) != sha256.Size*2 || strings.ToLower(value) != value {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }

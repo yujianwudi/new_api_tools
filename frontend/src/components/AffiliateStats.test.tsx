@@ -349,6 +349,28 @@ describe('AffiliateStats request ownership and accessibility', () => {
     expect(screen.queryByText('untrusted-detail')).not.toBeInTheDocument()
   })
 
+  it('fails closed when the detail query fingerprint does not match the parent query', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const parent = parentRow(5, 'fingerprint-inviter', 1)
+    useImmediateParentHandlers([parent])
+    server.use(
+      http.get('*/api/users/invite-topup-analysis/:inviterID/details', ({ params, request }) => {
+        const url = new URL(request.url)
+        const body = detailBody(url, Number(params.inviterID), 'untrusted-fingerprint-detail', parent.detail_evidence_hash)
+        body.data.query_fingerprint = 'f'.repeat(64)
+        return jsonResponse(body)
+      }),
+    )
+
+    const actor = userEvent.setup()
+    render(<AffiliateStats />)
+    await screen.findByText('fingerprint-inviter')
+    await actor.click(screen.getByRole('button', { name: /fingerprint-inviter/ }))
+
+    expect(await screen.findByRole('alert')).toBeVisible()
+    expect(screen.queryByText('untrusted-fingerprint-detail')).not.toBeInTheDocument()
+  })
+
   it.each([
     ['missing', ''],
     ['malformed', 'not-a-sha256'],

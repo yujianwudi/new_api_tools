@@ -63,6 +63,13 @@ interface EmbedTokenGroup {
 interface EmbedTokenGroupSyncResult {
   groups: EmbedTokenGroup[]
   groupFilter: string
+  scopeAvailable: boolean
+}
+
+type EmbedConfigState = 'loading' | 'ready' | 'unavailable'
+
+function isEmbedModelNameList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(model => typeof model === 'string' && model.trim().length > 0)
 }
 
 function isEmbedTokenGroup(value: unknown): value is EmbedTokenGroup {
@@ -70,7 +77,7 @@ function isEmbedTokenGroup(value: unknown): value is EmbedTokenGroup {
   const group = value as Record<string, unknown>
   return typeof group.group_name === 'string' && group.group_name.trim().length > 0
     && typeof group.model_count === 'number' && Number.isInteger(group.model_count) && group.model_count >= 0
-    && Array.isArray(group.models) && group.models.every(model => typeof model === 'string')
+    && isEmbedModelNameList(group.models)
     && (group.description === undefined || typeof group.description === 'string')
     && (group.ratio === undefined || (typeof group.ratio === 'number' && Number.isFinite(group.ratio)))
 }
@@ -81,6 +88,15 @@ interface EmbedCustomGroup {
   name: string
   icon?: string
   models: string[]
+}
+
+function isEmbedCustomGroup(value: unknown): value is EmbedCustomGroup {
+  if (typeof value !== 'object' || value === null) return false
+  const group = value as Record<string, unknown>
+  return typeof group.id === 'string' && group.id.trim().length > 0
+    && typeof group.name === 'string' && group.name.trim().length > 0
+    && (group.icon === undefined || typeof group.icon === 'string')
+    && isEmbedModelNameList(group.models)
 }
 
 // 厂商关键字映射：vendor 分组配置了 icon 时，名字含这些关键字的模型自动归入。
@@ -913,6 +929,14 @@ function embedTokenGroupModelsForFilter(groups: EmbedTokenGroup[], filter: strin
   return groups.find(group => group.group_name === groupName)?.models ?? []
 }
 
+function embedStatusScopeKey(window: string, filter: string, models: readonly string[]): string {
+  return JSON.stringify({
+    window,
+    filter,
+    models: Array.from(new Set(models)).sort(),
+  })
+}
+
 function isEmbedAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
 }
@@ -925,7 +949,10 @@ export function ModelStatusEmbed({
   const [maxBatch, setMaxBatch] = useState(PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH)
   const [modelStatuses, setModelStatuses] = useState<ModelStatus[]>([])
   const [statusWindow, setStatusWindow] = useState('')
+  const [statusScopeKey, setStatusScopeKey] = useState('')
   const [statusFetchFailed, setStatusFetchFailed] = useState(false)
+  const [configState, setConfigState] = useState<EmbedConfigState>('loading')
+  const [tokenGroupScopeUnavailable, setTokenGroupScopeUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
@@ -937,6 +964,8 @@ export function ModelStatusEmbed({
   const [tokenGroups, setTokenGroups] = useState<EmbedTokenGroup[]>([])
   const [groupFilter, setGroupFilter] = useState('all')
   const [siteTitle, setSiteTitle] = useState('')
+  const configRequestIdRef = useRef(0)
+  const configRequestControllerRef = useRef<AbortController | null>(null)
   const statusRequestIdRef = useRef(0)
   const statusRequestControllerRef = useRef<AbortController | null>(null)
   const tokenGroupRequestIdRef = useRef(0)
@@ -950,7 +979,44 @@ export function ModelStatusEmbed({
 
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const styles = themeStyles[theme] || themeStyles.daylight
-  const displayedModelStatuses = statusWindow === timeWindow ? modelStatuses : []
+  const desiredTokenGroupModels = useMemo(
+    () => embedTokenGroupModelsForFilter(tokenGroups, groupFilter),
+    [groupFilter, tokenGroups],
+  )
+  const desiredFetchSet = useMemo(
+    () => Array.from(new Set([...selectedModels, ...desiredTokenGroupModels])),
+    [desiredTokenGroupModels, selectedModels],
+  )
+  const desiredStatusScopeKey = useMemo(
+    () => embedStatusScopeKey(timeWindow, groupFilter, desiredFetchSet),
+    [desiredFetchSet, groupFilter, timeWindow],
+  )
+  const displayedModelStatuses = useMemo(
+    () => statusWindow === timeWindow && statusScopeKey === desiredStatusScopeKey ? modelStatuses : [],
+    [desiredStatusScopeKey, modelStatuses, statusScopeKey, statusWindow, timeWindow],
+  )
+  const visibleModelStatuses = useMemo(() => displayedModelStatuses.filter(model => {
+    if (groupFilter === 'all') return true
+    if (groupFilter.startsWith('token:')) {
+      const groupName = groupFilter.slice(6)
+      const group = tokenGroups.find(item => item.group_name === groupName)
+      return Boolean(group?.models.includes(model.model_name))
+    }
+    const group = customGroups.find(item => item.id === groupFilter)
+    return Boolean(group && embedModelMatchesGroup(model.model_name, group))
+  }), [customGroups, displayedModelStatuses, groupFilter, tokenGroups])
+
+  const clearTrustedStatuses = useCallback(() => {
+    statusRequestIdRef.current += 1
+    statusRequestControllerRef.current?.abort()
+    statusRequestControllerRef.current = null
+    setModelStatuses([])
+    setStatusWindow('')
+    setStatusScopeKey('')
+    setStatusFetchFailed(false)
+    setLastUpdate(null)
+    setLoading(false)
+  }, [])
 
   // Parse URL params for theme override
   useEffect(() => {
@@ -962,49 +1028,63 @@ export function ModelStatusEmbed({
   }, [])
 
   // Load config from backend
-  const loadConfig = useCallback(async (signal: AbortSignal) => {
+  const loadConfig = useCallback(async (): Promise<boolean | undefined> => {
+    const requestId = ++configRequestIdRef.current
+    configRequestControllerRef.current?.abort()
+    const controller = new AbortController()
+    configRequestControllerRef.current = controller
+    setConfigState('loading')
+    clearTrustedStatuses()
     try {
-      const response = await fetch(`${apiUrl}/api/model-status/embed/config/selected`, { signal })
+      const response = await fetch(`${apiUrl}/api/model-status/embed/config/selected`, { signal: controller.signal })
       const data = await response.json()
       if (!response.ok || !data.success) {
         throw new Error(data.error?.message || data.message || `HTTP ${response.status}`)
       }
-      setMaxBatch(normalizeModelStatusMaxBatch(data.max_batch, PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH))
-      if (data.success) {
-        if (Array.isArray(data.data) && data.data.every((model: unknown) => typeof model === 'string')) {
-          setSelectedModels(data.data)
-        }
-        if (data.time_window) {
-          setTimeWindow(data.time_window)
-        }
-        // Load refresh interval from backend
-        if (data.refresh_interval !== undefined && data.refresh_interval !== null) {
-          setRefreshInterval(data.refresh_interval)
-          setCountdown(data.refresh_interval)
-        }
-        // Load theme from backend if not overridden by URL
-        const urlParams = new URLSearchParams(window.location.search)
-        if (!urlParams.get('theme') && data.theme) {
-          // Validate theme exists in themeStyles, fallback to daylight for legacy values
-          const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
-          setTheme(validTheme as ThemeId)
-        }
-        // Load custom groups
-        if (data.custom_groups && Array.isArray(data.custom_groups)) {
-          setCustomGroups(data.custom_groups as EmbedCustomGroup[])
-        }
-        // Load site title
-        if (data.site_title) {
-          setSiteTitle(data.site_title)
-        }
-        return data.data || []
+      if (!isEmbedModelNameList(data.data)) {
+        throw new Error('Invalid model status embed config response')
       }
+      const customGroupsPayload = data.custom_groups ?? []
+      if (!Array.isArray(customGroupsPayload) || !customGroupsPayload.every(isEmbedCustomGroup)) {
+        throw new Error('Invalid model status embed custom-group response')
+      }
+      if (requestId !== configRequestIdRef.current) return undefined
+
+      setMaxBatch(normalizeModelStatusMaxBatch(data.max_batch, PUBLIC_MODEL_STATUS_DEFAULT_MAX_BATCH))
+      setSelectedModels(data.data)
+      if (typeof data.time_window === 'string' && data.time_window) {
+        setTimeWindow(data.time_window)
+      }
+      // Load refresh interval from backend
+      if (data.refresh_interval !== undefined && data.refresh_interval !== null) {
+        setRefreshInterval(data.refresh_interval)
+        setCountdown(data.refresh_interval)
+      }
+      // Load theme from backend if not overridden by URL
+      const urlParams = new URLSearchParams(window.location.search)
+      if (!urlParams.get('theme') && data.theme) {
+        // Validate theme exists in themeStyles, fallback to daylight for legacy values
+        const validTheme = THEMES.find(t => t.id === data.theme) ? data.theme : 'daylight'
+        setTheme(validTheme as ThemeId)
+      }
+      setCustomGroups(customGroupsPayload)
+      setSiteTitle(typeof data.site_title === 'string' ? data.site_title : '')
+      setConfigState('ready')
+      return true
     } catch (error) {
-      if (signal.aborted || isEmbedAbortError(error)) return []
+      if (controller.signal.aborted || requestId !== configRequestIdRef.current || isEmbedAbortError(error)) return undefined
       console.error('Failed to load config from backend:', error)
+      clearTrustedStatuses()
+      setSelectedModels([])
+      setCustomGroups([])
+      setConfigState('unavailable')
+      return false
+    } finally {
+      if (requestId === configRequestIdRef.current && configRequestControllerRef.current === controller) {
+        configRequestControllerRef.current = null
+      }
     }
-    return []
-  }, [apiUrl])
+  }, [apiUrl, clearTrustedStatuses])
 
   const fetchTokenGroups = useCallback(async (): Promise<EmbedTokenGroupSyncResult | null | undefined> => {
     const requestId = ++tokenGroupRequestIdRef.current
@@ -1025,39 +1105,44 @@ export function ModelStatusEmbed({
       const groups = data.data as EmbedTokenGroup[]
       setTokenGroups(groups)
 
-      let nextGroupFilter = groupFilterRef.current
-      if (nextGroupFilter.startsWith('token:') && !groups.some(group => `token:${group.group_name}` === nextGroupFilter)) {
-        nextGroupFilter = 'all'
-        groupFilterRef.current = nextGroupFilter
-        setGroupFilter(nextGroupFilter)
-      }
+      const nextGroupFilter = groupFilterRef.current
+      const scopeAvailable = !nextGroupFilter.startsWith('token:')
+        || groups.some(group => `token:${group.group_name}` === nextGroupFilter)
+      setTokenGroupScopeUnavailable(!scopeAvailable)
+      if (!scopeAvailable) clearTrustedStatuses()
 
-      return { groups, groupFilter: nextGroupFilter }
+      return { groups, groupFilter: nextGroupFilter, scopeAvailable }
     } catch (error) {
       if (controller.signal.aborted || requestId !== tokenGroupRequestIdRef.current || isEmbedAbortError(error)) {
         return undefined
       }
       console.error('Failed to fetch token groups:', error)
+      setTokenGroups([])
+      setTokenGroupScopeUnavailable(true)
+      if (groupFilterRef.current.startsWith('token:')) clearTrustedStatuses()
       return null
     } finally {
       if (requestId === tokenGroupRequestIdRef.current && tokenGroupRequestControllerRef.current === controller) {
         tokenGroupRequestControllerRef.current = null
       }
     }
-  }, [apiUrl])
+  }, [apiUrl, clearTrustedStatuses])
 
   useEffect(() => {
-    const controller = new AbortController()
-    void loadConfig(controller.signal)
+    void loadConfig()
+  }, [loadConfig])
+
+  useEffect(() => {
     void fetchTokenGroups()
-    return () => controller.abort()
-  }, [fetchTokenGroups, loadConfig])
+  }, [fetchTokenGroups])
 
   useEffect(() => {
     groupFilterRef.current = groupFilter
   }, [groupFilter])
 
   useEffect(() => () => {
+    configRequestIdRef.current += 1
+    configRequestControllerRef.current?.abort()
     statusRequestIdRef.current += 1
     statusRequestControllerRef.current?.abort()
     tokenGroupRequestIdRef.current += 1
@@ -1066,11 +1151,20 @@ export function ModelStatusEmbed({
 
   // Fetch model statuses
   // Embed page always uses cache to reduce database load
-  const fetchModelStatuses = useCallback(async (tokenGroupModelsOverride?: readonly string[]) => {
+  const fetchModelStatuses = useCallback(async (
+    tokenGroupModelsOverride?: readonly string[],
+    scopeFilter = groupFilter,
+  ) => {
+    if (configState !== 'ready') return
+    if (scopeFilter.startsWith('token:') && tokenGroupScopeUnavailable) {
+      clearTrustedStatuses()
+      return
+    }
     // 选中某个密钥分组时，自动把分组下全部模型并入请求集合，
     // 用户无需手工把每个模型加进监控列表也能看到分组下的状态。
-    const tokenGroupModels = tokenGroupModelsOverride ?? embedTokenGroupModelsForFilter(tokenGroups, groupFilter)
+    const tokenGroupModels = tokenGroupModelsOverride ?? embedTokenGroupModelsForFilter(tokenGroups, scopeFilter)
     const fetchSet = Array.from(new Set([...selectedModels, ...tokenGroupModels]))
+    const requestScopeKey = embedStatusScopeKey(timeWindow, scopeFilter, fetchSet)
     const requestId = ++statusRequestIdRef.current
     statusRequestControllerRef.current?.abort()
     setStatusFetchFailed(false)
@@ -1079,6 +1173,7 @@ export function ModelStatusEmbed({
       statusRequestControllerRef.current = null
       setModelStatuses([])
       setStatusWindow(timeWindow)
+      setStatusScopeKey(requestScopeKey)
       setLoading(false)
       return
     }
@@ -1108,6 +1203,7 @@ export function ModelStatusEmbed({
       if (requestId !== statusRequestIdRef.current) return
       setModelStatuses(chunkResults.flat())
       setStatusWindow(timeWindow)
+      setStatusScopeKey(requestScopeKey)
       setStatusFetchFailed(false)
       setLastUpdate(new Date())
     } catch (error) {
@@ -1115,6 +1211,7 @@ export function ModelStatusEmbed({
       controller.abort()
       setModelStatuses([])
       setStatusWindow(timeWindow)
+      setStatusScopeKey(requestScopeKey)
       setStatusFetchFailed(true)
       setLastUpdate(null)
       console.error('Failed to fetch model statuses:', error)
@@ -1124,15 +1221,19 @@ export function ModelStatusEmbed({
         setLoading(false)
       }
     }
-  }, [apiUrl, selectedModels, timeWindow, groupFilter, tokenGroups, maxBatch])
+  }, [apiUrl, clearTrustedStatuses, configState, selectedModels, timeWindow, groupFilter, tokenGroups, tokenGroupScopeUnavailable, maxBatch])
 
   const refreshStatusesWithLatestTokenGroups = useCallback(async () => {
     const tokenGroupSync = await fetchTokenGroups()
     if (tokenGroupSync === undefined) return
-    const tokenGroupModels = tokenGroupSync === null
-      ? undefined
-      : embedTokenGroupModelsForFilter(tokenGroupSync.groups, tokenGroupSync.groupFilter)
-    await fetchModelStatuses(tokenGroupModels)
+    if (tokenGroupSync === null) {
+      if (groupFilterRef.current.startsWith('token:')) return
+      await fetchModelStatuses([])
+      return
+    }
+    if (!tokenGroupSync.scopeAvailable) return
+    const tokenGroupModels = embedTokenGroupModelsForFilter(tokenGroupSync.groups, tokenGroupSync.groupFilter)
+    await fetchModelStatuses(tokenGroupModels, tokenGroupSync.groupFilter)
   }, [fetchModelStatuses, fetchTokenGroups])
 
   const runAutomaticRefresh = useCallback(async () => {
@@ -1148,15 +1249,20 @@ export function ModelStatusEmbed({
     setRefreshing(true)
     setCountdown(refreshInterval)
     try {
+      if (configState !== 'ready') {
+        await Promise.all([loadConfig(), fetchTokenGroups()])
+        return
+      }
       await refreshStatusesWithLatestTokenGroups()
     } finally {
       setRefreshing(false)
     }
-  }, [refreshInterval, refreshStatusesWithLatestTokenGroups])
+  }, [configState, fetchTokenGroups, loadConfig, refreshInterval, refreshStatusesWithLatestTokenGroups])
 
   useEffect(() => {
+    if (configState !== 'ready') return
     void fetchModelStatuses()
-  }, [fetchModelStatuses])
+  }, [configState, fetchModelStatuses])
 
   // Auto refresh with visibility change handling
   // When page is in background, browser throttles setInterval
@@ -1202,9 +1308,10 @@ export function ModelStatusEmbed({
   }, [refreshInterval, runAutomaticRefresh])
 
   const handleGroupFilterChange = useCallback((filter: string) => {
+    if (filter !== groupFilterRef.current) clearTrustedStatuses()
     groupFilterRef.current = filter
     setGroupFilter(filter)
-  }, [])
+  }, [clearTrustedStatuses])
 
   // Handler for hover
   const handleSlotHover = (slot: SlotStatus, rect: DOMRect) => {
@@ -1215,20 +1322,32 @@ export function ModelStatusEmbed({
     setHoveredSlot(slot)
   }
 
+  const tokenGroupFilterUnavailable = tokenGroupScopeUnavailable && groupFilter.startsWith('token:')
+  const blockingScopeUnavailable = configState === 'unavailable' || tokenGroupFilterUnavailable
+  const statusScopeLoading = configState === 'ready'
+    && !blockingScopeUnavailable
+    && (loading || statusScopeKey !== desiredStatusScopeKey)
+
   // Loading state
-  if ((loading || statusWindow !== timeWindow) && displayedModelStatuses.length === 0) {
+  if (configState === 'loading') {
     return (
       <div
+        data-model-status-surface
         className={cn("min-h-screen flex items-center justify-center", styles.container)}
         style={styles.background ? { background: styles.background.replace(/\s+/g, ' ') } : undefined}
+        role="status"
+        aria-live="polite"
+        aria-label="正在加载模型状态"
       >
-        <Loader2 className={cn("h-8 w-8 animate-spin", styles.loader)} />
+        <Loader2 aria-hidden="true" className={cn("h-8 w-8 animate-spin", styles.loader)} />
+        <span className="sr-only">正在加载模型状态</span>
       </div>
     )
   }
 
   return (
     <div
+      data-model-status-surface
       className={styles.container}
       style={styles.background ? { background: styles.background.replace(/\s+/g, ' ') } : undefined}
     >
@@ -1256,7 +1375,7 @@ export function ModelStatusEmbed({
             </div>
             <p className={styles.headerSubtitle}>
               {TIME_WINDOWS.find(w => w.value === timeWindow)?.label || '24小时'}
-              {theme !== 'minimal' && ' 滑动窗口'} · {selectedModels.length} {theme === 'minimal' ? 'models' : '个模型'}
+              {theme !== 'minimal' && ' 滑动窗口'} · {visibleModelStatuses.length} {theme === 'minimal' ? 'models' : '个模型'}
               {lastUpdate && theme !== 'minimal' && (
                 <span className="ml-2">· 更新于 {lastUpdate.toLocaleTimeString('zh-CN')}</span>
               )}
@@ -1272,10 +1391,10 @@ export function ModelStatusEmbed({
             )}
             onClick={() => void handleManualRefresh()}
             disabled={refreshing}
-            aria-label="立即刷新模型状态和令牌分组"
-            title="立即刷新模型状态和令牌分组"
+            aria-label={refreshing ? '正在刷新模型状态和密钥分组' : configState === 'unavailable' ? '重试加载模型监测配置' : '立即刷新模型状态和密钥分组'}
+            title={configState === 'unavailable' ? '重试加载模型监测配置' : '立即刷新模型状态和密钥分组'}
           >
-            <RefreshCw className={cn('h-4 w-4 opacity-60', refreshing && 'animate-spin')} />
+            <RefreshCw aria-hidden="true" className={cn('h-4 w-4 opacity-60', refreshing && 'animate-spin')} />
             <span className={styles.countdownText}>
               {refreshInterval > 0 ? formatCountdown(countdown) : '刷新'}
             </span>
@@ -1283,17 +1402,35 @@ export function ModelStatusEmbed({
           </button>
         </div>
 
+        {configState === 'unavailable' && (
+          <div className={cn('mb-6 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm', styles.emptyText)} role="alert">
+            <div className="font-semibold">模型监测配置暂不可用</div>
+            <div className="mt-1 opacity-80">无法确认当前监控范围，已清除旧状态且不会发起状态请求。请稍后刷新重试。</div>
+          </div>
+        )}
+
+        {tokenGroupScopeUnavailable && (
+          <div className={cn('mb-6 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm', styles.emptyText)} role="alert">
+            <div className="font-semibold">密钥分组范围暂不可用</div>
+            <div className="mt-1 opacity-80">
+              {tokenGroupFilterUnavailable
+                ? '无法确认所选密钥分组，已清除该范围的旧状态。请稍后刷新重试。'
+                : '密钥分组暂时无法同步；当前仅按已确认的监控模型展示状态。'}
+            </div>
+          </div>
+        )}
+
         {/* Stats Overview Bar */}
-        {displayedModelStatuses.length > 0 && theme !== 'minimal' && (() => {
-          const totalRequests = displayedModelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
-          const rateModels = displayedModelStatuses
+        {visibleModelStatuses.length > 0 && theme !== 'minimal' && (() => {
+          const totalRequests = visibleModelStatuses.reduce((sum, m) => sum + m.total_requests, 0)
+          const rateModels = visibleModelStatuses
             .map(model => effectiveEmbedRate(model))
             .filter((rate): rate is number => rate !== null)
           const avgRate = rateModels.length > 0 ? +(rateModels.reduce((sum, rate) => sum + rate, 0) / rateModels.length).toFixed(1) : null
-          const greenCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'green').length
-          const yellowCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'yellow').length
-          const redCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'red').length
-          const unknownCount = displayedModelStatuses.filter(m => effectiveEmbedStatus(m) === 'unknown').length
+          const greenCount = visibleModelStatuses.filter(m => effectiveEmbedStatus(m) === 'green').length
+          const yellowCount = visibleModelStatuses.filter(m => effectiveEmbedStatus(m) === 'yellow').length
+          const redCount = visibleModelStatuses.filter(m => effectiveEmbedStatus(m) === 'red').length
+          const unknownCount = visibleModelStatuses.filter(m => effectiveEmbedStatus(m) === 'unknown').length
           return (
             <div className={cn(
               "flex flex-wrap items-center gap-x-6 gap-y-2 mb-6 px-4 py-3 rounded-xl text-sm",
@@ -1352,7 +1489,7 @@ export function ModelStatusEmbed({
         })()}
 
         {/* Group Filter Tabs */}
-        {(customGroups.length > 0 || tokenGroups.length > 0) && displayedModelStatuses.length > 0 && theme !== 'minimal' && (() => {
+        {(customGroups.length > 0 || tokenGroups.length > 0) && theme !== 'minimal' && (() => {
           // Count models per group
           const activeModels = displayedModelStatuses.filter(m => m.total_requests > 0 && effectiveEmbedStatus(m) !== 'unknown')
           const groupCountMap: Record<string, number> = { all: activeModels.length }
@@ -1445,22 +1582,21 @@ export function ModelStatusEmbed({
         })()}
 
         {/* Model Status Cards */}
-        {displayedModelStatuses.length > 0 ? (
+        {statusScopeLoading ? (
+          <div
+            className={cn("flex items-center justify-center gap-3 py-16", styles.emptyText)}
+            role="status"
+            aria-live="polite"
+            aria-label="正在加载模型状态"
+          >
+            <Loader2 aria-hidden="true" className={cn("h-6 w-6 animate-spin", styles.loader)} />
+            <span>正在加载模型状态</span>
+          </div>
+        ) : visibleModelStatuses.length > 0 ? (
           <div className={cn(
             theme === 'minimal' ? 'divide-y divide-gray-100' : 'grid grid-cols-1 lg:grid-cols-2 gap-4'
           )}>
-            {displayedModelStatuses
-              .filter(model => {
-                if (groupFilter === 'all') return true
-                if (groupFilter.startsWith('token:')) {
-                  const tgName = groupFilter.slice(6)
-                  const tg = tokenGroups.find(g => g.group_name === tgName)
-                  return tg ? tg.models.includes(model.model_name) : true
-                }
-                const group = customGroups.find(g => g.id === groupFilter)
-                return group ? embedModelMatchesGroup(model.model_name, group) : true
-              })
-              .map(model => (
+            {visibleModelStatuses.map(model => (
               <EmbedModelCard
                 key={model.model_name}
                 model={model}
@@ -1472,11 +1608,15 @@ export function ModelStatusEmbed({
             ))}
           </div>
         ) : (
-          <div className={cn("text-center py-16", styles.emptyText)}>
-            {selectedModels.length === 0
-              ? '请在管理界面选择要监控的模型'
-              : statusFetchFailed
-                ? '模型状态数据源暂不可用，请稍后重试'
+          <div className={cn("text-center py-16", styles.emptyText)} role={configState === 'unavailable' || tokenGroupFilterUnavailable || statusFetchFailed ? 'alert' : undefined}>
+            {configState === 'unavailable'
+              ? '模型监测配置暂不可用，无法确认当前监控范围'
+              : tokenGroupFilterUnavailable
+                ? '所选密钥分组范围暂不可用，请稍后重试'
+                : statusFetchFailed
+              ? '模型状态数据源暂不可用，请稍后重试'
+              : selectedModels.length === 0 && embedTokenGroupModelsForFilter(tokenGroups, groupFilter).length === 0
+                ? '请在管理界面选择要监控的模型'
                 : '暂无模型状态数据'}
           </div>
         )}
@@ -1705,6 +1845,13 @@ function TokenGroupDropdown({ groups, countMap, value, onChange, styles }: Token
   const triggerRef = useRef<HTMLButtonElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
 
+  const restoreTriggerFocus = useCallback(() => {
+    queueMicrotask(() => {
+      const trigger = triggerRef.current
+      if (trigger?.isConnected) trigger.focus()
+    })
+  }, [])
+
   const isActive = value.startsWith('token:')
   const activeName = isActive ? value.slice(6) : ''
   const activeCount = isActive ? (countMap[value] || 0) : 0
@@ -1752,7 +1899,11 @@ function TokenGroupDropdown({ groups, countMap, value, onChange, styles }: Token
       }
     }
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false)
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setOpen(false)
+        restoreTriggerFocus()
+      }
     }
     document.addEventListener('mousedown', handleClickOutside)
     document.addEventListener('keydown', handleEscape)
@@ -1760,12 +1911,13 @@ function TokenGroupDropdown({ groups, countMap, value, onChange, styles }: Token
       document.removeEventListener('mousedown', handleClickOutside)
       document.removeEventListener('keydown', handleEscape)
     }
-  }, [open])
+  }, [open, restoreTriggerFocus])
 
-  const handleSelect = (filterId: string) => {
+  const handleSelect = useCallback((filterId: string) => {
     onChange(filterId)
     setOpen(false)
-  }
+    restoreTriggerFocus()
+  }, [onChange, restoreTriggerFocus])
 
   // 计算 panel 在视口里的位置；若右侧空间不够则向左对齐
   const panelStyle: React.CSSProperties = useMemo(() => {
@@ -1789,6 +1941,7 @@ function TokenGroupDropdown({ groups, countMap, value, onChange, styles }: Token
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={isActive ? `密钥分组筛选：${activeName}` : `密钥分组筛选：${groups.length} 个分组`}
         onClick={() => setOpen((o) => !o)}
         className={cn(
           "inline-flex items-center gap-1.5 pl-3 pr-2 py-1.5 text-xs font-medium rounded-full border transition-all whitespace-nowrap",
@@ -1798,16 +1951,17 @@ function TokenGroupDropdown({ groups, countMap, value, onChange, styles }: Token
             : cn("border-current/20 opacity-70 hover:opacity-100", styles.statsText)
         )}
       >
-        <KeyRound size={12} className="flex-shrink-0" />
+        <KeyRound aria-hidden="true" size={12} className="flex-shrink-0" />
         <span>{isActive ? activeName : '密钥分组'}</span>
         <span className="opacity-70 tabular-nums">
           {isActive ? activeCount : groups.length}
         </span>
-        <ChevronDown size={12} className={cn("flex-shrink-0 opacity-60 transition-transform", open && "rotate-180")} />
+        <ChevronDown aria-hidden="true" size={12} className={cn("flex-shrink-0 opacity-60 transition-transform", open && "rotate-180")} />
       </button>
 
       {open && triggerRect && createPortal(
         <div
+          data-model-status-portal
           ref={panelRef}
           role="listbox"
           style={panelStyle}

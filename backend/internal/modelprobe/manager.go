@@ -218,7 +218,11 @@ func (m *Manager) queue(ctx context.Context, trigger, actor, runKey string, mode
 	if !m.cfg.ModelProbeEnabled {
 		return toolstore.ModelProbeRun{}, false, ErrDisabled
 	}
-	if m.runner == nil || m.initError != "" || len(m.allowed) == 0 {
+	m.mu.RLock()
+	runner := m.runner
+	configured := runner != nil && m.initError == "" && len(m.allowed) > 0
+	m.mu.RUnlock()
+	if !configured {
 		return toolstore.ModelProbeRun{}, false, ErrNotConfigured
 	}
 	models, err := m.validateRequestedModels(models)
@@ -261,7 +265,7 @@ func (m *Manager) queue(ctx context.Context, trigger, actor, runKey string, mode
 	plans := make([]toolstore.ModelProbeAttemptPlan, 0, len(models))
 	for _, model := range models {
 		plans = append(plans, toolstore.ModelProbeAttemptPlan{
-			ModelName: model, Capability: m.runner.CapabilityFor(model),
+			ModelName: model, Capability: runner.CapabilityFor(model),
 		})
 	}
 	run, lifecycles, replayed, err := m.store.CreateModelProbeRunWithBudget(
@@ -388,7 +392,7 @@ func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, life
 	case failures > 0 || skipped > 0:
 		status = "partial"
 	}
-	finishCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_, finishErr := m.store.FinishModelProbeRun(finishCtx, toolstore.ModelProbeRunFinish{
 		ID: run.ID, Status: status, AttemptedCount: attempted, SuccessCount: successes,
 		FailureCount: failures, SkippedCount: skipped, ErrorCode: errorCode,
@@ -397,11 +401,16 @@ func (m *Manager) execute(ctx context.Context, run toolstore.ModelProbeRun, life
 	if finishErr != nil {
 		log.Error().Err(finishErr).Int64("run_id", run.ID).Msg("model probe run could not be finalized")
 	}
+	finishCancel()
+
+	// Retention is a separate durable operation. A slow or timed-out run
+	// finalization must not consume the cleanup deadline as well.
 	cleanupBefore := m.now().UTC().Add(-m.cfg.ModelProbeRetention)
-	if cleanupErr := m.store.CleanupModelProbes(finishCtx, cleanupBefore); cleanupErr != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if cleanupErr := m.store.CleanupModelProbes(cleanupCtx, cleanupBefore); cleanupErr != nil {
 		log.Warn().Err(cleanupErr).Msg("model probe retention cleanup failed")
 	}
-	cancel()
+	cleanupCancel()
 }
 
 func (m *Manager) Summary(ctx context.Context, models []string) (Summary, error) {
@@ -454,7 +463,9 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 	m.mu.RLock()
 	running := m.running
 	next := m.nextRunAt
-	configured := m.runner != nil && m.initError == "" && len(m.allowed) > 0
+	initError := m.initError
+	allowedModels := append([]string(nil), m.allowed...)
+	configured := m.runner != nil && initError == "" && len(allowedModels) > 0
 	m.mu.RUnlock()
 	remaining := m.cfg.ModelProbeDailyRequestBudget - used
 	if remaining < 0 {
@@ -466,7 +477,7 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 		state, message = "disabled", "主动探测默认关闭；配置专用模型令牌和白名单后再启用"
 	case !configured:
 		state, message = "misconfigured", "主动探测缺少专用令牌、有效 NewAPI 地址或模型白名单"
-		if m.initError != "" {
+		if initError != "" {
 			message = "主动探测配置无效"
 		}
 	case remaining == 0:
@@ -481,7 +492,7 @@ func (m *Manager) Status(ctx context.Context) (SystemStatus, error) {
 		MaxModelsPerRun: m.cfg.ModelProbeMaxModelsPerRun, DailyRequestBudget: m.cfg.ModelProbeDailyRequestBudget,
 		RequestsUsedToday: used, RequestsRemainingToday: remaining,
 		RetentionDays: int(m.cfg.ModelProbeRetention / (24 * time.Hour)),
-		AllowedModels: append([]string(nil), m.allowed...), LastRun: lastRun,
+		AllowedModels: allowedModels, LastRun: lastRun,
 	}
 	if !next.IsZero() && configured {
 		value := next

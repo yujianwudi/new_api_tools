@@ -12,6 +12,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -25,15 +27,172 @@ const (
 	inviteTopUpStateUnreconciled = "unreconciled"
 	inviteTopUpTimezone          = "Asia/Shanghai"
 	inviteTopUpFingerprintV2     = "invite-topup-query-v2"
+
+	defaultAffiliateEvidenceRowCap      int64 = 20_000
+	minimumAffiliateEvidenceRowCap      int64 = 1
+	maximumAffiliateEvidenceRowCap      int64 = 100_000
+	defaultAffiliateQueryTimeout              = 5 * time.Second
+	minimumAffiliateQueryTimeout              = time.Second
+	maximumAffiliateQueryTimeout              = time.Minute
+	defaultAffiliateQueryMaxConcurrency       = 2
+	minimumAffiliateQueryMaxConcurrency       = 1
+	maximumAffiliateQueryMaxConcurrency       = 16
+
+	// Evidence decimals are intentionally bounded before canonicalization. The
+	// limits are far above any legitimate top-up amount while preventing an
+	// unconstrained NUMERIC value from turning a row-capped evidence query into
+	// an unbounded allocation or exponent-parsing workload.
+	maximumAffiliateEvidenceDecimalInputBytes        = 2_048
+	maximumAffiliateEvidenceDecimalCoefficientDigits = 1_024
+	maximumAffiliateEvidenceDecimalExponentMagnitude = int64(1_000_000)
 )
 
 var inviteTopUpLocation = time.FixedZone(inviteTopUpTimezone, 8*60*60)
 
 var (
-	ErrInvalidAffiliateStatsParams = errors.New("invalid invite top-up analysis parameters")
-	ErrAffiliateSnapshotChanged    = errors.New("invite top-up analysis snapshot changed")
-	ErrAffiliateInviterNotFound    = errors.New("invite top-up analysis inviter not found")
+	ErrInvalidAffiliateStatsParams    = errors.New("invalid invite top-up analysis parameters")
+	ErrAffiliateSnapshotChanged       = errors.New("invite top-up analysis snapshot changed")
+	ErrAffiliateInviterNotFound       = errors.New("invite top-up analysis inviter not found")
+	ErrAffiliateEvidenceScaleExceeded = errors.New("invite top-up evidence scale exceeded")
+	ErrAffiliateStatsUnavailable      = errors.New("invite top-up analysis unavailable")
 )
+
+type affiliateStatsGuardrails struct {
+	evidenceRowCap      int64
+	queryTimeout        time.Duration
+	queryMaxConcurrency int
+}
+
+var affiliateStatsGuardrailConfig atomic.Pointer[affiliateStatsGuardrails]
+
+type affiliateQueryConcurrencyLimiter struct {
+	mu      sync.Mutex
+	active  int
+	changed chan struct{}
+}
+
+var affiliateQueryLimiter = affiliateQueryConcurrencyLimiter{changed: make(chan struct{})}
+
+func init() {
+	affiliateStatsGuardrailConfig.Store(&affiliateStatsGuardrails{
+		evidenceRowCap:      defaultAffiliateEvidenceRowCap,
+		queryTimeout:        defaultAffiliateQueryTimeout,
+		queryMaxConcurrency: defaultAffiliateQueryMaxConcurrency,
+	})
+}
+
+// ConfigureAffiliateStatsGuardrails installs one immutable per-process
+// guardrail snapshot. Production calls it once during startup, before serving
+// requests. Isolated service tests use the conservative defaults above.
+func ConfigureAffiliateStatsGuardrails(evidenceRowCap int64, queryTimeout time.Duration, queryMaxConcurrency int) error {
+	if evidenceRowCap < minimumAffiliateEvidenceRowCap || evidenceRowCap > maximumAffiliateEvidenceRowCap {
+		return fmt.Errorf("affiliate evidence row cap must be between %d and %d", minimumAffiliateEvidenceRowCap, maximumAffiliateEvidenceRowCap)
+	}
+	if queryTimeout < minimumAffiliateQueryTimeout || queryTimeout > maximumAffiliateQueryTimeout {
+		return fmt.Errorf("affiliate query timeout must be between %s and %s", minimumAffiliateQueryTimeout, maximumAffiliateQueryTimeout)
+	}
+	if queryMaxConcurrency < minimumAffiliateQueryMaxConcurrency || queryMaxConcurrency > maximumAffiliateQueryMaxConcurrency {
+		return fmt.Errorf("affiliate query max concurrency must be between %d and %d", minimumAffiliateQueryMaxConcurrency, maximumAffiliateQueryMaxConcurrency)
+	}
+	affiliateStatsGuardrailConfig.Store(&affiliateStatsGuardrails{
+		evidenceRowCap:      evidenceRowCap,
+		queryTimeout:        queryTimeout,
+		queryMaxConcurrency: queryMaxConcurrency,
+	})
+	return nil
+}
+
+func currentAffiliateStatsGuardrails() affiliateStatsGuardrails {
+	configured := affiliateStatsGuardrailConfig.Load()
+	if configured == nil {
+		return affiliateStatsGuardrails{
+			evidenceRowCap:      defaultAffiliateEvidenceRowCap,
+			queryTimeout:        defaultAffiliateQueryTimeout,
+			queryMaxConcurrency: defaultAffiliateQueryMaxConcurrency,
+		}
+	}
+	return *configured
+}
+
+func (l *affiliateQueryConcurrencyLimiter) acquire(ctx context.Context, limit int) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		l.mu.Lock()
+		if ctx.Err() != nil {
+			l.mu.Unlock()
+			return ctx.Err()
+		}
+		if l.active < limit {
+			l.active++
+			l.mu.Unlock()
+			return nil
+		}
+		changed := l.changed
+		l.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (l *affiliateQueryConcurrencyLimiter) release() {
+	l.mu.Lock()
+	if l.active < 1 {
+		l.mu.Unlock()
+		panic("affiliate query concurrency limiter released without an acquisition")
+	}
+	l.active--
+	close(l.changed)
+	l.changed = make(chan struct{})
+	l.mu.Unlock()
+}
+
+func (l *affiliateQueryConcurrencyLimiter) activeCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.active
+}
+
+type affiliateStatsOperation struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	guardrail affiliateStatsGuardrails
+}
+
+func startAffiliateStatsOperation(parent context.Context) (*affiliateStatsOperation, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	guardrail := currentAffiliateStatsGuardrails()
+	ctx, cancel := context.WithTimeout(parent, guardrail.queryTimeout)
+	if err := affiliateQueryLimiter.acquire(ctx, guardrail.queryMaxConcurrency); err != nil {
+		cancel()
+		return nil, fmt.Errorf("%w: wait for bounded query capacity: %w", ErrAffiliateStatsUnavailable, err)
+	}
+	return &affiliateStatsOperation{ctx: ctx, cancel: cancel, guardrail: guardrail}, nil
+}
+
+func (o *affiliateStatsOperation) close() {
+	affiliateQueryLimiter.release()
+	o.cancel()
+}
+
+func classifyAffiliateStatsError(err error) error {
+	if err == nil ||
+		errors.Is(err, ErrInvalidAffiliateStatsParams) ||
+		errors.Is(err, ErrAffiliateSnapshotChanged) ||
+		errors.Is(err, ErrAffiliateInviterNotFound) ||
+		errors.Is(err, ErrAffiliateEvidenceScaleExceeded) ||
+		errors.Is(err, ErrAffiliateStatsUnavailable) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrAffiliateStatsUnavailable, err)
+}
 
 // AffiliateAnalysisMetadata describes the immutable query boundary and the
 // limits of the source data. NewAPI's top_ups table has no currency or credited
@@ -339,13 +498,171 @@ func writeAffiliateEvidenceNullableInt64(digest hash.Hash, value sql.NullInt64) 
 	writeAffiliateEvidenceInt64(digest, value.Int64)
 }
 
-func writeAffiliateEvidenceNullableFloat64(digest hash.Hash, value sql.NullFloat64) {
+// affiliateEvidenceDecimal preserves exact database NUMERIC/DECIMAL values in
+// evidence hashes. The public response continues to expose money as *float64;
+// this scanner is used only by the parent/detail evidence contract, before a
+// detail page is scanned into the response type.
+type affiliateEvidenceDecimal struct {
+	Canonical string
+	Valid     bool
+}
+
+// Scan accepts the database/sql driver forms used by the supported engines.
+// PostgreSQL NUMERIC arrives from pgx as an exact string, while SQLite/MySQL
+// may supply a float64 or textual bytes depending on the declared column type.
+func (value *affiliateEvidenceDecimal) Scan(source any) error {
+	if value == nil {
+		return errors.New("scan affiliate evidence decimal into nil receiver")
+	}
+	*value = affiliateEvidenceDecimal{}
+
+	var text string
+	switch source := source.(type) {
+	case nil:
+		return nil
+	case string:
+		if len(source) > maximumAffiliateEvidenceDecimalInputBytes {
+			return fmt.Errorf("affiliate evidence decimal input exceeds %d bytes", maximumAffiliateEvidenceDecimalInputBytes)
+		}
+		text = source
+	case []byte:
+		if len(source) > maximumAffiliateEvidenceDecimalInputBytes {
+			return fmt.Errorf("affiliate evidence decimal input exceeds %d bytes", maximumAffiliateEvidenceDecimalInputBytes)
+		}
+		text = string(source)
+	case int64:
+		text = strconv.FormatInt(source, 10)
+	case float64:
+		if math.IsNaN(source) || math.IsInf(source, 0) {
+			return errors.New("affiliate evidence decimal is not finite")
+		}
+		text = strconv.FormatFloat(source, 'g', -1, 64)
+	default:
+		return fmt.Errorf("unsupported affiliate evidence decimal driver type %T", source)
+	}
+
+	canonical, err := canonicalizeAffiliateEvidenceDecimal(text)
+	if err != nil {
+		return err
+	}
+	value.Canonical = canonical
+	value.Valid = true
+	return nil
+}
+
+func canonicalizeAffiliateEvidenceDecimal(text string) (string, error) {
+	if len(text) == 0 {
+		return "", errors.New("affiliate evidence decimal is empty")
+	}
+	if len(text) > maximumAffiliateEvidenceDecimalInputBytes {
+		return "", fmt.Errorf("affiliate evidence decimal input exceeds %d bytes", maximumAffiliateEvidenceDecimalInputBytes)
+	}
+
+	index := 0
+	negative := false
+	if text[index] == '+' || text[index] == '-' {
+		negative = text[index] == '-'
+		index++
+		if index == len(text) {
+			return "", errors.New("affiliate evidence decimal has no digits")
+		}
+	}
+
+	digits := make([]byte, 0, len(text))
+	fractionDigits := 0
+	seenDigit := false
+	seenDecimalPoint := false
+	for index < len(text) && text[index] != 'e' && text[index] != 'E' {
+		switch character := text[index]; {
+		case character >= '0' && character <= '9':
+			digits = append(digits, character)
+			seenDigit = true
+			if seenDecimalPoint {
+				fractionDigits++
+			}
+		case character == '.' && !seenDecimalPoint:
+			seenDecimalPoint = true
+		default:
+			return "", errors.New("affiliate evidence decimal contains invalid syntax")
+		}
+		index++
+	}
+	if !seenDigit {
+		return "", errors.New("affiliate evidence decimal has no digits")
+	}
+
+	var explicitExponent int64
+	if index < len(text) {
+		index++
+		exponentNegative := false
+		if index < len(text) && (text[index] == '+' || text[index] == '-') {
+			exponentNegative = text[index] == '-'
+			index++
+		}
+		if index == len(text) {
+			return "", errors.New("affiliate evidence decimal exponent has no digits")
+		}
+		for ; index < len(text); index++ {
+			character := text[index]
+			if character < '0' || character > '9' {
+				return "", errors.New("affiliate evidence decimal exponent contains invalid syntax")
+			}
+			digit := int64(character - '0')
+			if explicitExponent > (maximumAffiliateEvidenceDecimalExponentMagnitude-digit)/10 {
+				return "", fmt.Errorf("affiliate evidence decimal exponent exceeds magnitude %d", maximumAffiliateEvidenceDecimalExponentMagnitude)
+			}
+			explicitExponent = explicitExponent*10 + digit
+		}
+		if exponentNegative {
+			explicitExponent = -explicitExponent
+		}
+	}
+
+	firstNonZero := 0
+	for firstNonZero < len(digits) && digits[firstNonZero] == '0' {
+		firstNonZero++
+	}
+	if firstNonZero == len(digits) {
+		return "0", nil
+	}
+	digits = digits[firstNonZero:]
+
+	trailingZeroes := 0
+	for trailingZeroes < len(digits) && digits[len(digits)-1-trailingZeroes] == '0' {
+		trailingZeroes++
+	}
+	coefficient := digits[:len(digits)-trailingZeroes]
+	if len(coefficient) > maximumAffiliateEvidenceDecimalCoefficientDigits {
+		return "", fmt.Errorf("affiliate evidence decimal coefficient exceeds %d digits", maximumAffiliateEvidenceDecimalCoefficientDigits)
+	}
+
+	exponent := explicitExponent - int64(fractionDigits) + int64(trailingZeroes)
+	if exponent < -maximumAffiliateEvidenceDecimalExponentMagnitude || exponent > maximumAffiliateEvidenceDecimalExponentMagnitude {
+		return "", fmt.Errorf("affiliate evidence decimal exponent exceeds magnitude %d", maximumAffiliateEvidenceDecimalExponentMagnitude)
+	}
+
+	canonicalLength := len(coefficient) + 1 + len(strconv.FormatInt(exponent, 10))
+	if negative {
+		canonicalLength++
+	}
+	canonical := make([]byte, 0, canonicalLength)
+	if negative {
+		canonical = append(canonical, '-')
+	}
+	canonical = append(canonical, coefficient...)
+	canonical = append(canonical, 'e')
+	canonical = strconv.AppendInt(canonical, exponent, 10)
+	return string(canonical), nil
+}
+
+func writeAffiliateEvidenceDecimal(digest hash.Hash, value affiliateEvidenceDecimal) {
 	if !value.Valid {
 		_, _ = digest.Write([]byte{0})
 		return
 	}
 	_, _ = digest.Write([]byte{1})
-	writeAffiliateEvidenceInt64(digest, int64(math.Float64bits(value.Float64)))
+	writeAffiliateEvidenceInt64(digest, int64(len(value.Canonical)))
+	_, _ = digest.Write([]byte(value.Canonical))
 }
 
 // affiliateDetailEvidenceHashes computes a cryptographic digest over every
@@ -357,10 +674,21 @@ func affiliateDetailEvidenceHashes(
 	tx *sqlx.Tx,
 	query normalizedAffiliateQuery,
 	inviterIDs []int64,
+	rowCap int64,
+	expectedRows int64,
 ) (map[int64]string, error) {
 	result := make(map[int64]string, len(inviterIDs))
 	if len(inviterIDs) == 0 {
+		if expectedRows != 0 {
+			return nil, fmt.Errorf("invite top-up detail evidence expected %d rows without an inviter", expectedRows)
+		}
 		return result, nil
+	}
+	if rowCap < 1 || rowCap == math.MaxInt64 {
+		return nil, fmt.Errorf("invalid invite top-up detail evidence row cap")
+	}
+	if expectedRows < 0 {
+		return nil, fmt.Errorf("invalid negative invite top-up detail evidence row count")
 	}
 	db := database.Get()
 	where, args, nextIdx := buildAffiliateAggWhere(query)
@@ -381,12 +709,15 @@ func affiliateDetailEvidenceHashes(
 		nextIdx++
 	}
 	where += " AND u.inviter_id IN (" + strings.Join(placeholders, ",") + ")"
+	limitPlaceholder := db.Placeholder(nextIdx)
+	args = append(args, rowCap+1)
 	rows, err := tx.QueryxContext(ctx, fmt.Sprintf(`SELECT u.inviter_id, t.id, t.user_id,
 			u.username, t.amount, t.money, t.complete_time, COALESCE(t.status, '')
 		FROM top_ups t
 		JOIN users u ON u.id = t.user_id
 		WHERE %s
-		ORDER BY u.inviter_id ASC, t.complete_time DESC, t.id DESC`, where), args...)
+		ORDER BY u.inviter_id ASC, t.complete_time DESC, t.id DESC
+		LIMIT %s`, where, limitPlaceholder), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query invite top-up detail evidence: %w", err)
 	}
@@ -394,11 +725,17 @@ func affiliateDetailEvidenceHashes(
 	for _, inviterID := range orderedIDs {
 		digests[inviterID] = sha256.New()
 	}
+	var rowsRead int64
 	for rows.Next() {
+		rowsRead++
+		if rowsRead > rowCap {
+			_ = rows.Close()
+			return nil, fmt.Errorf("%w: successful top-up evidence exceeds the configured %d-row cap", ErrAffiliateEvidenceScaleExceeded, rowCap)
+		}
 		var inviterID, id, userID, completeTime int64
 		var username, status sql.NullString
 		var amount sql.NullInt64
-		var money sql.NullFloat64
+		var money affiliateEvidenceDecimal
 		if err := rows.Scan(&inviterID, &id, &userID, &username, &amount, &money, &completeTime, &status); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan invite top-up detail evidence: %w", err)
@@ -412,7 +749,7 @@ func affiliateDetailEvidenceHashes(
 		writeAffiliateEvidenceInt64(digest, userID)
 		writeAffiliateEvidenceString(digest, username)
 		writeAffiliateEvidenceNullableInt64(digest, amount)
-		writeAffiliateEvidenceNullableFloat64(digest, money)
+		writeAffiliateEvidenceDecimal(digest, money)
 		writeAffiliateEvidenceInt64(digest, completeTime)
 		writeAffiliateEvidenceString(digest, status)
 	}
@@ -422,6 +759,9 @@ func affiliateDetailEvidenceHashes(
 	}
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close invite top-up detail evidence: %w", err)
+	}
+	if rowsRead != expectedRows {
+		return nil, fmt.Errorf("invite top-up detail evidence row count changed inside the snapshot: expected %d, read %d", expectedRows, rowsRead)
 	}
 	for inviterID, digest := range digests {
 		result[inviterID] = hex.EncodeToString(digest.Sum(nil))
@@ -477,6 +817,25 @@ func affiliateAggregateSQL(where string) string {
 	`, where)
 }
 
+// buildAffiliateParentAggregate pushes a non-empty inviter search into the
+// aggregate's user-id predicate. Filtering only after grouping would aggregate
+// every inviter three times (count, summary, list) even when the operator asks
+// for one exact inviter, which makes at-cap evidence requests needlessly slow.
+func buildAffiliateParentAggregate(query normalizedAffiliateQuery) (string, []interface{}, int) {
+	where, args, nextIdx := buildAffiliateAggWhere(query)
+	if query.params.Search != "" {
+		searchWhere, searchArgs, followingIdx := buildAffiliateSearchWhere("affiliate_search", query.params.Search, nextIdx)
+		where += fmt.Sprintf(` AND u.inviter_id IN (
+			SELECT affiliate_search.id
+			FROM users affiliate_search
+			WHERE affiliate_search.deleted_at IS NULL AND %s
+		)`, searchWhere)
+		args = append(args, searchArgs...)
+		nextIdx = followingIdx
+	}
+	return affiliateAggregateSQL(where), args, nextIdx
+}
+
 func affiliateSummarySQL(aggregateSQL, searchWhere string) string {
 	return fmt.Sprintf(`
 		SELECT COUNT(*) AS window_active_inviter_count,
@@ -496,6 +855,33 @@ const affiliateCurrentInviteeSQL = `
 	WHERE inviter_id IS NOT NULL AND inviter_id > 0 AND deleted_at IS NULL
 	GROUP BY inviter_id`
 
+func preflightAffiliateEvidenceRowCount(rowCount, rowCap int64) error {
+	if rowCount < 0 {
+		return fmt.Errorf("invalid negative invite top-up evidence row count")
+	}
+	if rowCount > rowCap {
+		return fmt.Errorf("%w: %d successful top-up rows exceed the configured %d-row cap", ErrAffiliateEvidenceScaleExceeded, rowCount, rowCap)
+	}
+	return nil
+}
+
+func preflightAffiliatePageEvidenceRows(items []AffiliateStatsRow, rowCap int64) (int64, error) {
+	var total int64
+	for _, item := range items {
+		if item.SuccessTopUpCount < 0 {
+			return 0, fmt.Errorf("invalid negative invite top-up evidence row count for inviter %d", item.InviterID)
+		}
+		if item.SuccessTopUpCount > math.MaxInt64-total {
+			return 0, fmt.Errorf("%w: successful top-up evidence row count overflow", ErrAffiliateEvidenceScaleExceeded)
+		}
+		total += item.SuccessTopUpCount
+		if err := preflightAffiliateEvidenceRowCount(total, rowCap); err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
 // ListAffiliateStats returns one page of the invite top-up analysis. Count and
 // rows share one read transaction; any scan or rows iteration error makes the
 // whole response unavailable rather than silently returning a partial page.
@@ -505,18 +891,22 @@ func ListAffiliateStats(params AffiliateStatsParams) (*PaginatedAffiliateStats, 
 
 // ListAffiliateStatsContext is the request-bound variant used by HTTP
 // handlers so cancellation and deadlines stop database work promptly.
-func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams) (*PaginatedAffiliateStats, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams) (result *PaginatedAffiliateStats, err error) {
 	query, err := normalizeAffiliateParams(params)
 	if err != nil {
 		return nil, err
 	}
+	operation, err := startAffiliateStatsOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer operation.close()
+	defer func() { err = classifyAffiliateStatsError(err) }()
+	ctx = operation.ctx
+
 	db := database.Get()
-	aggWhere, aggArgs, nextIdx := buildAffiliateAggWhere(query)
-	searchWhere, searchArgs, nextIdx := buildAffiliateSearchWhere("iu", query.params.Search, nextIdx)
-	aggSQL := affiliateAggregateSQL(aggWhere)
+	aggSQL, aggArgs, nextIdx := buildAffiliateParentAggregate(query)
+	const searchWhere = "1=1"
 
 	tx, err := db.DB.BeginTxx(ctx, affiliateReadTxOptions(db))
 	if err != nil {
@@ -528,7 +918,7 @@ func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams)
 		SELECT COUNT(*) FROM (%s) a
 		LEFT JOIN users iu ON iu.id = a.inviter_id AND iu.deleted_at IS NULL
 		WHERE %s`, aggSQL, searchWhere)
-	countArgs := append(append([]interface{}{}, aggArgs...), searchArgs...)
+	countArgs := append([]interface{}{}, aggArgs...)
 	var total int64
 	if err := tx.GetContext(ctx, &total, countSQL, countArgs...); err != nil {
 		return nil, fmt.Errorf("count invite top-up analysis: %w", err)
@@ -562,7 +952,7 @@ func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams)
 		affiliateSortColumn(query.params.SortBy), affiliateSortDir(query.params.SortDir),
 		db.Placeholder(nextIdx), db.Placeholder(nextIdx+1),
 	)
-	listArgs := append(append([]interface{}{}, aggArgs...), searchArgs...)
+	listArgs := append([]interface{}{}, aggArgs...)
 	listArgs = append(listArgs, query.params.PageSize, offset)
 	rows, err := tx.QueryxContext(ctx, listSQL, listArgs...)
 	if err != nil {
@@ -591,7 +981,13 @@ func ListAffiliateStatsContext(ctx context.Context, params AffiliateStatsParams)
 	for index := range items {
 		inviterIDs[index] = items[index].InviterID
 	}
-	evidenceHashes, err := affiliateDetailEvidenceHashes(ctx, tx, query, inviterIDs)
+	evidenceRows, err := preflightAffiliatePageEvidenceRows(items, operation.guardrail.evidenceRowCap)
+	if err != nil {
+		return nil, err
+	}
+	evidenceHashes, err := affiliateDetailEvidenceHashes(
+		ctx, tx, query, inviterIDs, operation.guardrail.evidenceRowCap, evidenceRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -622,20 +1018,24 @@ func GetAffiliateStatsSummary(params AffiliateStatsParams) (*AffiliateStatsSumma
 
 // GetAffiliateStatsSummaryContext is the request-bound compatibility summary
 // query. New clients should prefer the bundled summary from ListAffiliateStats.
-func GetAffiliateStatsSummaryContext(ctx context.Context, params AffiliateStatsParams) (*AffiliateStatsSummary, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func GetAffiliateStatsSummaryContext(ctx context.Context, params AffiliateStatsParams) (result *AffiliateStatsSummary, err error) {
 	query, err := normalizeAffiliateParams(params)
 	if err != nil {
 		return nil, err
 	}
+	operation, err := startAffiliateStatsOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer operation.close()
+	defer func() { err = classifyAffiliateStatsError(err) }()
+	ctx = operation.ctx
+
 	db := database.Get()
-	aggWhere, aggArgs, nextIdx := buildAffiliateAggWhere(query)
-	searchWhere, searchArgs, _ := buildAffiliateSearchWhere("iu", query.params.Search, nextIdx)
-	aggSQL := affiliateAggregateSQL(aggWhere)
+	aggSQL, aggArgs, _ := buildAffiliateParentAggregate(query)
+	const searchWhere = "1=1"
 	summarySQL := affiliateSummarySQL(aggSQL, searchWhere)
-	args := append(append([]interface{}{}, aggArgs...), searchArgs...)
+	args := append([]interface{}{}, aggArgs...)
 	var summary AffiliateStatsSummary
 	if err := db.DB.GetContext(ctx, &summary, summarySQL, args...); err != nil {
 		return nil, fmt.Errorf("query invite top-up analysis summary: %w", err)
@@ -653,10 +1053,7 @@ func ListAffiliateTopUpDetails(inviterID int64, params AffiliateStatsParams) (*P
 }
 
 // ListAffiliateTopUpDetailsContext is the request-bound detail query.
-func ListAffiliateTopUpDetailsContext(ctx context.Context, inviterID int64, params AffiliateStatsParams) (*PaginatedAffiliateTopUpDetails, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func ListAffiliateTopUpDetailsContext(ctx context.Context, inviterID int64, params AffiliateStatsParams) (result *PaginatedAffiliateTopUpDetails, err error) {
 	if inviterID < 1 {
 		return nil, fmt.Errorf("%w: inviter_id must be positive", ErrInvalidAffiliateStatsParams)
 	}
@@ -683,6 +1080,14 @@ func ListAffiliateTopUpDetailsContext(ctx context.Context, inviterID int64, para
 	if err != nil {
 		return nil, err
 	}
+	operation, err := startAffiliateStatsOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer operation.close()
+	defer func() { err = classifyAffiliateStatsError(err) }()
+	ctx = operation.ctx
+
 	db := database.Get()
 	where, args, nextIdx := buildAffiliateAggWhere(query)
 	// Append the inviter predicate after the shared predicates so anonymous
@@ -721,10 +1126,15 @@ func ListAffiliateTopUpDetailsContext(ctx context.Context, inviterID int64, para
 	if err := tx.GetContext(ctx, &total, "SELECT COUNT(*) "+fromSQL, args...); err != nil {
 		return nil, fmt.Errorf("count invite top-up details: %w", err)
 	}
+	if err := preflightAffiliateEvidenceRowCount(total, operation.guardrail.evidenceRowCap); err != nil {
+		return nil, err
+	}
 	if query.params.ExpectedDetailTotal != nil && total != *query.params.ExpectedDetailTotal {
 		return nil, fmt.Errorf("%w: expected %d detail rows, found %d", ErrAffiliateSnapshotChanged, *query.params.ExpectedDetailTotal, total)
 	}
-	evidenceHashes, err := affiliateDetailEvidenceHashes(ctx, tx, query, []int64{inviterID})
+	evidenceHashes, err := affiliateDetailEvidenceHashes(
+		ctx, tx, query, []int64{inviterID}, operation.guardrail.evidenceRowCap, total,
+	)
 	if err != nil {
 		return nil, err
 	}

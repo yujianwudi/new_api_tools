@@ -429,13 +429,20 @@ func assertAffiliateParentQueryShape(
 		t.Fatalf("normalize parent params for query-count proof: %v", err)
 	}
 	_, baseArgs, _ := buildAffiliateAggWhere(query)
-	batchedInviters := len(evidence.Args) - len(baseArgs)
+	// The final bind is the defensive LIMIT cap+1 value, not an inviter ID.
+	batchedInviters := len(evidence.Args) - len(baseArgs) - 1
 	if batchedInviters != len(parent.Items) || batchedInviters != params.PageSize {
 		t.Fatalf("batch evidence inviter args = %d, parent items/page_size = %d/%d; evidence is not one full-page batch",
 			batchedInviters, len(parent.Items), params.PageSize)
 	}
 	if !strings.Contains(strings.ToUpper(evidence.SQL), " IN (") {
 		t.Fatalf("evidence statement is not an IN batch: %s", evidence.SQL)
+	}
+	if !strings.Contains(strings.ToUpper(evidence.SQL), "LIMIT ?") {
+		t.Fatalf("SQLite evidence statement is missing the defensive LIMIT placeholder: %s", evidence.SQL)
+	}
+	if got := evidence.Args[len(evidence.Args)-1]; got != defaultAffiliateEvidenceRowCap+1 {
+		t.Fatalf("evidence LIMIT = %#v, want cap+1 = %d", got, defaultAffiliateEvidenceRowCap+1)
 	}
 	t.Logf("AFFILIATE_PERF query_count parent_total=%d heavy_aggregates=3 batch_evidence=1 batched_inviters=%d",
 		len(records), batchedInviters)
@@ -596,6 +603,109 @@ func TestAffiliateStatsPerformanceAcceptance(t *testing.T) {
 		})
 	})
 
+	if target.InviterID != 1 || detailTotal >= defaultAffiliateEvidenceRowCap {
+		t.Fatalf("high-skew seed inviter/rows = %d/%d, want inviter 1 below cap %d", target.InviterID, detailTotal, defaultAffiliateEvidenceRowCap)
+	}
+	skewRows := defaultAffiliateEvidenceRowCap - detailTotal
+	skewTx, err := fixture.db.Beginx()
+	if err != nil {
+		t.Fatalf("begin high-skew affiliate fixture: %v", err)
+	}
+	skewStmt, err := skewTx.Prepare(`INSERT INTO top_ups
+		(id, user_id, amount, money, trade_no, payment_method, status, create_time, complete_time)
+		VALUES (?, ?, ?, ?, ?, ?, 'success', ?, ?)`)
+	if err != nil {
+		_ = skewTx.Rollback()
+		t.Fatalf("prepare high-skew affiliate fixture: %v", err)
+	}
+	skewCompleteTime := time.Date(2026, 6, 15, 12, 0, 0, 0, inviteTopUpLocation).Unix()
+	for ordinal := int64(1); ordinal <= skewRows; ordinal++ {
+		topUpID := affiliatePerfTopUpCount + ordinal
+		if _, err := skewStmt.Exec(
+			topUpID,
+			int64(1001),
+			int64(20_000)+ordinal,
+			float64(20_000+ordinal)/100,
+			fmt.Sprintf("perf-skew-%09d", ordinal),
+			"alipay",
+			skewCompleteTime-300,
+			skewCompleteTime,
+		); err != nil {
+			_ = skewStmt.Close()
+			_ = skewTx.Rollback()
+			t.Fatalf("insert high-skew affiliate row %d/%d: %v", ordinal, skewRows, err)
+		}
+	}
+	if err := skewStmt.Close(); err != nil {
+		_ = skewTx.Rollback()
+		t.Fatalf("close high-skew affiliate statement: %v", err)
+	}
+	if err := skewTx.Commit(); err != nil {
+		t.Fatalf("commit high-skew affiliate fixture: %v", err)
+	}
+	if _, err := fixture.db.Exec("ANALYZE"); err != nil {
+		t.Fatalf("analyze high-skew affiliate fixture: %v", err)
+	}
+
+	skewParams := fixture.params
+	skewParams.PageSize = 1
+	skewParams.Search = "perf-user-000001"
+	skewParent, err := ListAffiliateStatsContext(context.Background(), skewParams)
+	if err != nil {
+		t.Fatalf("capture high-skew parent at cap: %v", err)
+	}
+	if skewParent.Total != 1 || len(skewParent.Items) != 1 ||
+		skewParent.Items[0].InviterID != 1 ||
+		skewParent.Items[0].SuccessTopUpCount != defaultAffiliateEvidenceRowCap ||
+		len(skewParent.Items[0].DetailEvidenceHash) != 64 {
+		t.Fatalf("high-skew parent is incomplete: %+v", skewParent)
+	}
+	skewTarget := skewParent.Items[0]
+	skewDetailTotal := skewTarget.SuccessTopUpCount
+	skewDetailParams := skewParams
+	skewDetailParams.ExpectedFingerprint = skewParent.QueryFingerprint
+	skewDetailParams.ExpectedDetailTotal = &skewDetailTotal
+	skewDetailParams.ExpectedDetailEvidenceHash = skewTarget.DetailEvidenceHash
+	skewDetail, err := ListAffiliateTopUpDetailsContext(context.Background(), 1, skewDetailParams)
+	if err != nil {
+		t.Fatalf("capture high-skew detail at cap: %v", err)
+	}
+	if skewDetail.Total != defaultAffiliateEvidenceRowCap ||
+		skewDetail.DetailEvidenceHash != skewTarget.DetailEvidenceHash ||
+		len(skewDetail.DetailEvidenceHash) != 64 {
+		t.Fatalf("high-skew detail is incomplete: %+v", skewDetail)
+	}
+
+	skewListTiming := measureAffiliatePerfP95(t, "affiliate_high_skew_list_at_evidence_cap", affiliatePerfListLimit, func() error {
+		return callWithTimeout(func(ctx context.Context) error {
+			result, err := ListAffiliateStatsContext(ctx, skewParams)
+			if err != nil {
+				return err
+			}
+			if result.Total != 1 || len(result.Items) != 1 ||
+				result.Items[0].SuccessTopUpCount != defaultAffiliateEvidenceRowCap ||
+				result.Items[0].DetailEvidenceHash != skewTarget.DetailEvidenceHash {
+				return fmt.Errorf("unexpected high-skew list total/items/rows/evidence = %d/%d/%d/%t",
+					result.Total, len(result.Items), result.Items[0].SuccessTopUpCount,
+					result.Items[0].DetailEvidenceHash == skewTarget.DetailEvidenceHash)
+			}
+			return nil
+		})
+	})
+	skewDetailTiming := measureAffiliatePerfP95(t, "affiliate_high_skew_detail_at_evidence_cap", affiliatePerfDetailLimit, func() error {
+		return callWithTimeout(func(ctx context.Context) error {
+			result, err := ListAffiliateTopUpDetailsContext(ctx, 1, skewDetailParams)
+			if err != nil {
+				return err
+			}
+			if result.Total != defaultAffiliateEvidenceRowCap || result.DetailEvidenceHash != skewTarget.DetailEvidenceHash {
+				return fmt.Errorf("unexpected high-skew detail total/evidence = %d/%t",
+					result.Total, result.DetailEvidenceHash == skewTarget.DetailEvidenceHash)
+			}
+			return nil
+		})
+	})
+
 	var sloFailures []string
 	if listTiming.p95 > affiliatePerfListLimit {
 		sloFailures = append(sloFailures, fmt.Sprintf("list p95 %s > %s", listTiming.p95, affiliatePerfListLimit))
@@ -605,6 +715,12 @@ func TestAffiliateStatsPerformanceAcceptance(t *testing.T) {
 	}
 	if detailTiming.p95 > affiliatePerfDetailLimit {
 		sloFailures = append(sloFailures, fmt.Sprintf("detail p95 %s > %s", detailTiming.p95, affiliatePerfDetailLimit))
+	}
+	if skewListTiming.p95 > affiliatePerfListLimit {
+		sloFailures = append(sloFailures, fmt.Sprintf("high-skew list p95 %s > %s", skewListTiming.p95, affiliatePerfListLimit))
+	}
+	if skewDetailTiming.p95 > affiliatePerfDetailLimit {
+		sloFailures = append(sloFailures, fmt.Sprintf("high-skew detail p95 %s > %s", skewDetailTiming.p95, affiliatePerfDetailLimit))
 	}
 	if len(sloFailures) > 0 {
 		t.Fatalf("affiliate performance SLO failure: %s", strings.Join(sloFailures, "; "))

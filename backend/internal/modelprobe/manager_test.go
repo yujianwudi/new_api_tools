@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,82 @@ func TestManagerQueuesIdempotentBudgetedProbeAndClassifiesSummary(t *testing.T) 
 	}
 	if _, _, err := manager.QueueManual(context.Background(), "admin", "forbidden-model", []string{"other-model"}); !errors.Is(err, ErrModelNotAllowed) {
 		t.Fatalf("forbidden model error = %v, want ErrModelNotAllowed", err)
+	}
+}
+
+// Run this test with -race. Startup recovery is the production writer for
+// initError; queue and status readiness must use one consistent mutex snapshot.
+func TestManagerQueueReadinessAccessIsSynchronized(t *testing.T) {
+	store, err := toolstore.Init(filepath.Join(t.TempDir(), "probe-readiness-race.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := &config.Config{
+		NewAPIBaseURL: "http://127.0.0.1:1", ModelProbeEnabled: true, ModelProbeAPIKey: "probe-key",
+		ModelProbeModels: []string{"gpt-test"}, ModelProbeTimeout: time.Second,
+		ModelProbeMaxConcurrency: 1, ModelProbeMaxModelsPerRun: 1,
+		ModelProbeDailyRequestBudget: 1, ModelProbeMaxOutputTokens: 4,
+	}
+	manager := NewManager(cfg, store)
+	const idempotencyKey = "readiness-race"
+	_, replayed, err := store.CreateModelProbeRun(context.Background(), toolstore.ModelProbeRunInput{
+		RunKey: "manual:" + idempotencyKey, RequestFingerprint: fingerprint("admin", []string{"gpt-test"}),
+		TriggerKind: "manual", Actor: "admin", RequestedCount: 1, StartedAt: time.Now().UTC(),
+	})
+	if err != nil || replayed {
+		t.Fatalf("seed replay run = replayed:%t err:%v", replayed, err)
+	}
+	configuredRunner := manager.runner
+
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-start
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			manager.mu.Lock()
+			manager.runner = configuredRunner
+			manager.allowed = []string{"gpt-test"}
+			if i%2 == 0 {
+				manager.initError = "model probe recovery failed"
+			} else {
+				manager.initError = ""
+			}
+			manager.mu.Unlock()
+			runtime.Gosched()
+		}
+	}()
+	close(start)
+	defer func() {
+		close(stop)
+		<-done
+	}()
+	for i := 0; i < 1_000; i++ {
+		_, replayed, queueErr := manager.QueueManual(context.Background(), "admin", idempotencyKey, []string{"gpt-test"})
+		if queueErr == nil && !replayed {
+			t.Fatal("readiness replay unexpectedly queued a new run")
+		}
+		if queueErr != nil && !errors.Is(queueErr, ErrNotConfigured) {
+			t.Fatalf("QueueManual() error = %v, want replay or ErrNotConfigured", queueErr)
+		}
+		status, statusErr := manager.Status(context.Background())
+		if statusErr != nil {
+			t.Fatalf("Status() error = %v", statusErr)
+		}
+		if len(status.AllowedModels) != 1 || status.AllowedModels[0] != "gpt-test" {
+			t.Fatalf("Status() allowed models = %v", status.AllowedModels)
+		}
+		if status.Configured == (status.State == "misconfigured") {
+			t.Fatalf("Status() readiness snapshot is inconsistent: %+v", status)
+		}
+		runtime.Gosched()
 	}
 }
 
