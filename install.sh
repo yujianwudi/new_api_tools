@@ -33,7 +33,7 @@ PROJECT_NAME="new_api_tools"
 NEWAPI_TOOLS_IMAGE_REPOSITORY="ghcr.io/yujianwudi/new_api_tools"
 NEWAPI_TOOLS_SIGNING_REPOSITORY="yujianwudi/new_api_tools"
 NEWAPI_TOOLS_COSIGN_IMAGE="ghcr.io/sigstore/cosign/cosign:v3.1.2@sha256:d91bc4e7e95e8d2f549c747a72dc174f90579e410a1695f57f686674f84ce849"
-INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.6.1}"
+INSTALL_REF="${NEWAPI_TOOLS_REF:-v0.6.2}"
 REQUESTED_NEWAPI_TOOLS_IMAGE="${NEWAPI_TOOLS_IMAGE:-}"
 REQUESTED_NEWAPI_TOOLS_EXPECTED_REVISION="${NEWAPI_TOOLS_EXPECTED_REVISION:-}"
 INSTALL_COMMIT=""
@@ -232,8 +232,11 @@ run_install_cosign() {
 }
 
 verify_install_release_signature() {
-  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
+  local image="$1" tag="$2" git_sha="$3" source_ref identity index
+  local -a certificate_sha_args=()
   local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_refs=("refs/tags/${tag}" refs/heads/main)
+  local -a workflow_shas=("$git_sha" '')
   local -a workflow_names=(
     'Build and Push Docker Image'
     'Recover Release Image From Existing Tag'
@@ -244,16 +247,20 @@ verify_install_release_signature() {
   [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   is_immutable_newapi_tools_image "$image" || return 1
   [[ "$(image_repository_without_tag "$image")" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
-  expected_ref="refs/tags/${tag}"
+  source_ref="refs/tags/${tag}"
 
   for index in "${!workflow_files[@]}"; do
-    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${workflow_refs[index]}"
+    certificate_sha_args=()
+    if [[ -n "${workflow_shas[index]}" ]]; then
+      certificate_sha_args=(--certificate-github-workflow-sha "${workflow_shas[index]}")
+    fi
     if run_install_cosign verify \
       --certificate-identity "$identity" \
       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
       --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
-      --certificate-github-workflow-ref "$expected_ref" \
-      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-ref "${workflow_refs[index]}" \
+      "${certificate_sha_args[@]}" \
       --certificate-github-workflow-name "${workflow_names[index]}" \
       --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
       -a "git_sha=${git_sha}" \
@@ -266,10 +273,46 @@ verify_install_release_signature() {
   return 1
 }
 
+resolve_install_release_platform_digests() {
+  local image="$1" descriptors platform digest
+  local amd64_digest='' arm64_digest=''
+
+  is_immutable_newapi_tools_image "$image" || return 1
+  docker buildx version >/dev/null 2>&1 || {
+    log_error "发行镜像平台 digest 校验需要 Docker Buildx"
+    return 1
+  }
+  descriptors="$(docker buildx imagetools inspect "$image" --format \
+    '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}}{{else}}unknown/unknown{{end}} {{.Digest}}{{println}}{{end}}')" || return 1
+  while read -r platform digest; do
+    [[ -n "$platform" ]] || continue
+    case "$platform" in
+      linux/amd64)
+        [[ -z "$amd64_digest" && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+        amd64_digest="$digest"
+        ;;
+      linux/arm64)
+        [[ -z "$arm64_digest" && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+        arm64_digest="$digest"
+        ;;
+      unknown/unknown)
+        [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done <<< "$descriptors"
+  [[ -n "$amd64_digest" && -n "$arm64_digest" ]] || return 1
+  printf '%s %s\n' "$amd64_digest" "$arm64_digest"
+}
+
 verify_install_release_provenance() {
-  local image="$1" tag="$2" git_sha="$3" expected_ref identity index
-  local repository manifest_digest policy_file policy_argument
+  local image="$1" tag="$2" git_sha="$3" source_ref identity index
+  local repository manifest_digest policy_file policy_argument platform_digests
+  local amd64_digest arm64_digest extra
+  local -a certificate_sha_args=()
   local -a workflow_files=(build.yml release-recovery.yml)
+  local -a workflow_refs=("refs/tags/${tag}" refs/heads/main)
+  local -a workflow_shas=("$git_sha" '')
   local -a workflow_names=(
     'Build and Push Docker Image'
     'Recover Release Image From Existing Tag'
@@ -282,11 +325,15 @@ verify_install_release_provenance() {
   repository="$(image_repository_without_tag "$image")"
   [[ "$repository" == "$NEWAPI_TOOLS_IMAGE_REPOSITORY" ]] || return 1
   manifest_digest="${image##*@}"
-  expected_ref="refs/tags/${tag}"
+  source_ref="refs/tags/${tag}"
+  platform_digests="$(resolve_install_release_platform_digests "$image")" || return 1
+  read -r amd64_digest arm64_digest extra <<< "$platform_digests"
+  [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ &&
+     "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ && -z "${extra:-}" ]] || return 1
 
   for index in "${!workflow_files[@]}"; do
-    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${expected_ref}"
-    policy_file="$(mktemp)" || return 1
+    identity="https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}/.github/workflows/${workflow_files[index]}@${workflow_refs[index]}"
+    policy_file="$(mktemp --suffix=.cue)" || return 1
     cat >"$policy_file" <<EOF
 package newapi_tools_release
 
@@ -301,17 +348,17 @@ predicate: {
     buildType: "${identity}"
     externalParameters: {
       repository: "https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}"
-      ref: "${expected_ref}"
+      ref: "${source_ref}"
       revision: "${git_sha}"
       tag: "${tag}"
       manifest_digest: "${manifest_digest}"
-      platform_digests: {
-        "linux/amd64": =~"^sha256:[0-9a-f]{64}$"
-        "linux/arm64": =~"^sha256:[0-9a-f]{64}$"
-      }
+      platform_digests: close({
+        "linux/amd64": "${amd64_digest}"
+        "linux/arm64": "${arm64_digest}"
+      })
     }
     resolvedDependencies: [{
-      uri: "git+https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}@${expected_ref}"
+      uri: "git+https://github.com/${NEWAPI_TOOLS_SIGNING_REPOSITORY}@${source_ref}"
       digest: gitCommit: "${git_sha}"
     }]
   }
@@ -323,18 +370,20 @@ EOF
     if [[ -z "${NEWAPI_TOOLS_COSIGN_RUNNER:-}" ]]; then
       policy_argument='/tmp/newapi-tools-provenance-policy.cue'
     fi
+    certificate_sha_args=()
+    if [[ -n "${workflow_shas[index]}" ]]; then
+      certificate_sha_args=(--certificate-github-workflow-sha "${workflow_shas[index]}")
+    fi
     if NEWAPI_TOOLS_COSIGN_POLICY_FILE="$policy_file" run_install_cosign verify-attestation \
       --type slsaprovenance1 \
       --policy "$policy_argument" \
       --certificate-identity "$identity" \
       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
       --certificate-github-workflow-repository "$NEWAPI_TOOLS_SIGNING_REPOSITORY" \
-      --certificate-github-workflow-ref "$expected_ref" \
-      --certificate-github-workflow-sha "$git_sha" \
+      --certificate-github-workflow-ref "${workflow_refs[index]}" \
+      "${certificate_sha_args[@]}" \
       --certificate-github-workflow-name "${workflow_names[index]}" \
       --certificate-github-workflow-trigger "${workflow_triggers[index]}" \
-      -a "git_sha=${git_sha}" \
-      -a "tag=${tag}" \
       "$image" >/dev/null; then
       rm -f -- "$policy_file"
       return 0
@@ -1149,7 +1198,7 @@ migrate_image_env_file() {
     if [[ -n "$existing_image" ]]; then
       selected_image="$existing_image"
     else
-      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.6.1"
+      selected_image="${NEWAPI_TOOLS_IMAGE_REPOSITORY}:0.6.2"
     fi
   fi
   validate_newapi_tools_image "$selected_image"
@@ -3676,7 +3725,7 @@ NewAPI Middleware Tool - 安装管理脚本
 环境变量:
   PROJECT_DIR        指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER   指定 NewAPI 容器名（默认: 自动检测）
-  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.6.1；main 会锁定本次 commit 的短 SHA 镜像）
+  NEWAPI_TOOLS_REF              Git 安装版本（默认: v0.6.2；main 会锁定本次 commit 的短 SHA 镜像）
   NEWAPI_TOOLS_IMAGE            发行页核验的完整 repo@sha256:digest；严格发行标签必填，开发 ref 禁止显式设置
   NEWAPI_TOOLS_EXPECTED_REVISION 发行页核验的 40 位 Git commit；显式镜像时必填
 
