@@ -156,6 +156,20 @@ func waitForRunStatus(t *testing.T, store *toolstore.Store, key, status string) 
 	t.Fatalf("run did not reach %q: %+v, %v", status, run, err)
 }
 
+func waitForManagerIdle(t *testing.T, manager *Manager) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := manager.Status(context.Background())
+		if err == nil && !status.Running {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status, err := manager.Status(context.Background())
+	t.Fatalf("manager did not become idle: %+v, %v", status, err)
+}
+
 func TestManagerSkipsUnsupportedWithoutNetworkOrBudget(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -185,6 +199,7 @@ func TestManagerSkipsUnsupportedWithoutNetworkOrBudget(t *testing.T) {
 		t.Fatalf("QueueManual(unsupported) = %+v, %t, %v", skippedRun, replayed, err)
 	}
 	waitForRunStatus(t, store, skippedRun.RunKey, "skipped")
+	waitForManagerIdle(t, manager)
 	status, err := manager.Status(context.Background())
 	if err != nil || status.RequestsUsedToday != 0 || requests.Load() != 0 {
 		t.Fatalf("unsupported truth = status:%+v requests:%d err:%v", status, requests.Load(), err)
