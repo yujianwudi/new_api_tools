@@ -7,6 +7,9 @@ import (
 )
 
 func TestAffiliateStatsGuardrailDefaultsAndBoundaries(t *testing.T) {
+	originalCfg := cfg
+	t.Cleanup(func() { cfg = originalCfg })
+
 	for _, key := range []string{
 		"AFFILIATE_EVIDENCE_ROW_CAP",
 		"AFFILIATE_QUERY_TIMEOUT_SECONDS",
@@ -52,6 +55,9 @@ func TestAffiliateStatsGuardrailDefaultsAndBoundaries(t *testing.T) {
 }
 
 func TestAffiliateStatsGuardrailEnvironmentFailsStartupValidation(t *testing.T) {
+	originalCfg := cfg
+	t.Cleanup(func() { cfg = originalCfg })
+
 	tests := []struct {
 		name    string
 		key     string
