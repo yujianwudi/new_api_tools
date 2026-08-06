@@ -25,6 +25,21 @@ for test_name in \
   grep -Fq "$test_name" "$performance"
 done
 
+affiliate_step="$(awk '
+  $0 == "      - name: Run affiliate performance acceptance" {
+    in_step = 1
+  }
+  in_step && $0 ~ /^      - name: / &&
+    $0 != "      - name: Run affiliate performance acceptance" {
+    exit
+  }
+  in_step {
+    print
+  }
+' "$performance")"
+grep -Fq '        env:' <<< "$affiliate_step"
+grep -Fq "          AFFILIATE_PERF: '1'" <<< "$affiliate_step"
+
 grep -Fq "if: github.ref_type == 'tag'" "$build"
 grep -Fq "needs: quality" "$build"
 grep -Fq "needs: [validate, quality]" "$recovery"

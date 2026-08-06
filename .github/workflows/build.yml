@@ -465,6 +465,8 @@ jobs:
             type=sha,prefix=,enable=${{ github.ref_type != 'tag' }}
 
       - name: Create manifest list and push
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
         run: bash scripts/ci/create-manifest.sh /tmp/digests
 
       - name: Inspect image
