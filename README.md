@@ -250,8 +250,8 @@ v0.6.2 继续缩小自动化写入面。下面的旧能力不得视为可用的�
 
 ```bash
 # v0.6.2 installer is pinned to an immutable audited commit and blob hash.
-INSTALLER_COMMIT_SHA=461db035f98a4be1ee370e7e27bce1d1df79ce92
-INSTALL_SCRIPT_SHA256=6dc1eab219a78587c2828388d921d2dcfd9d87c34a8ca01662d00ddb0efc1232
+INSTALLER_COMMIT_SHA=5230df4175a47d272a003317a56347cae2d9997f
+INSTALL_SCRIPT_SHA256=0797d2457c6a79e213968470ce1fafa4ac7474aabff5104ea7ebfcee382ac3a1
 install_script="$(mktemp)"
 trap 'rm -f "$install_script"' EXIT
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
