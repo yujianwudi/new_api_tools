@@ -1,0 +1,97 @@
+name: Build platform image
+description: Build one immutable platform image and optionally publish its digest artifact.
+
+inputs:
+  platform:
+    description: Target OCI platform.
+    required: true
+  runner-name:
+    description: Runner label used to name the digest artifact.
+    required: true
+  registry:
+    description: Container registry hostname.
+    required: true
+  image-name:
+    description: Registry repository name.
+    required: true
+  push:
+    description: Whether to authenticate, push the image, and upload its digest.
+    required: true
+  registry-username:
+    description: Registry username used only when push is true.
+    required: false
+    default: ''
+  registry-password:
+    description: Registry token used only when push is true.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Log in to GitHub Container Registry
+      if: inputs.push == 'true'
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+      with:
+        images: ${{ inputs.registry }}/${{ inputs.image-name }}
+
+    - name: Resolve immutable build identity
+      id: build_identity
+      shell: bash --noprofile --norc -euo pipefail {0}
+      run: |
+        version='0.6.2-dev'
+        if [[ "$GITHUB_REF_TYPE" == 'tag' ]]; then
+          version="${GITHUB_REF_NAME#v}"
+        fi
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+        echo "date=$(git show -s --format=%cI "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+
+    - name: Build and optionally push by digest
+      id: build
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: ${{ inputs.platform }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          APP_VERSION=${{ steps.build_identity.outputs.version }}
+          VCS_REF=${{ github.sha }}
+          BUILD_DATE=${{ steps.build_identity.outputs.date }}
+        provenance: mode=max
+        sbom: true
+        cache-from: type=gha,scope=build-${{ inputs.platform }}
+        cache-to: type=gha,mode=max,scope=build-${{ inputs.platform }}
+        outputs: type=image,name=${{ inputs.registry }}/${{ inputs.image-name }},push-by-digest=true,name-canonical=true,push=${{ inputs.push }}
+
+    - name: Export immutable digest
+      if: inputs.push == 'true'
+      shell: bash --noprofile --norc -euo pipefail {0}
+      run: |
+        digest='${{ steps.build.outputs.digest }}'
+        [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+          echo "build returned an invalid digest: $digest" >&2
+          exit 1
+        }
+        mkdir -p /tmp/digests
+        : > "/tmp/digests/${digest#sha256:}"
+
+    - name: Upload immutable digest
+      if: inputs.push == 'true'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: digests-${{ inputs.runner-name }}
+        path: /tmp/digests/*
+        if-no-files-found: error
+        retention-days: 1

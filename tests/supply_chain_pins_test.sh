@@ -152,6 +152,10 @@ grep -Fxq '.github/workflows/*.yml text eol=lf' .gitattributes ||
   fail 'workflow yml files must remain normalized to LF through .gitattributes'
 grep -Fxq '.github/workflows/*.yaml text eol=lf' .gitattributes ||
   fail 'workflow yaml files must remain normalized to LF through .gitattributes'
+grep -Fxq '.github/actions/**/action.yml text eol=lf' .gitattributes ||
+  fail 'composite action yml files must remain normalized to LF through .gitattributes'
+grep -Fxq '.yamllint.yml text eol=lf' .gitattributes ||
+  fail 'YAML lint policy must remain normalized to LF through .gitattributes'
 
 tr -d '\r' < .env.example | grep -Fxq 'NEWAPI_TOOLS_IMAGE=' ||
   fail '.env.example must not ship a mutable application image default'
@@ -249,7 +253,7 @@ fi
 # the matching protected tag. A not-yet-tagged document for the current source
 # version may temporarily bind to HEAD until its tag is created.
 pending_release_version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)"/\1/p' \
-  backend/internal/buildinfo/buildinfo.go)"
+  backend/internal/buildinfo/buildinfo.go | tr -d '\r')"
 [[ "$pending_release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   fail 'could not determine the pending source release version'
 
@@ -349,6 +353,106 @@ release_installer_sha256="$(sed -n 's/^INSTALL_SCRIPT_SHA256=\([0-9a-f]\{64\}\)$
 if grep -Eq '^[[:space:]]+paths:' .github/workflows/build.yml; then
   fail 'required build checks must run for every main push and pull request without path filters'
 fi
+
+pr_build_block="$(sed -n '/^  build:/,/^  build-publish:/p' .github/workflows/build.yml)"
+publish_build_block="$(sed -n '/^  build-publish:/,/^  merge:/p' .github/workflows/build.yml)"
+grep -Fq "if: github.event_name == 'pull_request'" <<< "$pr_build_block" ||
+  fail 'pull-request image builds must use the read-only build job'
+grep -Fq 'contents: read' <<< "$pr_build_block" ||
+  fail 'pull-request image builds must retain read-only repository access'
+if grep -Fq 'packages: write' <<< "$pr_build_block"; then
+  fail 'pull-request image builds must not receive package write permission'
+fi
+[[ "$(grep -cE '^[[:space:]]+- platform: linux/(amd64|arm64)[[:space:]]*$' <<< "$pr_build_block")" == '2' ]] ||
+  fail 'pull-request image build must retain exactly two required platforms'
+grep -Fq $'          - platform: linux/amd64\n            runner: ubuntu-latest' <<< "$pr_build_block" ||
+  fail 'pull-request amd64 platform must remain paired with ubuntu-latest'
+grep -Fq $'          - platform: linux/arm64\n            runner: ubuntu-24.04-arm' <<< "$pr_build_block" ||
+  fail 'pull-request arm64 platform must remain paired with ubuntu-24.04-arm'
+if grep -Eq '^    name:' <<< "$pr_build_block"; then
+  fail 'pull-request build job must not override the required matrix check names'
+fi
+grep -Fq "if: github.event_name == 'push'" <<< "$publish_build_block" ||
+  fail 'registry publication must be isolated from pull-request builds'
+grep -Fq 'packages: write' <<< "$publish_build_block" ||
+  fail 'registry publication must explicitly request package write permission'
+for build_block in "$pr_build_block" "$publish_build_block"; do
+  grep -Fq 'uses: ./.github/actions/build-platform' <<< "$build_block" ||
+    fail 'all platform builds must use the reviewed local composite action'
+done
+grep -Fq "push: 'false'" <<< "$pr_build_block" ||
+  fail 'pull-request image builds must disable registry publication'
+grep -Fq "push: 'true'" <<< "$publish_build_block" ||
+  fail 'publish image builds must explicitly enable registry publication'
+grep -Fq 'needs: [quality, build-publish]' .github/workflows/build.yml ||
+  fail 'manifest publication must consume only the privileged publish-build digests'
+grep -Fq 'run: bash scripts/ci/create-manifest.sh /tmp/digests' .github/workflows/build.yml ||
+  fail 'manifest publication must use the tested array-safe helper'
+grep -Fq 'bash tests/create_manifest_test.sh' .github/workflows/build.yml ||
+  fail 'normal quality gates must execute the manifest helper regression test'
+publication_checkout_line="$(grep -nF 'name: Checkout publication source' .github/workflows/build.yml |
+  head -n 1 | cut -d: -f1)"
+manifest_helper_line="$(grep -nF 'run: bash scripts/ci/create-manifest.sh /tmp/digests' .github/workflows/build.yml |
+  head -n 1 | cut -d: -f1)"
+[[ "$publication_checkout_line" =~ ^[0-9]+$ && "$manifest_helper_line" =~ ^[0-9]+$ &&
+   "$publication_checkout_line" -lt "$manifest_helper_line" ]] ||
+  fail 'manifest publication must checkout its exact source before invoking the helper'
+publication_checkout_block="$(awk '
+  $0 == "      - name: Checkout publication source" { capture = 1 }
+  capture && $0 ~ /^      - name:/ && $0 != "      - name: Checkout publication source" { exit }
+  capture { print }
+' .github/workflows/build.yml)"
+grep -Fq 'ref: ${{ github.sha }}' <<< "$publication_checkout_block" ||
+  fail 'manifest publication checkout must bind the exact workflow SHA'
+if grep -Fq 'if:' <<< "$publication_checkout_block"; then
+  fail 'manifest publication checkout must run for both main and tag pushes'
+fi
+
+build_action='.github/actions/build-platform/action.yml'
+[[ "$(grep -cF "if: inputs.push == 'true'" "$build_action")" == '3' ]] ||
+  fail 'composite build action must guard login, digest export, and artifact upload behind push=true'
+for guarded_step in \
+  'Log in to GitHub Container Registry' \
+  'Export immutable digest' \
+  'Upload immutable digest'; do
+  guarded_block="$(awk -v marker="    - name: ${guarded_step}" '
+    $0 == marker { capture = 1 }
+    capture && $0 ~ /^    - name:/ && $0 != marker { exit }
+    capture { print }
+  ' "$build_action")"
+  grep -Fq "if: inputs.push == 'true'" <<< "$guarded_block" ||
+    fail "composite action step is not individually guarded by push=true: $guarded_step"
+done
+grep -Fq '[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]' "$build_action" ||
+  fail 'composite build action must validate the published platform digest'
+grep -Fq 'registry-password: ${{ secrets.GITHUB_TOKEN }}' <<< "$publish_build_block" ||
+  fail 'only the publish caller may pass the registry token to the composite action'
+if grep -Fq 'registry-password:' <<< "$pr_build_block"; then
+  fail 'pull-request image builds must not pass a registry token'
+fi
+
+for legacy_workflow in \
+  .github/workflows/affiliate-performance.yml \
+  .github/workflows/model-status-performance.yml \
+  .github/workflows/user-management-performance.yml; do
+  [[ ! -e "$legacy_workflow" ]] ||
+    fail "duplicated performance workflow still exists: $legacy_workflow"
+done
+for required_context in \
+  '100k-user SQLite p95 and query-plan gate' \
+  'Authenticated status and durable config p95' \
+  '100k users and 30-day billing-log SLO'; do
+  grep -Fq "name: ${required_context}" .github/workflows/performance.yml ||
+    fail "consolidated performance workflow lost required check context: $required_context"
+done
+for workflow in .github/workflows/*.yml; do
+  grep -Eq '^permissions:' "$workflow" ||
+    fail "$workflow must declare an explicit top-level permission baseline"
+  grep -Eq '^concurrency:' "$workflow" ||
+    fail "$workflow must declare an explicit concurrency policy"
+  grep -Fq 'shell: bash --noprofile --norc -euo pipefail {0}' "$workflow" ||
+    fail "$workflow must use the strict shared Bash execution policy"
+done
 
 # Release publication is intentionally fail-closed around annotated tag
 # identity. The normal tag workflow and the manual recovery path must both

@@ -23,6 +23,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   validate:
     name: Validate existing release tag
@@ -55,7 +59,6 @@ jobs:
 
       - name: Validate immutable release identity
         id: identity
-        shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           REQUESTED_MANIFEST_DIGEST: ${{ inputs.expected_manifest_digest }}
@@ -171,7 +174,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   quality:
-    name: Test and security gates
+    name: Recovery test and security gates
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -215,7 +218,6 @@ jobs:
           cosign-release: v3.1.2
 
       - name: Verify validated checkout
-        shell: bash
         env:
           EXPECTED_COMMIT: ${{ needs.validate.outputs.tag_commit }}
         run: |
@@ -381,7 +383,6 @@ jobs:
 
       - name: Publish and verify release manifest
         id: publish
-        shell: bash
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
