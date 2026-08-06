@@ -3,8 +3,8 @@ package newapi_tools_release
 "_type": "https://in-toto.io/Statement/v0.1"
 predicateType: "https://slsa.dev/provenance/v1"
 subject: [{
-	name: "ghcr.io/yujianwudi/new_api_tools"
-	digest: sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	name: "artifact.txt"
+	digest: sha256: =~"^[0-9a-f]{64}$"
 }]
 predicate: {
 	buildDefinition: {

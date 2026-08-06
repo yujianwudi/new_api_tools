@@ -209,6 +209,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Install Cosign for offline policy gate
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.2
+
       - name: Verify validated checkout
         shell: bash
         env:
@@ -778,7 +783,7 @@ jobs:
 
           cat > "$policy_file" <<EOF
           package newapi_tools_release
-          "_type": "https://in-toto.io/Statement/v1"
+          "_type": "https://in-toto.io/Statement/v0.1"
           predicateType: "https://slsa.dev/provenance/v1"
           subject: [{name: "${image}", digest: sha256: "${version_digest#sha256:}"}]
           predicate: {
@@ -834,8 +839,6 @@ jobs:
             exit 1
           }
 
-          minor_updated=false
-
           echo "manifest_digest=${version_digest}" >> "$GITHUB_OUTPUT"
           {
             echo "### Recovered release image"
@@ -844,7 +847,7 @@ jobs:
             echo "- Commit: \`${EXPECTED_TAG_COMMIT}\`"
             echo "- Manifest: \`${version_digest}\`"
             echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
-            echo "- Exact tag reused: \`${release_image_exists}\`"
-            echo "- Minor alias updated: \`${minor_updated}\`"
+            echo "- Exact tag: reused and verified without mutation"
+            echo "- Minor alias: not updated by recovery design"
             echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } >> "$GITHUB_STEP_SUMMARY"

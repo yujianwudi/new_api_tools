@@ -278,11 +278,15 @@ resolve_install_release_platform_digests() {
   local amd64_digest='' arm64_digest=''
 
   is_immutable_newapi_tools_image "$image" || return 1
+  command -v timeout >/dev/null 2>&1 || {
+    log_error "发行镜像平台 digest 校验需要 timeout"
+    return 1
+  }
   docker buildx version >/dev/null 2>&1 || {
     log_error "发行镜像平台 digest 校验需要 Docker Buildx"
     return 1
   }
-  descriptors="$(docker buildx imagetools inspect "$image" --format \
+  descriptors="$(timeout -k 10s 120s docker buildx imagetools inspect "$image" --format \
     '{{range .Manifest.Manifests}}{{if .Platform}}{{.Platform.OS}}/{{.Platform.Architecture}}{{else}}unknown/unknown{{end}} {{.Digest}}{{println}}{{end}}')" || return 1
   while read -r platform digest; do
     [[ -n "$platform" ]] || continue
@@ -337,7 +341,7 @@ verify_install_release_provenance() {
     cat >"$policy_file" <<EOF
 package newapi_tools_release
 
-"_type": "https://in-toto.io/Statement/v1"
+"_type": "https://in-toto.io/Statement/v0.1"
 predicateType: "https://slsa.dev/provenance/v1"
 subject: [{
   name: "${repository}"
@@ -2030,6 +2034,7 @@ check_requirements() {
   command -v realpath >/dev/null 2>&1 || missing+=("realpath")
   command -v stat >/dev/null 2>&1 || missing+=("stat")
   command -v sync >/dev/null 2>&1 || missing+=("sync")
+  command -v timeout >/dev/null 2>&1 || missing+=("timeout")
 
   # 当前基础 Compose 使用不可变镜像策略门禁，并与 host overlay 统一要求 v2.24+。
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then

@@ -7,7 +7,9 @@ fail() {
 }
 
 command -v cosign >/dev/null 2>&1 || fail 'cosign is not installed'
-cosign version 2>&1 | grep -Fq 'v3.1.2' || fail 'workflow did not install the pinned Cosign v3.1.2 CLI'
+cosign_version="$(cosign version 2>&1 | awk '$1 == "GitVersion:" { print $2 }')"
+[[ "$cosign_version" == 'v3.1.2' ]] ||
+  fail "workflow installed Cosign ${cosign_version:-unknown}, expected exactly v3.1.2"
 
 sign_help="$(cosign sign --help)"
 verify_help="$(cosign verify --help)"

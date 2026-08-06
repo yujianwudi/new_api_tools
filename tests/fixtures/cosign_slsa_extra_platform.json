@@ -1,5 +1,5 @@
 {
-  "_type": "https://in-toto.io/Statement/v1",
+  "_type": "https://in-toto.io/Statement/v0.1",
   "predicateType": "https://slsa.dev/provenance/v1",
   "subject": [{
     "name": "ghcr.io/yujianwudi/new_api_tools",

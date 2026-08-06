@@ -27,6 +27,8 @@ for workflow in .github/workflows/build.yml .github/workflows/release-recovery.y
     fail "$workflow does not give the CUE policy an explicit suffix"
   grep -Fq 'platform_digests: close({' "$workflow" ||
     fail "$workflow does not close the platform digest policy"
+  grep -Fq '"_type": "https://in-toto.io/Statement/v0.1"' "$workflow" ||
+    fail "$workflow policy does not match Cosign v3.1.2 generated statement type v0.1"
 
   sign_block="$(extract_command_block "$workflow" 'cosign sign --yes' '"$subject"')"
   verify_block="$(extract_command_block "$workflow" 'cosign verify ' '"$subject"')"
@@ -46,6 +48,26 @@ for workflow in .github/workflows/build.yml .github/workflows/release-recovery.y
   done
 done
 
+grep -Fq 'cosign attest-blob --yes' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not create a real Cosign blob attestation'
+grep -Fq 'cosign verify-blob-attestation' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not cryptographically verify its Cosign bundle'
+grep -Fq 'cosign signing-config create' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not use an explicit service-free signing config'
+grep -Fq 'tests/workflow_cue_policy_smoke.py' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not render and mutation-test the workflow policies'
+grep -Fq 'expected Cosign v3.1.2' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not assert the exact Cosign version'
+grep -Fq 'expected CUE v0.16.1' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy gate does not assert the exact CUE version'
+
+recovery_quality_block="$(sed -n '/^  quality:/,/^  publish:/p' .github/workflows/release-recovery.yml)"
+grep -Fq 'sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6' \
+  <<< "$recovery_quality_block" ||
+  fail 'release recovery quality job does not install Cosign from the reviewed action commit'
+grep -Fq 'cosign-release: v3.1.2' <<< "$recovery_quality_block" ||
+  fail 'release recovery quality job does not install exactly Cosign v3.1.2'
+
 for script in install.sh deploy.sh; do
   runner_prefix="run_${script%.sh}_cosign"
   signature_block="$(extract_command_block "$script" "${runner_prefix} verify " '"$image"')"
@@ -61,6 +83,8 @@ for script in install.sh deploy.sh; do
     fail "$script does not give local Cosign a CUE policy suffix"
   grep -Fq 'platform_digests: close({' "$script" ||
     fail "$script does not bind the exact two child manifest digests"
+  grep -Fq '"_type": "https://in-toto.io/Statement/v0.1"' "$script" ||
+    fail "$script policy does not match Cosign v3.1.2 generated statement type v0.1"
   grep -Fq 'refs/heads/main' "$script" ||
     fail "$script does not recognize the protected-main recovery identity"
 done

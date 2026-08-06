@@ -20,7 +20,7 @@ NewAPI Tools 是面向 [QuantumNous/new-api](https://github.com/QuantumNous/new-
 - 渠道和用户发生了什么，证据能否追溯；
 - 高风险操作是否经过授权、说明理由并留下完整结果。
 
-> v0.6.2 包含 v0.6.1 的用户筛选、邀请证据、模型监测与 Tool Store 安全整改，并修复 Cosign v3 attestation、恢复工作流身份和双平台 digest 消费门禁。失败的 v0.6.1 标签保持不可变且不创建 Release；v0.6.2 是首个完成该供应链闭环的发行版。
+> v0.6.2 包含 v0.6.1 的用户筛选、邀请证据、模型监测与 Tool Store 安全整改，并修复 Cosign v3 attestation、恢复工作流身份和双平台 digest 消费门禁。失败的 v0.6.1 标签保持不可变且不创建 Release；v0.6.2 是首个以完成该供应链闭环为目标的发行候选，只有 exact-main、标签产物、恢复演练和 GitHub Release 验证全部通过后才视为正式闭环。
 
 ## 架构边界
 
@@ -280,7 +280,7 @@ bash "$install_script"
 
 ### 手动部署
 
-v0.6.2 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本，并要求 Docker Buildx 用于读取不可变 manifest 的真实子平台 digest；旧版 `docker-compose` v1 或缺失 Buildx 都会失败关闭。
+v0.6.2 全部 Compose 路径要求 Docker Compose v2.24.0 或更高版本，并要求 Docker Buildx 与 GNU/BusyBox `timeout`（支持 `-k`）用于限时读取不可变 manifest 的真实子平台 digest；旧版 `docker-compose` v1、缺失 Buildx/`timeout` 或 registry 查询超时都会失败关闭。
 
 ```bash
 git clone --branch v0.6.2 --depth 1 https://github.com/yujianwudi/new_api_tools.git

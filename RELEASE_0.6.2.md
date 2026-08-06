@@ -11,7 +11,7 @@
 ## 供应链修复
 
 - `cosign sign` / `cosign verify` 继续用 annotations 绑定目标 tag 与 commit；`attest` / `verify-attestation` 不再传入 Cosign v3 不支持的 annotation 参数。
-- 所有 Cosign CUE policy 临时文件使用明确的 `.cue` 后缀；CI 直接检查固定的 Cosign v3.1.2 命令面。
+- 所有 Cosign CUE policy 临时文件使用明确的 `.cue` 后缀，并按 Cosign v3.1.2 实际生成的 in-toto `Statement/v0.1` 消费 SLSA v1 predicate；CI 真实执行离线签名、bundle 验签、DSSE 解码及正反 CUE policy。
 - 正常 tag workflow 的 SLSA predicate 和 policy 精确绑定 repository、tag ref、revision、manifest digest、amd64/arm64 digest、builder identity 与 resolved dependency。
 - 安装器和部署器从目标不可变 manifest 读取真实 amd64/arm64 子 digest，并把精确值写入闭合 CUE 结构；重复、缺失、额外平台或合法格式的伪造 digest 都失败关闭。
 - recovery 只能从受保护 `main` 调度，只接受 `v0.6.2+` annotated tag，并把实际 workflow ref/SHA 与目标 tag object/commit 分开记录和验证。
@@ -29,7 +29,7 @@
 ## 安装前置条件
 
 - Docker Engine，Docker Compose v2.24.0 或更高版本，以及 Docker Buildx；
-- Linux 主机上的 `git`、`flock`、`sha256sum`、`realpath`、`stat` 和 `sync`；
+- Linux 主机上的 `git`、`flock`、`sha256sum`、`realpath`、`stat`、`sync`，以及支持 `-k` 的 GNU/BusyBox `timeout`；
 - 已备份并验证实际 `TOOL_STORE_PATH`、`.env`、Compose overlay/project identity 和当前镜像 digest/revision。
 
 ## 安装模板（替换全部占位符后才能执行）

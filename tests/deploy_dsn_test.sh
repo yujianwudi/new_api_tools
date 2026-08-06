@@ -551,7 +551,7 @@ fake_cosign_runner() {
   [[ -z "$annotation_sha" && -z "$annotation_tag" ]] || return 1
   [[ "$predicate_type" == 'slsaprovenance1' && "$policy_file" == *.cue &&
      -f "$policy_file" && ! -L "$policy_file" ]] || return 1
-  grep -Fq '"_type": "https://in-toto.io/Statement/v1"' "$policy_file" &&
+  grep -Fq '"_type": "https://in-toto.io/Statement/v0.1"' "$policy_file" &&
     grep -Fq 'predicateType: "https://slsa.dev/provenance/v1"' "$policy_file" &&
     grep -Fq "name: \"${FAKE_PROVENANCE_SUBJECT_NAME}\"" "$policy_file" &&
     grep -Fq "digest: sha256: \"${FAKE_PROVENANCE_SUBJECT_DIGEST}\"" "$policy_file" &&
@@ -605,7 +605,7 @@ verify_release_signature_fixture() (
     identity) FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/forged.yml@refs/tags/${release_tag}" ;;
     issuer) FAKE_COSIGN_ISSUER='https://issuer.example.invalid' ;;
     repository) FAKE_COSIGN_REPOSITORY='attacker/new_api_tools' ;;
-    ref) FAKE_COSIGN_REF='refs/heads/main' ;;
+    ref) FAKE_COSIGN_REF='refs/heads/attacker' ;;
     sha) FAKE_COSIGN_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
     name) FAKE_COSIGN_NAME='Forged Workflow' ;;
     trigger) FAKE_COSIGN_TRIGGER='pull_request' ;;
@@ -697,6 +697,9 @@ for verifier in verify_install_release_signature verify_deploy_release_signature
     "${verifier} accepts the exact protected recovery workflow identity" \
     '' \
     verify_release_signature_fixture "$verifier" recovery
+  assert_rejected \
+    "${verifier} rejects a forged protected-main recovery ref" \
+    verify_release_signature_fixture "$verifier" recovery ref
   for mutation in identity issuer repository ref sha name trigger annotation-sha annotation-tag digest; do
     assert_rejected \
       "${verifier} rejects forged release certificate field ${mutation}" \
@@ -722,6 +725,24 @@ done
 
 release_platform_digest_fixture() (
   local resolver="$1" mode="$2"
+  command() {
+    if [[ "$mode" == missing-timeout && "$1" == -v && "${2:-}" == timeout ]]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  timeout() {
+    [[ "$1" == -k && "$2" == 10s && "$3" == 120s ]] || return 125
+    shift 3
+    if [[ "$mode" == timeout ]]; then
+      return 124
+    fi
+    if [[ "$mode" == partial-timeout ]]; then
+      "$@"
+      return 124
+    fi
+    "$@"
+  }
   docker() {
     [[ "$1" == buildx ]] || return 1
     if [[ "$2" == version ]]; then
@@ -730,11 +751,12 @@ release_platform_digest_fixture() (
     fi
     [[ "$2" == imagetools && "$3" == inspect ]] || return 1
     case "$mode" in
-      valid)
+      valid|partial-timeout)
         printf '%s\n' \
           'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
           'unknown/unknown sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
-          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+          'unknown/unknown sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
         ;;
       duplicate)
         printf '%s\n' \
@@ -753,6 +775,15 @@ release_platform_digest_fixture() (
           'linux/amd64 not-a-digest' \
           'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
         ;;
+      amd64-only)
+        printf '%s\n' \
+          'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        ;;
+      arm64-only)
+        printf '%s\n' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        ;;
+      empty|timeout) ;;
       *) return 1 ;;
     esac
   }
@@ -764,7 +795,7 @@ for resolver in resolve_install_release_platform_digests resolve_deploy_release_
     "${resolver} extracts the exact two release platform digests" \
     'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
     release_platform_digest_fixture "$resolver" valid
-  for mutation in duplicate extra invalid missing-buildx; do
+  for mutation in duplicate extra invalid amd64-only arm64-only empty timeout partial-timeout missing-buildx missing-timeout; do
     assert_rejected \
       "${resolver} rejects ${mutation} release platform metadata" \
       release_platform_digest_fixture "$resolver" "$mutation"
