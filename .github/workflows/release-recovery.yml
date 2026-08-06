@@ -23,6 +23,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
   validate:
     name: Validate existing release tag
@@ -55,7 +59,6 @@ jobs:
 
       - name: Validate immutable release identity
         id: identity
-        shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           REQUESTED_MANIFEST_DIGEST: ${{ inputs.expected_manifest_digest }}
@@ -171,7 +174,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   quality:
-    name: Test and security gates
+    name: Recovery test and security gates
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -215,7 +218,6 @@ jobs:
           cosign-release: v3.1.2
 
       - name: Verify validated checkout
-        shell: bash
         env:
           EXPECTED_COMMIT: ${{ needs.validate.outputs.tag_commit }}
         run: |
@@ -381,7 +383,6 @@ jobs:
 
       - name: Publish and verify release manifest
         id: publish
-        shell: bash
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -445,7 +446,7 @@ jobs:
             echo "GHCR token endpoint returned HTTP ${token_http_code}" >&2
             exit 1
           }
-          if ! registry_token="$(jq -er \
+          if ! ghcr_pull_token="$(jq -er \
             '.token | select(type == "string" and length > 0)' \
             "$token_response")"; then
             echo "GHCR token response did not contain a usable token" >&2
@@ -453,7 +454,7 @@ jobs:
           fi
           rm -f -- "$token_response"
           token_response=""
-          echo "::add-mask::${registry_token}"
+          echo "::add-mask::${ghcr_pull_token}"
           registry_index_accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
           registry_reference_digest() {
             local reference="$1"
@@ -466,7 +467,7 @@ jobs:
             headers_file="$(mktemp)"
             if ! http_code="$(curl --silent --show-error \
               --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 \
-              -H "Authorization: Bearer ${registry_token}" \
+              -H "Authorization: Bearer ${ghcr_pull_token}" \
               -H "Accept: ${registry_index_accept}" \
               --dump-header "$headers_file" \
               --output "$destination" \
@@ -532,7 +533,7 @@ jobs:
             headers_file="$(mktemp)"
             if ! http_code="$(curl --silent --show-error \
               --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 \
-              -H "Authorization: Bearer ${registry_token}" \
+              -H "Authorization: Bearer ${ghcr_pull_token}" \
               -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
               --dump-header "$headers_file" \
               --output "$destination" \

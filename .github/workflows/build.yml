@@ -1,22 +1,28 @@
-# GitHub Actions CI/CD Workflow for NewAPI Middleware Tool
-# 构建并推送 All-in-One Docker 镜像 (Go 后端, 支持 amd64 和 arm64)
-
 name: Build and Push Docker Image
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
-    branches: [main]
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 jobs:
   quality:
@@ -73,7 +79,6 @@ jobs:
       - name: Validate release tag identity
         id: release_identity
         if: github.ref_type == 'tag'
-        shell: bash
         run: |
           tag="${GITHUB_REF_NAME}"
           if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -147,6 +152,7 @@ jobs:
           bash tests/toolstore_transaction_test.sh
           bash tests/install_clone_recovery_test.sh
           bash tests/release_performance_gate_test.sh
+          bash tests/create_manifest_test.sh
           bash tests/setup_log_db_safety_test.sh
           bash tests/supply_chain_pins_test.sh
           docker compose config --quiet
@@ -159,6 +165,9 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache: false
+
+      - name: Lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Evaluate CUE provenance policy fixtures
         run: bash tests/cue_policy_smoke_test.sh
@@ -259,6 +268,39 @@ jobs:
         run: npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org
 
   build:
+    if: github.event_name == 'pull_request'
+    needs: quality
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build platform without registry write access
+        uses: ./.github/actions/build-platform
+        with:
+          platform: ${{ matrix.platform }}
+          runner-name: ${{ matrix.runner }}
+          registry: ${{ env.REGISTRY }}
+          image-name: ${{ env.IMAGE_NAME }}
+          push: 'false'
+
+  build-publish:
+    if: github.event_name == 'push'
     needs: quality
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -281,73 +323,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - name: Build and publish immutable platform digest
+        uses: ./.github/actions/build-platform
         with:
+          platform: ${{ matrix.platform }}
+          runner-name: ${{ matrix.runner }}
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Resolve immutable build identity
-        id: build_identity
-        shell: bash
-        run: |
-          version="0.6.2-dev"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "date=$(git show -s --format=%cI "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ steps.build_identity.outputs.version }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ steps.build_identity.outputs.date }}
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=build-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-
-      - name: Export digest
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: digests-${{ matrix.runner }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          image-name: ${{ env.IMAGE_NAME }}
+          push: 'true'
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name != 'pull_request'
-    needs: [quality, build]
+    if: github.event_name == 'push'
+    needs: [quality, build-publish]
     concurrency:
       group: ${{ github.ref_type == 'tag' && format('ghcr-publish-minor-{0}', needs.quality.outputs.release_major_minor) || 'ghcr-publish-main' }}
       cancel-in-progress: false
@@ -357,8 +348,7 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout release identity
-        if: github.ref_type == 'tag'
+      - name: Checkout publication source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.sha }}
@@ -385,7 +375,6 @@ jobs:
       - name: Revalidate release identity and minor alias
         if: github.ref_type == 'tag'
         id: release_alias
-        shell: bash
         env:
           EXPECTED_TAG_OID: ${{ needs.quality.outputs.release_tag_oid }}
           EXPECTED_TAG_COMMIT: ${{ needs.quality.outputs.release_tag_commit }}
@@ -476,10 +465,9 @@ jobs:
             type=sha,prefix=,enable=${{ github.ref_type != 'tag' }}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        run: bash scripts/ci/create-manifest.sh /tmp/digests
 
       - name: Inspect image
         run: |
@@ -499,7 +487,6 @@ jobs:
 
       - name: Sign, attest, and verify immutable release manifest
         if: github.ref_type == 'tag'
-        shell: bash
         run: |
           image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
           manifest_digest="$(docker buildx imagetools inspect "$image" |

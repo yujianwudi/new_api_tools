@@ -1,0 +1,96 @@
+name: Performance acceptance
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  affiliate-performance:
+    name: 100k-user SQLite p95 and query-plan gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Run affiliate performance acceptance
+        working-directory: backend
+        env:
+          AFFILIATE_PERF: '1'
+        run: |
+          test_name='TestAffiliateStatsPerformanceAcceptance'
+          selected="$(go test -list "^${test_name}$" ./internal/service)"
+          grep -Fxq -- "$test_name" <<< "$selected"
+          go test ./internal/service -run "^${test_name}$" -count=1 -v -timeout 10m
+
+  model-status-performance:
+    name: Authenticated status and durable config p95
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Run model status performance acceptance
+        working-directory: backend
+        run: |
+          test_name='TestModelStatusPerformanceSLO'
+          selected="$(go test -tags=performance -list "^${test_name}$" ./internal/handler)"
+          grep -Fxq -- "$test_name" <<< "$selected"
+          go test -tags=performance -run "^${test_name}$" -count=1 -v ./internal/handler
+
+  user-management-performance:
+    name: 100k users and 30-day billing-log SLO
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Enforce user-management latency SLOs
+        working-directory: backend
+        run: |
+          test_name='TestUserManagementPerformanceSLO'
+          selected="$(go test -tags=performance -list "^${test_name}$" ./internal/service)"
+          grep -Fxq -- "$test_name" <<< "$selected"
+          go test -tags=performance -run "^${test_name}$" -count=1 -v ./internal/service

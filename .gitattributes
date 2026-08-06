@@ -1,8 +1,13 @@
 *.sh text eol=lf
+.gitattributes text eol=lf
 .env.example text eol=lf
 .github/dependabot.yml text eol=lf
+.github/*.md text eol=lf
+.github/actions/**/action.yml text eol=lf
+.github/actions/**/action.yaml text eol=lf
+.github/workflows/*.yml text eol=lf
+.github/workflows/*.yaml text eol=lf
+.yamllint.yml text eol=lf
 README.md text eol=lf
 RELEASE_*.md text eol=lf
 Dockerfile text eol=lf
-.github/workflows/*.yml text eol=lf
-.github/workflows/*.yaml text eol=lf
