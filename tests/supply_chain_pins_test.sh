@@ -371,8 +371,8 @@ build_tag_type_line="$(grep -nF \
 recovery_commit_checkout_count="$(grep -cF \
   'ref: ${{ needs.validate.outputs.tag_commit }}' \
   .github/workflows/release-recovery.yml || true)"
-[[ "$recovery_commit_checkout_count" == "3" ]] ||
-  fail 'release recovery quality, build, and publish jobs must checkout the validated commit'
+[[ "$recovery_commit_checkout_count" == "2" ]] ||
+  fail 'release recovery quality and repair jobs must checkout the validated release commit'
 if grep -Fq 'ref: refs/tags/${{ inputs.tag }}' .github/workflows/release-recovery.yml; then
   fail 'release recovery must not checkout an input tag after identity validation'
 fi
@@ -391,8 +391,9 @@ grep -Fq 'latest=false' .github/workflows/build.yml ||
   fail 'release tags must not implicitly move the latest image alias'
 grep -Fq 'publish_minor=false' .github/workflows/build.yml ||
   fail 'normal tag publication must guard the mutable major.minor alias'
-grep -Fq 'publish_minor=false' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must guard the mutable major.minor alias'
+if grep -Fq 'docker buildx imagetools create' .github/workflows/release-recovery.yml; then
+  fail 'release recovery must never create or move an exact or minor image tag'
+fi
 grep -Fq 'refusing to overwrite existing release image tag' .github/workflows/build.yml ||
   fail 'normal release publication must keep exact version image tags immutable'
 grep -Fq 'release_image_exists=true' .github/workflows/release-recovery.yml ||
@@ -421,13 +422,8 @@ grep -Fq -- '-a "tag=${GITHUB_REF_NAME}"' .github/workflows/build.yml ||
   fail 'release signature must bind the protected release tag annotation'
 grep -Fq 'candidate_source_version=' .github/workflows/build.yml ||
   fail 'normal release publication must ignore invalid higher-version tags'
-grep -Fq 'candidate_source_version=' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must ignore invalid higher-version tags'
 grep -Fq 'NEWAPI_TOOLS_REF=${candidate_tag} \\' .github/workflows/build.yml ||
   fail 'normal release publication must require the candidate installer ref marker'
-grep -Fq 'NEWAPI_TOOLS_REF=${candidate_tag} \\' \
-  .github/workflows/release-recovery.yml ||
-  fail 'release recovery must require the candidate installer ref marker'
 grep -Fq 'Run Go race detector' .github/workflows/release-recovery.yml ||
   fail 'release recovery must repeat the Go race quality gate'
 grep -Fq 'npm audit --audit-level=high' .github/workflows/release-recovery.yml ||
@@ -436,7 +432,21 @@ grep -Fq 'npm audit --omit=dev --audit-level=moderate' .github/workflows/release
   fail 'release recovery must repeat the stricter production dependency audit'
 grep -Fq 'in-toto.io/predicate-type' .github/workflows/release-recovery.yml ||
   fail 'release recovery must verify SBOM and provenance attestations'
+
+extract_command_block() {
+  local file="$1" marker="$2" terminal="$3"
+  awk -v marker="$marker" -v terminal="$terminal" '
+    index($0, marker) { capture = 1 }
+    capture { print }
+    capture && index($0, terminal) { exit }
+  ' "$file"
+}
+
 for workflow in .github/workflows/build.yml .github/workflows/release-recovery.yml; do
+  grep -Fq 'bash tests/cosign_v3_cli_smoke_test.sh' "$workflow" ||
+    fail "$workflow must execute the real pinned Cosign CLI surface gate"
+  grep -Fq 'bash tests/cue_policy_smoke_test.sh' "$workflow" ||
+    fail "$workflow must evaluate CUE policy positive and negative fixtures"
   grep -Fq 'cosign attest --yes' "$workflow" ||
     fail "$workflow must publish signed SLSA provenance for the immutable manifest"
   grep -Fq -- '--type slsaprovenance1' "$workflow" ||
@@ -449,7 +459,55 @@ for workflow in .github/workflows/build.yml .github/workflows/release-recovery.y
     fail "$workflow provenance must bind the immutable manifest digest"
   grep -Fq 'resolvedDependencies' "$workflow" ||
     fail "$workflow provenance must bind its Git source dependency"
+  grep -Fq 'policy_file="$(mktemp --suffix=.cue)"' "$workflow" ||
+    fail "$workflow must give Cosign v3 an explicit CUE policy suffix"
+  grep -Fq 'platform_digests: close({' "$workflow" ||
+    fail "$workflow provenance policy must reject extra platform keys"
+
+  sign_block="$(extract_command_block "$workflow" 'cosign sign --yes' '"$subject"')"
+  verify_block="$(extract_command_block "$workflow" 'cosign verify ' '"$subject"')"
+  attest_block="$(extract_command_block "$workflow" 'cosign attest --yes' '"$subject"')"
+  verify_attestation_block="$(extract_command_block "$workflow" 'cosign verify-attestation' '"$subject"')"
+  for signature_block in "$sign_block" "$verify_block"; do
+    grep -Fq -- '-a "git_sha=' <<< "$signature_block" ||
+      fail "$workflow signature command must bind the target commit annotation"
+    grep -Fq -- '-a "tag=' <<< "$signature_block" ||
+      fail "$workflow signature command must bind the target tag annotation"
+  done
+  for attestation_block in "$attest_block" "$verify_attestation_block"; do
+    [[ -n "$attestation_block" ]] || fail "$workflow attestation command block could not be isolated"
+    if grep -Eq '^[[:space:]]+-a[[:space:]]' <<< "$attestation_block"; then
+      fail "$workflow must not pass unsupported annotation flags to Cosign v3 attestation commands"
+    fi
+  done
 done
+for policy_consumer in \
+  .github/workflows/build.yml \
+  .github/workflows/release-recovery.yml \
+  install.sh \
+  deploy.sh; do
+  grep -Fq '"_type": "https://in-toto.io/Statement/v0.1"' "$policy_consumer" ||
+    fail "$policy_consumer must consume the statement type generated by Cosign v3.1.2"
+done
+grep -Fq 'cuelang.org/go/cmd/cue@v0.16.1' tests/cue_policy_smoke_test.sh ||
+  fail 'CUE policy smoke test must match the evaluator embedded in Cosign v3.1.2'
+grep -Fq "[[ \"\$cosign_version\" == 'v3.1.2' ]]" tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy smoke must assert the exact Cosign CLI version'
+grep -Fq "[[ \"\$cue_version\" == 'v0.16.1' ]]" tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy smoke must assert the exact CUE CLI version'
+grep -Fq 'cosign attest-blob --yes' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy smoke must create a real signed Cosign attestation bundle'
+grep -Fq 'cosign verify-blob-attestation' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy smoke must verify the signed blob attestation'
+grep -Fq 'workflow_cue_policy_smoke.py' tests/cue_policy_smoke_test.sh ||
+  fail 'offline policy smoke must mutation-test both rendered workflow policies'
+
+recovery_quality_block="$(sed -n '/^  quality:/,/^  publish:/p' .github/workflows/release-recovery.yml)"
+grep -Fq 'sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6' \
+  <<< "$recovery_quality_block" ||
+  fail 'release recovery quality gate must install Cosign from the reviewed immutable action commit'
+grep -Fq 'cosign-release: v3.1.2' <<< "$recovery_quality_block" ||
+  fail 'release recovery quality gate must install exactly Cosign v3.1.2'
 for script in install.sh deploy.sh; do
   grep -Fq 'verify-attestation' "$script" ||
     fail "$script must verify signed release provenance before activation"
@@ -459,13 +517,48 @@ for script in install.sh deploy.sh; do
     fail "$script provenance policy must require amd64 and arm64 digests"
   grep -Fq 'manifest_digest:' "$script" ||
     fail "$script provenance policy must bind the requested manifest digest"
+  grep -Fq 'platform_digests: close({' "$script" ||
+    fail "$script provenance policy must bind the exact manifest platform digests"
+  grep -Fq 'policy_file="$(mktemp --suffix=.cue)"' "$script" ||
+    fail "$script must give a local Cosign v3 runner an explicit CUE policy suffix"
+  grep -Fq 'refs/heads/main' "$script" ||
+    fail "$script must recognize the protected-main recovery signer profile"
+
+  runner_prefix="run_${script%.sh}_cosign"
+  signature_block="$(extract_command_block "$script" "${runner_prefix} verify " '"$image"')"
+  provenance_block="$(extract_command_block "$script" "${runner_prefix} verify-attestation" '"$image"')"
+  grep -Fq -- '-a "git_sha=${git_sha}"' <<< "$signature_block" ||
+    fail "$script signature verification must retain the target commit annotation"
+  grep -Fq -- '-a "tag=${tag}"' <<< "$signature_block" ||
+    fail "$script signature verification must retain the target tag annotation"
+  if grep -Eq '^[[:space:]]+-a[[:space:]]' <<< "$provenance_block"; then
+    fail "$script must not pass unsupported annotation flags to Cosign v3 verify-attestation"
+  fi
 done
-grep -Fq '[[ "${GITHUB_REF}" == "refs/tags/${tag}" ]]' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must require dispatch against the exact protected tag ref'
+grep -Fq 'expected_manifest_digest:' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must require an operator-supplied immutable manifest digest'
+grep -Fq 'protected-main recovery is supported only for v0.6.2 and newer releases' \
+  .github/workflows/release-recovery.yml ||
+  fail 'release recovery must reject legacy tags whose consumers cannot trust the main signer profile'
+grep -Fq '[[ "${GITHUB_REF}" == "refs/heads/main" ]]' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must dispatch only from the protected main branch'
+grep -Fq 'RECOVERY_WORKFLOW_SHA: ${{ github.workflow_sha }}' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must bind the actual protected workflow revision'
+grep -Fq 'ref: ${{ github.workflow_sha }}' .github/workflows/release-recovery.yml ||
+  fail 'release recovery validation must checkout the workflow revision, not the target tag'
+grep -Fq 'refs/recovery/tags/${tag}' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must fetch the target tag into a private validation namespace'
+grep -Fq '"$version_digest" == "$EXPECTED_MANIFEST_DIGEST"' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must reject an existing manifest that differs from the recorded digest'
+grep -Fq '"$final_version_digest" == "$EXPECTED_MANIFEST_DIGEST"' .github/workflows/release-recovery.yml ||
+  fail 'release recovery must recheck the exact manifest after Sigstore writes'
+if grep -Fq 'docker/build-push-action@' .github/workflows/release-recovery.yml; then
+  fail 'release recovery must not rebuild or push replacement platform images'
+fi
 grep -Fq 'registry_manifest()' .github/workflows/release-recovery.yml ||
   fail 'release recovery must read attestation manifests through the registry API'
 grep -Fq 'registry_reference_digest()' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must inspect exact and minor tags through the registry API'
+  fail 'release recovery must inspect the exact tag through the registry API'
 if grep -Eiq 'manifest unknown|could not determine whether the (release image tag|minor alias) exists' \
   .github/workflows/release-recovery.yml; then
   fail 'release recovery must not infer registry status from Buildx error text'
@@ -479,12 +572,10 @@ grep -Fq 'sha256sum "$destination"' .github/workflows/release-recovery.yml ||
 grep -Fq 'attestation manifest was not found' .github/workflows/release-recovery.yml ||
   fail 'release recovery must distinguish missing attestations from other registry errors'
 grep -Fq '"${image}@${version_digest}"' .github/workflows/release-recovery.yml ||
-  fail 'release recovery must publish the minor alias from the exact manifest digest'
+  fail 'release recovery must sign and attest only the exact immutable manifest digest'
 [[ "$(grep -Fc '[[ "$current_version_digest" == "$version_digest" ]]' \
-  .github/workflows/release-recovery.yml)" -ge 3 ]] ||
-  fail 'release recovery must recheck the pinned exact digest before and after minor publication'
-[[ "$(grep -Fc 'refresh_release_versions' .github/workflows/release-recovery.yml)" -ge 3 ]] ||
-  fail 'release recovery must refresh release ordering immediately before minor publication'
+  .github/workflows/release-recovery.yml)" -ge 1 ]] ||
+  fail 'release recovery must recheck the pinned exact digest before Sigstore writes'
 grep -Fq '.schemaVersion == 2' .github/workflows/release-recovery.yml ||
   fail 'release recovery must validate OCI schema version 2 manifests'
 grep -Fq 'umask 077' .github/workflows/release-recovery.yml ||
@@ -494,16 +585,6 @@ if grep -Fq \
   .github/workflows/release-recovery.yml; then
   fail 'release recovery must not use Buildx to decode attestation manifests'
 fi
-
-release_exact_publish_line="$(grep -nF -- \
-  '-t "${image}:${RELEASE_VERSION}"' \
-  .github/workflows/release-recovery.yml | head -n 1 | cut -d: -f1)"
-release_minor_publish_line="$(grep -nF -- \
-  '-t "${image}:${RELEASE_MAJOR_MINOR}"' \
-  .github/workflows/release-recovery.yml | head -n 1 | cut -d: -f1)"
-[[ -n "$release_exact_publish_line" && -n "$release_minor_publish_line" &&
-   "$release_exact_publish_line" -lt "$release_minor_publish_line" ]] ||
-  fail 'release recovery must verify the exact release before updating the minor alias'
 
 release_alias_line="$(grep -nF 'id: release_alias' .github/workflows/build.yml |
   tail -n 1 | cut -d: -f1)"

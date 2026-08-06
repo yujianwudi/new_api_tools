@@ -518,6 +518,7 @@ fake_cosign_runner() {
       --certificate-github-workflow-name) workflow_name="${2:-}"; shift 2 ;;
       --certificate-github-workflow-trigger) workflow_trigger="${2:-}"; shift 2 ;;
       -a)
+        [[ "$command" == 'verify' ]] || return 1
         case "${2:-}" in
           git_sha=*) annotation_sha="${2#git_sha=}" ;;
           tag=*) annotation_tag="${2#tag=}" ;;
@@ -540,13 +541,17 @@ fake_cosign_runner() {
      "$workflow_sha" == "$FAKE_COSIGN_SHA" &&
      "$workflow_name" == "$FAKE_COSIGN_NAME" &&
      "$workflow_trigger" == "$FAKE_COSIGN_TRIGGER" &&
-     "$annotation_sha" == "$FAKE_COSIGN_ANNOTATION_SHA" &&
-     "$annotation_tag" == "$FAKE_COSIGN_ANNOTATION_TAG" &&
      "$subject" == "$FAKE_COSIGN_SUBJECT" ]] || return 1
 
-  [[ "$command" == 'verify-attestation' ]] || return 0
-  [[ "$predicate_type" == 'slsaprovenance1' && -f "$policy_file" && ! -L "$policy_file" ]] || return 1
-  grep -Fq '"_type": "https://in-toto.io/Statement/v1"' "$policy_file" &&
+  if [[ "$command" == 'verify' ]]; then
+    [[ "$annotation_sha" == "$FAKE_COSIGN_ANNOTATION_SHA" &&
+       "$annotation_tag" == "$FAKE_COSIGN_ANNOTATION_TAG" ]] || return 1
+    return 0
+  fi
+  [[ -z "$annotation_sha" && -z "$annotation_tag" ]] || return 1
+  [[ "$predicate_type" == 'slsaprovenance1' && "$policy_file" == *.cue &&
+     -f "$policy_file" && ! -L "$policy_file" ]] || return 1
+  grep -Fq '"_type": "https://in-toto.io/Statement/v0.1"' "$policy_file" &&
     grep -Fq 'predicateType: "https://slsa.dev/provenance/v1"' "$policy_file" &&
     grep -Fq "name: \"${FAKE_PROVENANCE_SUBJECT_NAME}\"" "$policy_file" &&
     grep -Fq "digest: sha256: \"${FAKE_PROVENANCE_SUBJECT_DIGEST}\"" "$policy_file" &&
@@ -558,8 +563,9 @@ fake_cosign_runner() {
     grep -Fq "manifest_digest: \"${FAKE_PROVENANCE_MANIFEST_DIGEST}\"" "$policy_file" &&
     grep -Fq "uri: \"${FAKE_PROVENANCE_DEPENDENCY}\"" "$policy_file" &&
     grep -Fq "digest: gitCommit: \"${FAKE_PROVENANCE_REVISION}\"" "$policy_file" &&
-    grep -Fq '"linux/amd64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
-    grep -Fq '"linux/arm64": =~"^sha256:[0-9a-f]{64}$"' "$policy_file" &&
+    grep -Fq 'platform_digests: close({' "$policy_file" &&
+    grep -Fq "\"linux/amd64\": \"${FAKE_PROVENANCE_AMD64_DIGEST}\"" "$policy_file" &&
+    grep -Fq "\"linux/arm64\": \"${FAKE_PROVENANCE_ARM64_DIGEST}\"" "$policy_file" &&
     [[ "$FAKE_PROVENANCE_AMD64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
        "$FAKE_PROVENANCE_ARM64_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
 }
@@ -572,20 +578,22 @@ verify_release_signature_fixture() (
       workflow_file='build.yml'
       workflow_name='Build and Push Docker Image'
       workflow_trigger='push'
+      FAKE_COSIGN_REF="refs/tags/${release_tag}"
+      FAKE_COSIGN_SHA="$test_commit"
       ;;
     recovery)
       workflow_file='release-recovery.yml'
       workflow_name='Recover Release Image From Existing Tag'
       workflow_trigger='workflow_dispatch'
+      FAKE_COSIGN_REF='refs/heads/main'
+      FAKE_COSIGN_SHA=''
       ;;
     *) return 1 ;;
   esac
 
-  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@${FAKE_COSIGN_REF}"
   FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
   FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
-  FAKE_COSIGN_REF="refs/tags/${release_tag}"
-  FAKE_COSIGN_SHA="$test_commit"
   FAKE_COSIGN_NAME="$workflow_name"
   FAKE_COSIGN_TRIGGER="$workflow_trigger"
   FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
@@ -597,7 +605,7 @@ verify_release_signature_fixture() (
     identity) FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/forged.yml@refs/tags/${release_tag}" ;;
     issuer) FAKE_COSIGN_ISSUER='https://issuer.example.invalid' ;;
     repository) FAKE_COSIGN_REPOSITORY='attacker/new_api_tools' ;;
-    ref) FAKE_COSIGN_REF='refs/heads/main' ;;
+    ref) FAKE_COSIGN_REF='refs/heads/attacker' ;;
     sha) FAKE_COSIGN_SHA='ffffffffffffffffffffffffffffffffffffffff' ;;
     name) FAKE_COSIGN_NAME='Forged Workflow' ;;
     trigger) FAKE_COSIGN_TRIGGER='pull_request' ;;
@@ -619,20 +627,22 @@ verify_release_provenance_fixture() (
       workflow_file='build.yml'
       workflow_name='Build and Push Docker Image'
       workflow_trigger='push'
+      FAKE_COSIGN_REF="refs/tags/${release_tag}"
+      FAKE_COSIGN_SHA="$test_commit"
       ;;
     recovery)
       workflow_file='release-recovery.yml'
       workflow_name='Recover Release Image From Existing Tag'
       workflow_trigger='workflow_dispatch'
+      FAKE_COSIGN_REF='refs/heads/main'
+      FAKE_COSIGN_SHA=''
       ;;
     *) return 1 ;;
   esac
 
-  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@refs/tags/${release_tag}"
+  FAKE_COSIGN_IDENTITY="https://github.com/yujianwudi/new_api_tools/.github/workflows/${workflow_file}@${FAKE_COSIGN_REF}"
   FAKE_COSIGN_ISSUER='https://token.actions.githubusercontent.com'
   FAKE_COSIGN_REPOSITORY='yujianwudi/new_api_tools'
-  FAKE_COSIGN_REF="refs/tags/${release_tag}"
-  FAKE_COSIGN_SHA="$test_commit"
   FAKE_COSIGN_NAME="$workflow_name"
   FAKE_COSIGN_TRIGGER="$workflow_trigger"
   FAKE_COSIGN_ANNOTATION_SHA="$test_commit"
@@ -647,8 +657,17 @@ verify_release_provenance_fixture() (
   FAKE_PROVENANCE_TAG="$release_tag"
   FAKE_PROVENANCE_MANIFEST_DIGEST="${resolved_test_image##*@}"
   FAKE_PROVENANCE_DEPENDENCY="git+https://github.com/yujianwudi/new_api_tools@refs/tags/${release_tag}"
+  FAKE_MANIFEST_AMD64_DIGEST='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  FAKE_MANIFEST_ARM64_DIGEST='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   FAKE_PROVENANCE_AMD64_DIGEST='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   FAKE_PROVENANCE_ARM64_DIGEST='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+  resolve_install_release_platform_digests() {
+    printf '%s %s\n' "$FAKE_MANIFEST_AMD64_DIGEST" "$FAKE_MANIFEST_ARM64_DIGEST"
+  }
+  resolve_deploy_release_platform_digests() {
+    printf '%s %s\n' "$FAKE_MANIFEST_AMD64_DIGEST" "$FAKE_MANIFEST_ARM64_DIGEST"
+  }
 
   case "$mutation" in
     none) ;;
@@ -661,7 +680,7 @@ verify_release_provenance_fixture() (
     tag) FAKE_PROVENANCE_TAG='v9.9.9' ;;
     manifest) FAKE_PROVENANCE_MANIFEST_DIGEST='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
     dependency) FAKE_PROVENANCE_DEPENDENCY='git+https://github.com/attacker/new_api_tools@refs/heads/main' ;;
-    platform) FAKE_PROVENANCE_AMD64_DIGEST='not-a-digest' ;;
+    platform) FAKE_PROVENANCE_AMD64_DIGEST='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' ;;
     *) return 1 ;;
   esac
 
@@ -678,6 +697,9 @@ for verifier in verify_install_release_signature verify_deploy_release_signature
     "${verifier} accepts the exact protected recovery workflow identity" \
     '' \
     verify_release_signature_fixture "$verifier" recovery
+  assert_rejected \
+    "${verifier} rejects a forged protected-main recovery ref" \
+    verify_release_signature_fixture "$verifier" recovery ref
   for mutation in identity issuer repository ref sha name trigger annotation-sha annotation-tag digest; do
     assert_rejected \
       "${verifier} rejects forged release certificate field ${mutation}" \
@@ -698,6 +720,85 @@ for verifier in verify_install_release_provenance verify_deploy_release_provenan
     assert_rejected \
       "${verifier} rejects forged provenance field ${mutation}" \
       verify_release_provenance_fixture "$verifier" build "$mutation"
+  done
+done
+
+release_platform_digest_fixture() (
+  local resolver="$1" mode="$2"
+  command() {
+    if [[ "$mode" == missing-timeout && "$1" == -v && "${2:-}" == timeout ]]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  timeout() {
+    [[ "$1" == -k && "$2" == 10s && "$3" == 120s ]] || return 125
+    shift 3
+    if [[ "$mode" == timeout ]]; then
+      return 124
+    fi
+    if [[ "$mode" == partial-timeout ]]; then
+      "$@"
+      return 124
+    fi
+    "$@"
+  }
+  docker() {
+    [[ "$1" == buildx ]] || return 1
+    if [[ "$2" == version ]]; then
+      [[ "$mode" != missing-buildx ]] || return 1
+      return 0
+    fi
+    [[ "$2" == imagetools && "$3" == inspect ]] || return 1
+    case "$mode" in
+      valid|partial-timeout)
+        printf '%s\n' \
+          'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+          'unknown/unknown sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+          'unknown/unknown sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+        ;;
+      duplicate)
+        printf '%s\n' \
+          'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+          'linux/amd64 sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        ;;
+      extra)
+        printf '%s\n' \
+          'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+          'linux/s390x sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+        ;;
+      invalid)
+        printf '%s\n' \
+          'linux/amd64 not-a-digest' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        ;;
+      amd64-only)
+        printf '%s\n' \
+          'linux/amd64 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        ;;
+      arm64-only)
+        printf '%s\n' \
+          'linux/arm64 sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        ;;
+      empty|timeout) ;;
+      *) return 1 ;;
+    esac
+  }
+  "$resolver" "$resolved_test_image"
+)
+
+for resolver in resolve_install_release_platform_digests resolve_deploy_release_platform_digests; do
+  assert_eq \
+    "${resolver} extracts the exact two release platform digests" \
+    'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    release_platform_digest_fixture "$resolver" valid
+  for mutation in duplicate extra invalid amd64-only arm64-only empty timeout partial-timeout missing-buildx missing-timeout; do
+    assert_rejected \
+      "${resolver} rejects ${mutation} release platform metadata" \
+      release_platform_digest_fixture "$resolver" "$mutation"
   done
 done
 
